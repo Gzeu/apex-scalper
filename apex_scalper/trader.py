@@ -1,17 +1,11 @@
-"""Trader module v0.7.1 — rate limiter + SL-triggered-while-offline detection.
+"""Trader module v0.8.1 — Bug 12 fix: close_position guard client None.
 
-Upgrades vs v0.5.0:
-  1. RateLimiter: token bucket 10 req/s, burst=3
-     All place_order / amend_order / close_position go through _rate_limit()
-     429 response: auto-retry after Retry-After delay
-     Exponential backoff: 0.1s -> 0.2s -> 0.4s -> 0.8s (max 4 attempts)
-
-  2. sync_position_from_exchange():
-     If exchange shows NO open position BUT state has open_position set:
-     -> SL was triggered while bot was offline
-     -> Reconstructs PnL from entry price vs current market price
-     -> Calls risk.on_close() + db.record_trade() + Telegram alert
-     -> Clears state.open_position cleanly
+Changelog:
+  v0.8.1 — BUG 12 FIX: close_position() nu verifica trader._client is None.
+    Daca SIGTERM vine inainte de trader.setup(), _client=None si
+    close_position() arunca AttributeError in _shutdown() blocand cleanup.
+    Fix: guard 'if self._client is None: return' la intrarea in close_position().
+  v0.7.1 — RateLimiter + sync_position_from_exchange.
 """
 from __future__ import annotations
 
@@ -28,9 +22,9 @@ from .state import state
 class RateLimiter:
     """Token bucket: 10 tokens/s, burst=3. Thread-safe."""
 
-    RATE    = 10.0   # tokens per second (Bybit REST limit)
-    BURST   = 3      # max burst
-    BACKOFF = [0.1, 0.2, 0.4, 0.8]   # seconds, exponential
+    RATE    = 10.0
+    BURST   = 3
+    BACKOFF = [0.1, 0.2, 0.4, 0.8]
 
     def __init__(self):
         self._tokens   = float(self.BURST)
@@ -38,7 +32,6 @@ class RateLimiter:
         self._lock     = threading.Lock()
 
     async def acquire(self) -> None:
-        """Block (async) until a token is available."""
         while True:
             with self._lock:
                 now = time.monotonic()
@@ -56,12 +49,10 @@ _limiter = RateLimiter()
 
 
 async def _api_call_with_retry(fn, *args, **kwargs) -> dict:
-    """Execute fn(*args, **kwargs) with rate limiting + retry on 429."""
     for attempt, backoff in enumerate(_limiter.BACKOFF + [None]):
         await _limiter.acquire()
         try:
             result = fn(*args, **kwargs)
-            # Bybit returns retCode 10006 for rate limit exceeded
             if isinstance(result, dict) and result.get("retCode") in (429, 10006):
                 if backoff is None:
                     logger.error("Rate limit: max retries exceeded")
@@ -128,12 +119,12 @@ class Trader:
                 self._client.switch_position_mode,
                 category="linear",
                 symbol=self._symbol,
-                mode=0,   # 0 = OneWay
+                mode=0,
             )
             if result.get("retCode") not in (0, 110025):
                 logger.warning(f"set_position_mode: {result}")
             else:
-                logger.info("Position mode: OneWay ✅")
+                logger.info("Position mode: OneWay \u2705")
         except Exception as e:
             logger.warning(f"set_position_mode failed: {e}")
 
@@ -159,6 +150,7 @@ class Trader:
             logger.warning(f"get_instrument_info failed: {e}")
 
     def fee_estimate(self, qty: float, price: float, order_type: str) -> float:
+        """Estimeaza fee in USDT. Returneaza float (nu dict)."""
         rate = 0.00020 if order_type == "Limit" else 0.00055
         return round(qty * price * rate, 6)
 
@@ -188,8 +180,8 @@ class Trader:
             reduceOnly=reduce_only,
         )
         if order_type == "Limit":
-            params["price"]         = str(round(price, 8))
-            params["timeInForce"]   = "PostOnly" if post_only else "GTC"
+            params["price"]       = str(round(price, 8))
+            params["timeInForce"] = "PostOnly" if post_only else "GTC"
         if stop_loss:
             params["stopLoss"] = str(round(stop_loss, 8))
         if take_profit:
@@ -211,8 +203,8 @@ class Trader:
             symbol=self._symbol,
             orderId=order_id,
         )
-        if qty    is not None: params["qty"]   = str(round(qty,   6))
-        if price  is not None: params["price"] = str(round(price, 8))
+        if qty   is not None: params["qty"]   = str(round(qty,   6))
+        if price is not None: params["price"] = str(round(price, 8))
         return await _api_call_with_retry(self._client.amend_order, **params)
 
     async def amend_sl_tp(
@@ -236,7 +228,15 @@ class Trader:
         use_limit: bool = True,
         limit_timeout_s: float = 3.0,
     ) -> None:
-        """Close full position. Limit-first (maker fee), Market fallback."""
+        """Close full position. Limit-first (maker fee), Market fallback.
+
+        v0.8.1 BUG 12 FIX: guard client None pentru shutdown inainte de setup().
+        """
+        # BUG 12 FIX: daca setup() nu a fost apelat, nu avem client
+        if self._client is None:
+            logger.debug("[trader] close_position: client not initialized, skipping")
+            return
+
         with state.lock:
             pos = state.open_position
             qty = state.open_qty
@@ -258,7 +258,6 @@ class Trader:
             if resp.get("retCode") == 0:
                 await asyncio.sleep(limit_timeout_s)
 
-        # Market fallback / final close
         await self.place_order(
             side=close_side, qty=qty,
             order_type="Market", post_only=False,
@@ -296,7 +295,6 @@ class Trader:
                 current_px  = state.last_price
 
             if bot_has_pos and not exchange_has_pos:
-                # SL was triggered while offline — reconstruct & clean state
                 logger.warning(
                     f"Ghost position detected: bot={bot_side} qty={bot_qty} "
                     f"entry={bot_entry} — exchange has NO open position. "
@@ -336,7 +334,7 @@ class Trader:
                 try:
                     from .telegram_ui import send_message
                     await send_message(
-                        f"⚠️ *SL triggered while offline* — ghost state cleared\n"
+                        f"\u26a0\ufe0f *SL triggered while offline* — ghost state cleared\n"
                         f"`{bot_side} {bot_qty} entry={bot_entry}`\n"
                         f"`estimated pnl={pnl_usdt:+.4f} USDT`"
                     )
@@ -344,7 +342,6 @@ class Trader:
                     pass
 
             elif not bot_has_pos and exchange_has_pos:
-                # Exchange has position but bot doesn't know — sync from exchange
                 for p in positions:
                     sz = float(p.get("size", 0))
                     if sz > 0:
@@ -361,7 +358,7 @@ class Trader:
                         )
                         break
             else:
-                logger.info("Position sync: state matches exchange ✅")
+                logger.info("Position sync: state matches exchange \u2705")
 
         except Exception as e:
             logger.warning(f"sync_position_from_exchange failed: {e}")

@@ -1,13 +1,12 @@
-"""Risk manager v0.8.0 — Kelly formula corectata (Bug 6).
+"""Risk manager v0.8.1 — kelly_f property adaugat (Bug 10 fix).
 
 Changelog:
-  v0.8.0 — BUG 6 FIX: Kelly formula incorecta.
-    Implementat anterior: f = (win_rate - loss_rate) * (avg_win / avg_loss)
-    Corect Kelly standard: f = win_rate - loss_rate * (avg_loss / avg_win)
-    Diferenta practica (scalping win_rate=0.6, avg_win=0.12%, avg_loss=0.08%):
-      Vechi: f = (0.6-0.4)*(0.12/0.08) = 0.30 * 1.5 = 0.45 (inainte de KELLY_FRACTION)
-      Nou:   f = 0.6 - 0.4*(0.08/0.12) = 0.6 - 0.267 = 0.333 (inainte de KELLY_FRACTION)
-    Ambele aplica KELLY_FRACTION=0.5 -> 0.225 vs 0.167 — mai conservator si corect.
+  v0.8.1 — BUG 10 FIX: adaugat kelly_f property pentru acces extern curat.
+    pulse.py facea getattr(risk, '_kelly_factor', 0.5) — returna obiect metoda
+    -> TypeError: unsupported format character la f-string in pulse.
+    Fix: @property kelly_f apeleaza _kelly_factor() sub lock si returneaza float.
+    pulse.py updatat sa foloseasca risk.kelly_f (fara paranteze).
+  v0.8.0 — Kelly formula corecta (Bug 6).
   v0.7.1 — reset_daily fix, MAX_CONSECUTIVE_LOSSES, partial close tracking.
 """
 from __future__ import annotations
@@ -24,7 +23,6 @@ MIN_BID_DEPTH          = float(os.getenv("MIN_BID_DEPTH",            "10000"))
 MIN_ASK_DEPTH          = float(os.getenv("MIN_ASK_DEPTH",            "10000"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES",     "5"))
 
-# Kelly params
 KELLY_FRACTION      = float(os.getenv("KELLY_FRACTION",       "0.5"))
 KELLY_LOOKBACK      = int(os.getenv("KELLY_LOOKBACK",         "50"))
 MIN_KELLY_TRADES    = int(os.getenv("MIN_KELLY_TRADES",       "20"))
@@ -39,7 +37,6 @@ class RiskManager:
         self._daily_limit        = MAX_DAILY_LOSS
         self._open_count         = 0
         self._consecutive_losses = 0
-        # Kelly tracking: {"pnl_pct": float, "win": bool}
         self._trade_results: deque = deque(maxlen=KELLY_LOOKBACK)
 
     def can_open(self) -> bool:
@@ -81,10 +78,7 @@ class RiskManager:
         """Half-Kelly sizing factor din trade history recent.
 
         v0.8.0 BUG 6 FIX: formula Kelly standard corecta.
-          Anterior: f = (win_rate - loss_rate) * (avg_win / avg_loss)
-          Corect:   f = win_rate - loss_rate * (avg_loss / avg_win)
-          Sursa: Kelly J.L. (1956) - A New Interpretation of Information Rate.
-          Formula: f* = p - q/odds = p - (1-p)*(avg_loss/avg_win)
+        f* = win_rate - loss_rate * (avg_loss / avg_win)
         """
         trades = list(self._trade_results)
         if len(trades) < MIN_KELLY_TRADES:
@@ -105,12 +99,21 @@ class RiskManager:
         if avg_win == 0:
             return MIN_KELLY_F
 
-        # Kelly standard: f* = p - q * (avg_loss / avg_win)
-        # = win_rate - loss_rate * (avg_loss / avg_win)
         f = win_rate - loss_rate * (avg_loss / avg_win)
-        f = f * KELLY_FRACTION   # half-Kelly
+        f = f * KELLY_FRACTION
         f = max(MIN_KELLY_F, min(MAX_KELLY_F, f))
         return f
+
+    @property
+    def kelly_f(self) -> float:
+        """BUG 10 FIX: property pentru acces extern la kelly factor.
+
+        pulse.py folosea getattr(risk, '_kelly_factor', 0.5) care returna
+        obiectul metoda, nu un float -> TypeError la f-string.
+        Acum: risk.kelly_f returneaza float corect, thread-safe sub lock.
+        """
+        with self._lock:
+            return self._kelly_factor()
 
     def calc_qty(
         self,
@@ -142,8 +145,8 @@ class RiskManager:
 
     def reset_daily(self) -> None:
         with self._lock:
-            self._daily_loss  = 0.0
-            self._open_count  = 0
+            self._daily_loss = 0.0
+            self._open_count = 0
 
     @property
     def consecutive_losses(self) -> int:
@@ -151,7 +154,6 @@ class RiskManager:
             return self._consecutive_losses
 
     def reset_consecutive_losses(self) -> None:
-        """Called by /resume Telegram command to unblock after manual review."""
         with self._lock:
             self._consecutive_losses = 0
         logger.info("Consecutive losses counter reset manually")

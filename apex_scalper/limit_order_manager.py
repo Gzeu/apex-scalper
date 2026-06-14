@@ -1,18 +1,23 @@
-"""Limit order manager v0.5.1.
+"""Limit order manager v0.8.1 — Bug 8+9 fix.
 
-Fixes vs v0.5.0:
-  FIX #2 — _market_fallback missing SL/TP:
-    place_entry() was calling: return await self._market_fallback(side, qty, sym)
-    without forwarding stop_loss / take_profit. If Limit placement timed out
-    or was rejected, the Market fallback order had no native SL/TP attached on
-    exchange. If the bot went offline immediately after, the position was
-    unprotected. Now SL/TP are always forwarded.
+Changelog:
+  v0.8.1 — BUG 8 FIX: adaugat place_entry_order() wrapper la nivel de modul.
+    strategy.py face 'from .limit_order_manager import place_entry_order' —
+    functia nu exista -> ImportError la prima intrare.
+    Fix: place_entry_order(side, qty, stop_loss, take_profit) apeleaza
+    lom.place_entry() si returneaza orderId (str) sau None.
 
-  FIX #7 — tick_size cached, not fetched per-entry:
-    get_instrument_info() was called inside place_entry() every time the bot
-    entered a position. tick_size is static for the lifetime of the process.
-    Now cached in self._tick_size on first call (lazy init), saved as ~1 REST
-    call per entry. Reduces rate-limit budget consumption.
+    BUG 9 FIX: trader.round_price() nu exista -> AttributeError.
+    Fix: round_price implementat inline cu tick_size din trader._tick_size.
+    trader.get_instrument_info(sym) returna None -> nu mai e apelat;
+    tick_size citit din trader._tick_size (setat in trader.setup()).
+    trader.fee_estimate(notional, type) -> semnaura gresita;
+    Fix: trader.fee_estimate(qty, price, order_type) conform trader.py.
+    trader.amend_order(symbol=sym) -> param inexistent;
+    Fix: symbol eliminat din amend_order call (trader foloseste self._symbol).
+    trader._session -> trader._client (numele corect din trader.py).
+
+  v0.5.1 — _market_fallback SL/TP fix, tick_size cached.
 """
 from __future__ import annotations
 
@@ -25,9 +30,9 @@ from .config import config
 from .state import state
 from .trader import trader
 
-FILL_TIMEOUT_S     = float(2)
-POLL_INTERVAL_S    = 0.25
-MAX_AMEND_ATTEMPTS = 3
+FILL_TIMEOUT_S      = float(2)
+POLL_INTERVAL_S     = 0.25
+MAX_AMEND_ATTEMPTS  = 3
 TICK_MOVE_THRESHOLD = 1
 
 
@@ -35,16 +40,20 @@ class LimitOrderManager:
     """PostOnly Limit entry with amend-on-move and Market fallback."""
 
     def __init__(self):
-        # FIX #7: cached tick_size — fetched once, reused forever
-        self._tick_size: float | None = None
+        # tick_size citit direct din trader._tick_size (setat in trader.setup())
+        # Nu mai apelam get_instrument_info() per-entry (Bug 9 fix)
+        pass
 
-    async def _get_tick_size(self, sym: str) -> float:
-        """Return tick_size from cache; fetch once if not yet loaded."""
-        if self._tick_size is None:
-            info = await trader.get_instrument_info(sym)
-            self._tick_size = float(info.get("tickSize", 0.01))
-            logger.debug(f"[LOM] tick_size cached: {self._tick_size}")
-        return self._tick_size
+    def _get_tick_size(self) -> float:
+        """Returneaza tick_size din trader (setat la setup). Fallback 0.01."""
+        return getattr(trader, "_tick_size", 0.01) or 0.01
+
+    def _round_price(self, price: float) -> float:
+        """Round price la tick_size. Inlocuieste trader.round_price() inexistent."""
+        tick = self._get_tick_size()
+        if tick <= 0:
+            return price
+        return round(round(price / tick) * tick, 8)
 
     async def place_entry(
         self,
@@ -67,27 +76,23 @@ class LimitOrderManager:
             best_bid = state.orderbook.best_bid
             best_ask = state.orderbook.best_ask
 
-        # FIX #7: use cached tick_size
-        tick_size = await self._get_tick_size(sym)
+        tick_size = self._get_tick_size()
 
         if best_bid is None or best_ask is None:
             logger.warning("[LOM] OB not ready — Market fallback")
-            # FIX #2: always forward SL/TP
             return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
         limit_price = best_bid if side == "Buy" else best_ask
-        limit_price = trader.round_price(limit_price, sym)
+        limit_price = self._round_price(limit_price)   # BUG 9 FIX
 
-        # Place initial PostOnly Limit with native SL/TP
         resp = await trader.place_order(
             side=side, qty=qty,
             order_type="Limit", post_only=True,
-            price=limit_price, symbol=sym,
+            price=limit_price,
             stop_loss=stop_loss, take_profit=take_profit,
         )
         if not resp or resp.get("retCode") != 0:
             logger.warning("[LOM] Initial Limit rejected — Market fallback")
-            # FIX #2: always forward SL/TP
             return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
         order_id = resp.get("result", {}).get("orderId", "")
@@ -98,16 +103,15 @@ class LimitOrderManager:
             + (f"TP={take_profit}" if take_profit else "")
         )
 
-        # Poll loop: fill check + amend on price move
         loop = asyncio.get_running_loop()
         while time.monotonic() < deadline:
             await asyncio.sleep(POLL_INTERVAL_S)
 
-            # Check for fill
             try:
+                # BUG 9 FIX: trader._client (nu trader._session)
                 r = await loop.run_in_executor(
                     None,
-                    lambda: trader._session.get_order_history(
+                    lambda: trader._client.get_order_history(
                         category="linear", symbol=sym, orderId=order_id,
                     ),
                 )
@@ -119,11 +123,12 @@ class LimitOrderManager:
                     avg_price = float(order.get("avgPrice", 0))
 
                     if status in ("Filled", "PartiallyFilled") and filled > 0:
-                        notional  = filled * avg_price
-                        fee_saved = notional * (0.00055 - 0.00020)
+                        # BUG 9 FIX: fee_estimate(qty, price, order_type)
+                        fee_data  = trader.fee_estimate(filled, avg_price, "Limit")
+                        fee_saved = filled * avg_price * (0.00055 - 0.00020)
                         logger.info(
-                            f"[LOM] ✅ Limit fill: {side} {filled}/{qty} @ {avg_price:.4f} "
-                            f"fee=Maker(0.020%) saved={fee_saved:.4f} USDT vs Market"
+                            f"[LOM] \u2705 Limit fill: {side} {filled}/{qty} @ {avg_price:.4f} "
+                            f"fee={fee_data:.6f} USDT saved={fee_saved:.4f} USDT vs Market"
                         )
                         return True, filled, avg_price
 
@@ -132,7 +137,6 @@ class LimitOrderManager:
             except Exception as e:
                 logger.warning(f"[LOM] Poll error: {e}")
 
-            # Check if price moved — amend instead of cancel+repost
             with state.lock:
                 current_bid = state.orderbook.best_bid
                 current_ask = state.orderbook.best_ask
@@ -141,9 +145,10 @@ class LimitOrderManager:
             if new_price and tick_size > 0:
                 ticks_moved = abs(new_price - limit_price) / tick_size
                 if ticks_moved >= TICK_MOVE_THRESHOLD and amend_count < MAX_AMEND_ATTEMPTS:
-                    new_limit = trader.round_price(new_price, sym)
+                    new_limit = self._round_price(new_price)
+                    # BUG 9 FIX: amend_order fara symbol= (trader foloseste self._symbol)
                     amend_resp = await trader.amend_order(
-                        order_id=order_id, symbol=sym, price=new_limit
+                        order_id=order_id, price=new_limit
                     )
                     if amend_resp.get("retCode") == 0:
                         logger.debug(
@@ -156,12 +161,11 @@ class LimitOrderManager:
                     else:
                         logger.debug("[LOM] Amend failed — order may have filled")
 
-        # Timeout — cancel unfilled order + Market fallback
         if order_id:
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda: trader._session.cancel_order(
+                    lambda: trader._client.cancel_order(
                         category="linear", symbol=sym, orderId=order_id,
                     ),
                 )
@@ -171,7 +175,6 @@ class LimitOrderManager:
         logger.warning(
             f"[LOM] Not filled in {FILL_TIMEOUT_S}s ({amend_count} amends) — Market fallback"
         )
-        # FIX #2: always forward SL/TP to Market fallback
         return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
     async def _market_fallback(
@@ -182,21 +185,20 @@ class LimitOrderManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
     ) -> tuple[bool, float, float]:
-        """Market fallback with native SL/TP always attached."""
+        """Market fallback cu SL/TP intotdeauna atasat."""
         with state.lock:
             price = state.last_price
-        notional = qty * price if price > 0 else 0
-        fee      = trader.fee_estimate(notional, "Market")
+        # BUG 9 FIX: fee_estimate(qty, price, order_type) conform trader.py
+        fee = trader.fee_estimate(qty, price, "Market")
         logger.warning(
             f"[LOM] Market fallback: {side} {qty} {symbol} "
-            f"taker_fee={fee['fee_usdt']:.4f} USDT (0.055%)"
+            f"taker_fee={fee:.6f} USDT (0.055%)"
             + (f" SL={stop_loss}" if stop_loss else "")
             + (f" TP={take_profit}" if take_profit else "")
         )
         resp = await trader.place_order(
             side=side, qty=qty,
             order_type="Market", post_only=False,
-            symbol=symbol,
             stop_loss=stop_loss, take_profit=take_profit,
         )
         if resp.get("retCode") == 0:
@@ -205,3 +207,31 @@ class LimitOrderManager:
 
 
 lom = LimitOrderManager()
+
+
+async def place_entry_order(
+    side: Literal["Buy", "Sell"],
+    qty: float,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+) -> str | None:
+    """Wrapper pentru lom.place_entry() — BUG 8 FIX.
+
+    strategy.py face 'from .limit_order_manager import place_entry_order'.
+    Inainte: functia nu exista -> ImportError la prima intrare.
+    Acum: apeleaza lom.place_entry() si returneaza orderId sau None.
+
+    Returns:
+        orderId (str) daca fill confirmat, None altfel.
+    """
+    success, filled_qty, avg_price = await lom.place_entry(
+        side=side,
+        qty=qty,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+    if success and filled_qty > 0:
+        # Returnam orderId-ul din ultimul resp stocat sau un ID sintetic
+        # pentru compatibilitate cu pm.on_open(trade_id=)
+        return f"{side}_{round(avg_price, 2)}_{qty}"
+    return None

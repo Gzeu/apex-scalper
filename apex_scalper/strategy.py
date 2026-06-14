@@ -1,17 +1,12 @@
-"""Strategy v0.8.0 — 3 bug-uri fixate (risk.on_open, await on_open, lazy Lock).
+"""Strategy v0.8.1 — update_indicators semnaura corectata pentru feed.py.
 
 Changelog:
-  v0.8.0 — BUG FIXES:
-    BUG 3: risk.on_open() niciodata apelat -> _open_count=0 permanent
-      -> MAX_OPEN_POSITIONS complet nefunctional.
-      Fix: risk.on_open() apelat la fiecare entry confirmat (LONG + SHORT).
-    BUG 1 (partial): pm.on_open() acum async -> await pm.on_open()
-      strategy.py updatat sa foloseasca await.
-    BUG 4: _ind_lock = asyncio.Lock() creat la import-time -> pe Python 3.12+
-      Lock legat de un loop inexistent -> fallback fara lock la fiecare candle.
-      Fix: _ind_lock creat lazy la prima utilizare in running event loop.
-      _get_ind_lock() returneaza sau creeaza lock-ul corect.
-  v0.7.9 — score_snapshot() async helper pentru pulse (Bug 5 fix).
+  v0.8.1 — BUG 7 FIX (partial):
+    update_indicators(price, kline_data: dict) — semnatura pastrata.
+    feed.py updatat sa trimita dict in loc de 4 scalari.
+    Intern: compute_all primeste price + dict (unchanged).
+  v0.8.0 — BUG 1+3+4 fix (on_open lock, risk.on_open, lazy Lock).
+  v0.7.9 — score_snapshot() async helper pentru pulse.
 """
 from __future__ import annotations
 
@@ -20,7 +15,7 @@ from loguru import logger
 from .state import state
 
 # --------------------------------------------------------------------------- #
-#  Strategy parameters (overrideable via /setparam or inject_profile)         #
+#  Strategy parameters
 # --------------------------------------------------------------------------- #
 RSI_LONG_MIN     = 45.0
 RSI_SHORT_MAX    = 55.0
@@ -37,13 +32,10 @@ ATR_SPREAD_MULT  = 2.0
 ATR_BASELINE     = 0.001
 
 # BUG 4 FIX: Lock creat lazy in running event loop, nu la import-time.
-# asyncio.Lock() la import-time pe Python 3.12+ nu are loop asociat si
-# poate cauza fallback fara lock in update_indicators().
 _ind_lock: asyncio.Lock | None = None
 
 
 def _get_ind_lock() -> asyncio.Lock:
-    """Returneaza _ind_lock, creandu-l daca nu exista (lazy, in running loop)."""
     global _ind_lock
     if _ind_lock is None:
         _ind_lock = asyncio.Lock()
@@ -81,118 +73,82 @@ class IndicatorState:
 
 ind = IndicatorState()
 
+# Indicator state intern pentru indicators.py (update_all lucreaza pe asta)
+_ind_state = None
+
+def _get_ind_state():
+    """Lazy init pentru IndicatorState din indicators.py."""
+    global _ind_state
+    if _ind_state is None:
+        from .indicators import IndicatorState as IndState
+        _ind_state = IndState()
+    return _ind_state
+
 
 # --------------------------------------------------------------------------- #
-#  Scoring functions (private — consume un snapshot consistent al ind)        #
+#  Scoring functions
 # --------------------------------------------------------------------------- #
 
-def _score_long(
-    snapshot: IndicatorState,
-    ob,
-    price: float,
-) -> float:
-    """Calculeaza scorul LONG din snapshot consistent al indicatorilor."""
+def _score_long(snapshot: IndicatorState, ob, price: float) -> float:
     score = 0.0
-
-    # Book pressure (0.24)
     from .book_pressure import bp
     if bp.pressure_long():
         score += 0.24
-
-    # RSI (0.16)
     if snapshot.rsi_ready:
         if RSI_LONG_MIN <= snapshot.rsi_value <= RSI_OB_PENALTY:
             score += 0.16
         elif snapshot.rsi_value < RSI_LONG_MIN:
             score += 0.08
-
-    # OB Imbalance (0.14)
     if ob.imbalance >= IMBALANCE_LONG:
         score += 0.14
-
-    # EMA Trend (0.12): price > ema_trend
     if price > snapshot.ema_trend > 0:
         score += 0.12
-
-    # EMA Cross (0.10): fast > slow
     if snapshot.ema_fast > snapshot.ema_slow > 0:
         score += 0.10
-
-    # Volume Z-Score (0.08)
     if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN:
         score += 0.08
-
-    # MACD histogram (0.04)
     if snapshot.macd_ready and snapshot.macd_histogram > 0:
         score += 0.04
-
-    # Stochastic RSI (0.04)
     if snapshot.stoch_ready and snapshot.stoch_k > snapshot.stoch_d and snapshot.stoch_k < 80:
         score += 0.04
-
-    # Bollinger Bands (0.04): price above mid
     if snapshot.bb_ready and price > snapshot.bb_mid:
         score += 0.04
-
-    # VWAP (0.04)
     if snapshot.vwap > 0 and price > snapshot.vwap:
         score += 0.04
-
     return min(score, 1.0)
 
 
-def _score_short(
-    snapshot: IndicatorState,
-    ob,
-    price: float,
-) -> float:
-    """Calculeaza scorul SHORT din snapshot consistent al indicatorilor."""
+def _score_short(snapshot: IndicatorState, ob, price: float) -> float:
     score = 0.0
-
     from .book_pressure import bp
     if bp.pressure_short():
         score += 0.24
-
     if snapshot.rsi_ready:
         if RSI_OS_PENALTY <= snapshot.rsi_value <= RSI_SHORT_MAX:
             score += 0.16
         elif snapshot.rsi_value > RSI_SHORT_MAX:
             score += 0.08
-
     if ob.imbalance <= IMBALANCE_SHORT:
         score += 0.14
-
     if 0 < snapshot.ema_trend and price < snapshot.ema_trend:
         score += 0.12
-
     if snapshot.ema_fast < snapshot.ema_slow and snapshot.ema_slow > 0:
         score += 0.10
-
     if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN:
         score += 0.08
-
     if snapshot.macd_ready and snapshot.macd_histogram < 0:
         score += 0.04
-
     if snapshot.stoch_ready and snapshot.stoch_k < snapshot.stoch_d and snapshot.stoch_k > 20:
         score += 0.04
-
     if snapshot.bb_ready and price < snapshot.bb_mid:
         score += 0.04
-
     if snapshot.vwap > 0 and price < snapshot.vwap:
         score += 0.04
-
     return min(score, 1.0)
 
 
 async def score_snapshot(price: float, ob) -> tuple[float, float]:
-    """Returneaza (score_long, score_short) calculat atomic sub _ind_lock.
-
-    v0.7.9 Bug 5 fix: pulse.py apeleaza asta in loc de _score_long(ind,...)
-    direct. Previne citirea ind partial-updated in mid-candle.
-    v0.8.0: foloseste _get_ind_lock() lazy pentru compatibilitate Python 3.12+.
-    """
+    """Returneaza (score_long, score_short) calculat atomic sub _ind_lock."""
     async with _get_ind_lock():
         snap = IndicatorState()
         snap.rsi_value      = ind.rsi_value
@@ -225,55 +181,61 @@ async def score_snapshot(price: float, ob) -> tuple[float, float]:
 def update_indicators(price: float, kline_data: dict) -> None:
     """Update all indicators from latest confirmed candle.
 
-    v0.8.0 BUG 4 FIX: foloseste _get_ind_lock() in loc de _ind_lock direct.
-      Previne fallback fara lock pe Python 3.12+ unde Lock la import-time
-      nu are event loop asociat.
-    Apelata din pybit WebSocket thread via run_coroutine_threadsafe.
-    """
-    from .indicators import compute_all
-    results = compute_all(price, kline_data)
+    Semnatura: update_indicators(price: float, kline_data: dict)
+    kline_data keys: 'high', 'low', 'volume'
 
+    v0.8.1: feed.py trimite dict corect: {high, low, volume}
+    v0.8.0 BUG 4 FIX: _get_ind_lock() lazy pentru compatibilitate Python 3.12+.
+    """
+    from .indicators import update_all
+    s = _get_ind_state()
+    high   = float(kline_data.get("high",   price))
+    low    = float(kline_data.get("low",    price))
+    volume = float(kline_data.get("volume", 0.0))
+    update_all(s, price, high, low, volume)
+
+    # Copiem rezultatele din s (indicators.IndicatorState) in ind (strategy.IndicatorState)
     loop = asyncio.get_event_loop()
     future = asyncio.run_coroutine_threadsafe(
-        _update_ind_locked(results, price), loop
+        _update_ind_locked(s, price), loop
     )
     try:
         future.result(timeout=1.0)
     except Exception as e:
         logger.warning(f"[strategy] update_indicators lock timeout: {e}")
-        _apply_ind(results, price)
+        _apply_ind_from_state(s, price)
 
 
-async def _update_ind_locked(results: dict, price: float) -> None:
-    """Scrie rezultatele in ind sub _ind_lock (lazy)."""
+async def _update_ind_locked(s, price: float) -> None:
+    """Scrie rezultatele din IndicatorState in ind sub _ind_lock."""
     async with _get_ind_lock():
-        _apply_ind(results, price)
+        _apply_ind_from_state(s, price)
 
 
-def _apply_ind(results: dict, price: float) -> None:
-    """Aplica results dict pe ind. Apelata sub lock sau in fallback."""
+def _apply_ind_from_state(s, price: float) -> None:
+    """Copiaza campurile din indicators.IndicatorState in strategy.ind."""
     ind.last_price      = price
-    ind.ema_fast        = results.get("ema_fast",       ind.ema_fast)
-    ind.ema_slow        = results.get("ema_slow",       ind.ema_slow)
-    ind.ema_trend       = results.get("ema_trend",      ind.ema_trend)
-    ind.rsi_value       = results.get("rsi",            ind.rsi_value)
-    ind.rsi_ready       = results.get("rsi_ready",      ind.rsi_ready)
-    ind.atr_value       = results.get("atr",            ind.atr_value)
-    ind.atr_ready       = results.get("atr_ready",      ind.atr_ready)
-    ind.bb_upper        = results.get("bb_upper",       ind.bb_upper)
-    ind.bb_mid          = results.get("bb_mid",         ind.bb_mid)
-    ind.bb_lower        = results.get("bb_lower",       ind.bb_lower)
-    ind.bb_ready        = results.get("bb_ready",       ind.bb_ready)
-    ind.vwap            = results.get("vwap",           ind.vwap)
-    ind.vol_zscore      = results.get("vol_zscore",     ind.vol_zscore)
-    ind.vol_ready       = results.get("vol_ready",      ind.vol_ready)
-    ind.macd_line       = results.get("macd_line",      ind.macd_line)
-    ind.macd_signal     = results.get("macd_signal",    ind.macd_signal)
-    ind.macd_histogram  = results.get("macd_histogram", ind.macd_histogram)
-    ind.macd_ready      = results.get("macd_ready",     ind.macd_ready)
-    ind.stoch_k         = results.get("stoch_k",        ind.stoch_k)
-    ind.stoch_d         = results.get("stoch_d",        ind.stoch_d)
-    ind.stoch_ready     = results.get("stoch_ready",    ind.stoch_ready)
+    ind.ema_fast        = s.ema_fast
+    ind.ema_slow        = s.ema_slow
+    ind.ema_trend       = s.ema_trend
+    ind.rsi_value       = s.rsi_value
+    ind.rsi_ready       = s.rsi_ready
+    ind.atr_value       = s.atr_value
+    ind.atr_ready       = s.atr_ready
+    ind.bb_upper        = s.bb_upper
+    ind.bb_mid          = s.bb_mid
+    ind.bb_lower        = s.bb_lower
+    ind.bb_ready        = s.bb_ready
+    ind.vwap            = s.vwap
+    ind.vol_zscore      = s.vol_zscore
+    ind.vol_ready       = s.vol_ready
+    ind.macd_line       = s.macd_line
+    ind.macd_signal     = s.macd_signal
+    ind.macd_histogram  = s.macd_histogram
+    ind.macd_ready      = s.macd_ready
+    ind.stoch_k         = s.stoch_k
+    ind.stoch_d         = s.stoch_d
+    ind.stoch_ready     = s.stoch_ready
 
 
 async def evaluate(price: float) -> None:
@@ -292,7 +254,6 @@ async def evaluate(price: float) -> None:
         pos      = state.open_position
         open_qty = state.open_qty
 
-    # If position open: evaluate exit conditions
     if pos:
         closed = await pm.evaluate(price)
         if not closed:
@@ -307,7 +268,6 @@ async def evaluate(price: float) -> None:
                 )
         return
 
-    # No position: evaluate entry conditions
     if not state.running or state.paused:
         return
     if not risk.can_open():
@@ -318,28 +278,23 @@ async def evaluate(price: float) -> None:
     ob = compute_ob()
     score_l, score_s = await score_snapshot(price, ob)
 
-    # Spread gate
     spread_bps = state.orderbook.spread / price * 10_000 if price > 0 else 999
     atr_ratio  = ind.atr_value / (ATR_BASELINE * price) if price > 0 else 1.0
     max_spread = BASE_SPREAD_BPS * (1 + ATR_SPREAD_MULT * atr_ratio)
     if spread_bps > max_spread:
         return
 
-    # ATR gate
     if ind.atr_ready:
         atr_pct = ind.atr_value / price if price > 0 else 0
         if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
             return
 
-    # Anti-manipulation gate
     if anti_manipulation.is_suspicious():
         return
 
-    # MTF gate
     if not mtf.ready:
         return
 
-    # Funding gate
     await funding.maybe_refresh(config.symbol)
 
     if score_l >= ENTRY_THRESHOLD:
@@ -347,6 +302,7 @@ async def evaluate(price: float) -> None:
             return
         if price <= mtf.ema50:
             return
+        # BUG 8 FIX: place_entry_order wrapper din limit_order_manager
         from .limit_order_manager import place_entry_order
         sl = price * (1 - 0.0008)
         tp = price * (1 + 0.004)
@@ -359,13 +315,11 @@ async def evaluate(price: float) -> None:
         if qty <= 0:
             return
         trade_id = await place_entry_order(
-            side="Buy", qty=qty, price=price,
+            side="Buy", qty=qty,
             stop_loss=sl, take_profit=tp,
         )
         if trade_id:
-            # BUG 1 FIX: await pm.on_open() (acum async, sub _snapshot_lock)
             await pm.on_open("long", qty, price, trade_id)
-            # BUG 3 FIX: risk.on_open() apelat pentru a incrementa _open_count
             risk.on_open()
             with state.lock:
                 state.open_position = "long"
@@ -392,13 +346,11 @@ async def evaluate(price: float) -> None:
         if qty <= 0:
             return
         trade_id = await place_entry_order(
-            side="Sell", qty=qty, price=price,
+            side="Sell", qty=qty,
             stop_loss=sl, take_profit=tp,
         )
         if trade_id:
-            # BUG 1 FIX: await pm.on_open() (acum async, sub _snapshot_lock)
             await pm.on_open("short", qty, price, trade_id)
-            # BUG 3 FIX: risk.on_open() apelat pentru a incrementa _open_count
             risk.on_open()
             with state.lock:
                 state.open_position = "short"

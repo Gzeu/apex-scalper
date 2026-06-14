@@ -1,17 +1,16 @@
-"""Public WebSocket feed v0.7.4: orderbook (L2-50) + klines (1m).
+"""Public WebSocket feed v0.8.1: orderbook (L2-50) + klines (1m).
 
 Changelog:
-  v0.7.4 — PRIORITY 2: Feed latency guard
-             state.last_tick_ts updated on every OB message.
-             _handle_kline() checks staleness before dispatching strategy.evaluate().
-             If time.time() - state.last_tick_ts > FEED_STALE_S (default 2.0s),
-             candle is logged as STALE and strategy is NOT called.
-             Prevents entries based on prices that are 2s+ old.
-  v0.7.2 — GAP #1 fix: bp.on_tick() now passes level lists [(price,size)]
-             instead of scalar totals. Activates book_pressure Check B
-             (deep wall spoof detection).
-  v0.7.1 — bp.on_tick() wired up (was DEAD)
-  v0.3.1 — Full reconnect loop with watchdog integration
+  v0.8.1 — BUG 7 FIX:
+    'from .strategy import strategy' -> AttributeError (strategy e modul, nu obiect)
+    update_indicators(close, high, low, volume) -> semnatura gresita (asteapta dict)
+    Fix: import evaluate, update_indicators direct din strategy
+    update_indicators(close, {"high": high, "low": low, "volume": volume})
+    asyncio.run_coroutine_threadsafe(evaluate(close), _loop)
+  v0.7.4 — Feed latency guard, staleness check inainte de evaluate.
+  v0.7.2 — bp.on_tick() cu level lists (deep wall spoof detection).
+  v0.7.1 — bp.on_tick() wired up.
+  v0.3.1 — Full reconnect loop cu watchdog integration.
 """
 from __future__ import annotations
 
@@ -27,8 +26,8 @@ from .state import state
 _loop: asyncio.AbstractEventLoop | None = None
 _ws:   BybitWS | None = None
 
-OB_DEPTH_FOR_PRESSURE = 10   # top N levels passed to book_pressure
-FEED_STALE_S = float(os.getenv("FEED_STALE_S", "2.0"))  # max age of last tick
+OB_DEPTH_FOR_PRESSURE = 10
+FEED_STALE_S = float(os.getenv("FEED_STALE_S", "2.0"))
 
 
 def _handle_orderbook(msg: dict) -> None:
@@ -37,7 +36,6 @@ def _handle_orderbook(msg: dict) -> None:
     if not data:
         return
     try:
-        # v0.7.4: stamp every OB message for feed latency tracking
         with state.lock:
             state.last_tick_ts = time.time()
             if msg_type == "snapshot":
@@ -50,7 +48,6 @@ def _handle_orderbook(msg: dict) -> None:
                 for item in data.get("a", []):
                     state.orderbook.apply_delta("a", item[0], item[1])
 
-        # GAP #1 FIX v0.7.2: pass level lists, not scalar totals
         from .book_pressure import bp
         bids = data.get("b", [])
         asks = data.get("a", [])
@@ -69,16 +66,18 @@ def _handle_orderbook(msg: dict) -> None:
 def _handle_kline(msg: dict) -> None:
     """Process confirmed (closed) 1m candles only.
 
-    v0.7.4: Feed staleness guard — if last OB tick is older than FEED_STALE_S,
-    the candle is discarded and strategy.evaluate() is NOT called.
-    This prevents entering trades on stale/delayed exchange data.
+    v0.8.1 BUG 7 FIX:
+      - Importam evaluate si update_indicators direct (nu 'strategy.evaluate()')
+      - update_indicators(close, kline_dict) conform semnaturii corecte
+      - asyncio.run_coroutine_threadsafe(evaluate(close), _loop)
+    v0.7.4: Feed staleness guard.
     """
     try:
         data = msg.get("data", [])
         if not data or not data[0].get("confirm", False):
             return
 
-        # v0.7.4 FEED LATENCY GUARD
+        # Feed staleness guard
         with state.lock:
             last_tick_ts = getattr(state, "last_tick_ts", 0.0)
         tick_age = time.time() - last_tick_ts
@@ -98,12 +97,13 @@ def _handle_kline(msg: dict) -> None:
         with state.lock:
             state.last_price = close
 
-        from .strategy import update_indicators
-        update_indicators(close, high, low, volume)
+        # BUG 7 FIX: semnatura corecta update_indicators(price, kline_data: dict)
+        from .strategy import update_indicators, evaluate
+        update_indicators(close, {"high": high, "low": low, "volume": volume})
 
+        # BUG 7 FIX: evaluate(close) corect, nu strategy.evaluate()
         if _loop and _loop.is_running():
-            from .strategy import strategy
-            asyncio.run_coroutine_threadsafe(strategy.evaluate(), _loop)
+            asyncio.run_coroutine_threadsafe(evaluate(close), _loop)
 
     except Exception as e:
         logger.error(f"Kline handler error: {e}")
