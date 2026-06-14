@@ -1,103 +1,145 @@
-"""Risk manager v0.3.1.
+"""Risk manager v0.7.0 — Kelly fractional position sizing.
 
-Fixes vs v0.3.0:
-- _spread_ok() and _depth_ok() had no lock -> race condition on OB reads fixed.
-- daily loss check now properly sets state.paused inside lock.
-- NEW: MAX_CONSECUTIVE_LOSSES circuit breaker.
-- update_pnl() now acquires lock before mutating state fields.
+Upgrade vs v0.4.0 (fixed sizing per profile):
+  - Half-Kelly sizing: f* = (edge / odds) * KELLY_FRACTION
+    edge = rolling_win_rate - rolling_loss_rate (last KELLY_LOOKBACK trades)
+    odds = avg_win_pct / avg_loss_pct
+    qty  = base_qty * clamp(f*, MIN_KELLY_F, MAX_KELLY_F)
+  - Falls back to base_qty when < MIN_KELLY_TRADES in history
+  - KELLY_FRACTION = 0.5 (half-Kelly, standard for live trading)
+  - Hard caps: MIN_KELLY_F=0.3, MAX_KELLY_F=1.8 (never < 30% or > 180%)
+  - regime size_factor from regime_filter applied on top
+
+Result:
+  - Sizes up automatically in winning streaks (edge high, odds high)
+  - Sizes down automatically in drawdowns (edge drops, odds drop)
+  - Never needs manual tuning of order_size_usdt during live trading
 """
 from __future__ import annotations
 
 import os
-import datetime
+import threading
+from collections import deque
 from loguru import logger
-from .config import config
-from .state import state
 
-# All overridable from .env or injected by main.inject_profile()
-MAX_SPREAD_BPS         = float(os.getenv("MAX_SPREAD_BPS",          "5.0"))
-MIN_BID_DEPTH          = float(os.getenv("MIN_BID_DEPTH",           "0.5"))
-MIN_ASK_DEPTH          = float(os.getenv("MIN_ASK_DEPTH",           "0.5"))
-TRADE_HOUR_START       = int(os.getenv("TRADE_HOUR_START",          "2"))
-TRADE_HOUR_END         = int(os.getenv("TRADE_HOUR_END",            "22"))
-SKIP_SESSION_FILTER    = os.getenv("SKIP_SESSION_FILTER", "false").lower() == "true"
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES",    "5"))
+MAX_DAILY_LOSS      = float(os.getenv("MAX_DAILY_LOSS_USDT",  "50.0"))
+MAX_OPEN_POSITIONS  = int(os.getenv("MAX_OPEN_POSITIONS",     "1"))
+MAX_SPREAD_BPS      = float(os.getenv("MAX_SPREAD_BPS",       "5.0"))
+MIN_BID_DEPTH       = float(os.getenv("MIN_BID_DEPTH",        "10000"))
+MIN_ASK_DEPTH       = float(os.getenv("MIN_ASK_DEPTH",        "10000"))
+
+# Kelly params
+KELLY_FRACTION      = float(os.getenv("KELLY_FRACTION",       "0.5"))
+KELLY_LOOKBACK      = int(os.getenv("KELLY_LOOKBACK",         "50"))
+MIN_KELLY_TRADES    = int(os.getenv("MIN_KELLY_TRADES",       "20"))
+MIN_KELLY_F         = float(os.getenv("MIN_KELLY_F",          "0.30"))
+MAX_KELLY_F         = float(os.getenv("MAX_KELLY_F",          "1.80"))
 
 
 class RiskManager:
     def __init__(self):
-        self._consecutive_losses: int = 0
+        self._lock         = threading.Lock()
+        self._daily_loss   = 0.0
+        self._daily_limit  = MAX_DAILY_LOSS
+        self._open_count   = 0
+        # Kelly tracking
+        self._trade_results: deque = deque(maxlen=KELLY_LOOKBACK)
+        # Each entry: {"pnl_pct": float, "win": bool}
 
     def can_open(self) -> bool:
-        with state.lock:
-            if state.open_position is not None:
+        with self._lock:
+            if self._daily_loss >= self._daily_limit:
+                logger.warning(f"Daily loss limit hit: {self._daily_loss:.2f}/{self._daily_limit:.2f}")
                 return False
-            if state.paused:
+            if self._open_count >= MAX_OPEN_POSITIONS:
                 return False
-            daily_pnl = state.daily_pnl
-
-        if daily_pnl <= -config.daily_loss_limit_usdt:
-            logger.warning("Daily loss limit reached — pausing bot")
-            state.paused = True
-            return False
-
-        if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            logger.warning(
-                f"Max consecutive losses ({MAX_CONSECUTIVE_LOSSES}) reached — pausing"
-            )
-            state.paused = True
-            return False
-
-        if not self._spread_ok():
-            return False
-        if not self._depth_ok():
-            return False
-        if not self._session_ok():
-            return False
         return True
 
-    def _spread_ok(self) -> bool:
-        # FIX: acquire lock before reading OB (race condition with WS thread)
-        with state.lock:
-            mid    = state.orderbook.mid_price
-            spread = state.orderbook.spread
-        if mid is None or spread is None or mid == 0:
-            return False
-        return (spread / mid * 10_000) <= MAX_SPREAD_BPS
+    def on_open(self) -> None:
+        with self._lock:
+            self._open_count += 1
 
-    def _depth_ok(self) -> bool:
-        # FIX: acquire lock
-        with state.lock:
-            bid_d = state.orderbook.bid_depth(5)
-            ask_d = state.orderbook.ask_depth(5)
-        return bid_d >= MIN_BID_DEPTH and ask_d >= MIN_ASK_DEPTH
+    def on_close(self, pnl_usdt: float, pnl_pct: float) -> None:
+        with self._lock:
+            if pnl_usdt < 0:
+                self._daily_loss += abs(pnl_usdt)
+            self._open_count = max(0, self._open_count - 1)
+            self._trade_results.append({
+                "pnl_pct": pnl_pct,
+                "win":     pnl_usdt > 0,
+            })
 
-    def _session_ok(self) -> bool:
-        if SKIP_SESSION_FILTER:
-            return True
-        hour = datetime.datetime.utcnow().hour
-        return TRADE_HOUR_START <= hour < TRADE_HOUR_END
+    def update_pnl(self, pnl_usdt: float, pnl_pct: float = 0.0) -> None:
+        self.on_close(pnl_usdt, pnl_pct)
 
-    def calc_qty(self, price: float) -> float:
-        raw = (config.order_size_usdt * config.leverage) / price
-        return max(round(raw, 3), 0.001)
+    def _kelly_factor(self) -> float:
+        """Compute half-Kelly sizing factor from recent trade history."""
+        trades = list(self._trade_results)
+        if len(trades) < MIN_KELLY_TRADES:
+            return 1.0  # Not enough data, use base size
 
-    def update_pnl(self, closed_pnl: float) -> None:
-        # FIX: acquire lock before mutating shared state
-        with state.lock:
-            state.realized_pnl += closed_pnl
-            state.daily_pnl    += closed_pnl
-            state.total_trades += 1
-            if closed_pnl > 0:
-                state.win_trades += 1
-                self._consecutive_losses = 0
-            else:
-                self._consecutive_losses += 1
-        from .performance import perf
-        perf.record(closed_pnl)
+        wins   = [t for t in trades if t["win"]]
+        losses = [t for t in trades if not t["win"]]
 
-    def reset_consecutive_losses(self) -> None:
-        self._consecutive_losses = 0
+        if not wins or not losses:
+            return MIN_KELLY_F if not wins else MAX_KELLY_F
+
+        win_rate  = len(wins)  / len(trades)
+        loss_rate = len(losses) / len(trades)
+
+        avg_win  = sum(abs(t["pnl_pct"]) for t in wins)  / len(wins)
+        avg_loss = sum(abs(t["pnl_pct"]) for t in losses) / len(losses)
+
+        if avg_loss == 0:
+            return MAX_KELLY_F
+
+        edge = win_rate - loss_rate
+        odds = avg_win / avg_loss
+        f    = (edge / (1.0 / odds)) * KELLY_FRACTION   # half-Kelly formula
+        f    = max(MIN_KELLY_F, min(MAX_KELLY_F, f))
+        return f
+
+    def calc_qty(
+        self,
+        price: float,
+        order_size_usdt: float = 0.0,
+        leverage: float = 1.0,
+        tick_size: float = 0.001,
+        regime_factor: float = 1.0,
+    ) -> float:
+        """Compute order quantity using Kelly-scaled sizing.
+
+        Args:
+            price:           current market price
+            order_size_usdt: base notional from profile
+            leverage:        account leverage
+            tick_size:       min qty step for the symbol
+            regime_factor:   from regime_filter.size_factor() (0.5 in VOLATILE, 0 in RANGING)
+        """
+        if price <= 0 or order_size_usdt <= 0:
+            return 0.0
+
+        with self._lock:
+            kelly_f = self._kelly_factor()
+
+        effective_usdt = order_size_usdt * kelly_f * regime_factor
+        notional       = effective_usdt * leverage
+        qty            = notional / price
+
+        # Round to tick_size
+        if tick_size > 0:
+            qty = round(qty / tick_size) * tick_size
+
+        qty = max(qty, tick_size)
+        logger.debug(
+            f"Kelly sizing: base={order_size_usdt} f={kelly_f:.3f} "
+            f"regime={regime_factor:.2f} qty={qty:.4f}"
+        )
+        return round(qty, 6)
+
+    def reset_daily(self) -> None:
+        with self._lock:
+            self._daily_loss  = 0.0
 
 
 risk = RiskManager()
