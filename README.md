@@ -1,9 +1,33 @@
-# ⚡ Apex Scalper v0.7.1
+# ⚡ Apex Scalper v0.7.2
 
 Production-grade async crypto scalping bot for **Bybit USDT Perpetual Futures** (V5 API).  
 Built to compete with commercial-grade bots via institutional-level signal engineering, smart execution, and probabilistic risk management.
 
-> **Status:** Internally consistent and feature-complete. Ready for testnet validation (5+ days) before mainnet.
+> **Status:** All critical bugs and integration gaps closed. Ready for testnet validation (5+ days) before mainnet.
+
+---
+
+## Bug Fix History
+
+### v0.7.2 — Gap Closure (June 2026)
+| ID | File | Issue | Fix |
+|---|---|---|---|
+| GAP #1 | `feed.py` | `bp.on_tick()` passed scalar totals → book_pressure Check B (deep wall) disabled | Pass `list[(price, size)]` level data; activates granular spoof detection |
+| GAP #2 | `position_manager.py` | `trader._api_call()` does not exist → `AttributeError` on every partial close | Import and use module-level `_api_call_with_retry` from `trader.py` |
+| GAP #3 | `telegram_ui.py` | `/resume` did not reset consecutive loss counter → permanent entry block after N losses | `/resume` now calls `risk.reset_consecutive_losses()` |
+
+### v0.7.1 — Critical Fixes (June 2026)
+| ID | File | Issue | Fix |
+|---|---|---|---|
+| FIX #1 | `position_manager.py` | `retCode==0` assumed fill → false state, wrong qty tracking | Poll `get_order_history` to confirm fill |
+| FIX #2 | `limit_order_manager.py` | `_market_fallback()` missing `stop_loss`/`take_profit` → no native SL on fallback | Pass all params through all 3 callsites |
+| FIX #3 | `persistence.py` | New connection per `record_trade()` → `database is locked` under load | Single persistent connection + WAL mode |
+| FIX #4 | `regime_filter.py` | ADX used simple average, not Wilder smoothing → diverges from TradingView | Implemented Wilder EMA smoothing |
+| FIX #5 | `book_pressure.py` | Absorption used avg total vol → spoof wall at depth passes undetected | Two-check granular system: near-touch (Check A) + deep wall ratio (Check B) |
+| FIX #6 | `anti_manipulation.py` | `_signals` singleton mutated without lock → race condition | `threading.Lock()` with atomic snapshot writes |
+| FIX #7 | `limit_order_manager.py` | `get_instrument_info()` REST call on every entry | Lazy-cache `tick_size` after first call |
+| FIX #8 | `regime_filter.py` | `sorted()` on 28,800-element deque per candle → 15ms/candle | `bisect.insort` on parallel sorted list → O(log n) |
+| FIX #9 | `persistence.py` | OPEN trade record never updated → duplicate records on restart | `record_open_trade()` + `close_trade_record(trade_id)` correlated pair |
 
 ---
 
@@ -27,6 +51,20 @@ ATR(14) Wilder is used as a volatility gate and for SL/TP sizing (not in score).
 
 ---
 
+## Book Pressure — Absorption Detection v0.7.1
+
+Two independent checks block entry when absorption is detected:
+
+| Check | Logic | Detects |
+|---|---|---|
+| **Check A — Near-touch wall** | `avg_near_ask / avg_near_bid > 3.0×` (levels 0–2) | Genuine resistance at touch — real orders that will be hit |
+| **Check B — Deep wall ratio** | `avg_deep_ask / avg_near_ask > 5.0×` (levels 3–9) | Spoof pattern: thin near-touch + huge wall at depth |
+
+Both checks use a 5-tick rolling window to smooth single-tick noise. Either check alone is sufficient to block.  
+Feed passes `list[(price, size)]` level data (not scalar totals) since v0.7.2, activating full granular detection.
+
+---
+
 ## Regime Detection
 
 Market classified every candle into **TRENDING / RANGING / VOLATILE / NEUTRAL**:
@@ -37,6 +75,8 @@ Market classified every candle into **TRENDING / RANGING / VOLATILE / NEUTRAL**:
 | VOLATILE | any | ≥ 80th | any | ✅ allowed | 50% |
 | NEUTRAL | 20–25 | 20–80th | 0.45–0.55 | ✅ allowed | 75% |
 | RANGING | < 20 | < 20th | < 0.45 | ❌ blocked | 0% |
+
+ADX uses **Wilder smoothing** (v0.7.1 fix) — aligned with TradingView to ±0.3 after warmup.
 
 ---
 
@@ -50,10 +90,11 @@ Market classified every candle into **TRENDING / RANGING / VOLATILE / NEUTRAL**:
 | TP2 | +0.25% | +0.28% | +0.45% | 25% of position |
 | TP3 | +0.40% | +0.45% | +0.75% | 50% remainder |
 
-All exits via Limit `reduceOnly`. Fallback to Market if not filled in 2s.
+All exits via Limit `reduceOnly`. Fallback to Market if not filled after poll confirmation.  
+Fill confirmed via `get_order_history` poll — never assumed from `retCode==0` (v0.7.1 fix).
 
 ### Other Exit Conditions
-- **Stop Loss**: native exchange SL attached on every entry
+- **Stop Loss**: native exchange SL attached on every entry (including market fallback — v0.7.1 fix)
 - **Trailing Stop**: activates after `TRAIL_PCT`, amended on exchange in real-time via `amend_sl_tp()`
 - **Timeout**: `MAX_HOLD_CANDLES` (4–5 by symbol)
 - **Pyramid**: add to winners if score ≥ 0.70 AND PnL ≥ 0.10% (configurable per symbol)
@@ -65,10 +106,10 @@ All exits via Limit `reduceOnly`. Fallback to Market if not filled in 2s.
 | Feature | Detail |
 |---|---|
 | Entry | **Limit PostOnly** (maker 0.020%) |
-| Exit | **Limit reduceOnly**, Market fallback 2s |
+| Exit | **Limit reduceOnly**, Market fallback with fill confirmation |
 | Order amendment | `amend_order()` — modify SL/TP without cancel+repost |
 | Rate limiting | Token bucket 10 req/s, burst 3, exponential backoff on 429 |
-| Native SL/TP | Attached on every entry (exchange-side) |
+| Native SL/TP | Attached on every entry including market fallback (v0.7.1 fix) |
 | Ghost recovery | Detects SL triggered offline, re-syncs on restart |
 | Position mode | OneWay enforced at startup |
 
@@ -85,8 +126,8 @@ All exits via Limit `reduceOnly`. Fallback to Market if not filled in 2s.
 | **Depth gate** | Min bid/ask depth (USDT) required before entry |
 | **Funding rate filter** | Blocks entries counter to negative funding |
 | **MTF filter** | EMA50(15m) must confirm 1m direction |
-| **Anti-manipulation** | L2 spoof / wash detection |
-| **Consecutive losses** | Pause after N consecutive losses |
+| **Anti-manipulation** | L2 spoof / wash detection (thread-safe singleton v0.7.1 fix) |
+| **Consecutive losses** | Pause after N losses. `/resume` resets counter (v0.7.2 fix). |
 
 ---
 
@@ -131,7 +172,7 @@ Optuna grid search over TP/SL/threshold params, optimizing for **Sharpe net of r
 | WebSocket | pybit `orderbook.50` + `kline.1`, auto-reconnect |
 | Orderbook | SortedDict L2, O(log n) updates |
 | Watchdog | Heartbeat monitor, auto-restart (max 3/hour) |
-| Persistence | SQLite — trade log + Kelly state survive restarts |
+| Persistence | SQLite WAL — correlated open/close records, survive restarts (v0.7.1 fix) |
 | Daily report | Telegram 23:59 UTC automated summary |
 | Midnight reset | Daily PnL counters at UTC 00:00:05 |
 | Graceful shutdown | SIGINT/SIGTERM closes position before exit |
@@ -144,7 +185,8 @@ Optuna grid search over TP/SL/threshold params, optimizing for **Sharpe net of r
 | Command | Action |
 |---|---|
 | `/start` `/stop` | Enable/disable trading |
-| `/pause` `/resume` | Suspend/resume entries |
+| `/pause` | Suspend new entries |
+| `/resume` | Resume entries, reset daily PnL + consecutive loss counter |
 | `/status` | Price, spread, EMA, RSI, ATR, regime, book pressure |
 | `/signals` | Full snapshot: all 10 indicators + book Δ + regime |
 | `/regime` | Regime label, ADX, Hurst, size factor, entry allowed |
@@ -153,7 +195,7 @@ Optuna grid search over TP/SL/threshold params, optimizing for **Sharpe net of r
 | `/balance` | USDT wallet balance |
 | `/close` | Force close position |
 | `/watchdog` | WS feed health + last heartbeat |
-| `/setparam KEY VALUE` | Live-tune any of 26 strategy parameters |
+| `/setparam KEY VALUE` | Live-tune any of 25 strategy parameters |
 
 ---
 
@@ -161,26 +203,26 @@ Optuna grid search over TP/SL/threshold params, optimizing for **Sharpe net of r
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│  Bybit WebSocket (pybit thread)                                │
-│   ├─ orderbook.50 → SortedDict L2 + bp.on_tick()             │
-│   └─ kline.1 (confirmed) → update_indicators()               │
-│        └─ run_coroutine_threadsafe → strategy.evaluate()       │
+│  Bybit WebSocket (pybit thread)                                   │
+│   ├─ orderbook.50 → SortedDict L2 + bp.on_tick(levels)  v0.7.2   │
+│   └─ kline.1 (confirmed) → update_indicators()                   │
+│        └─ run_coroutine_threadsafe → strategy.evaluate()          │
 ├───────────────────────────────────────────────────────────────────┤
-│  Async Event Loop                                              │
-│   ├─ regime_filter    → ADX + ATR pct + Hurst (every candle)  │
-│   ├─ book_pressure    → cum. delta + accel + absorption        │
-│   ├─ strategy         → 10-signal weighted score               │
-│   ├─ position_manager → TP1/TP2/TP3 scale-out + pyramid        │
-│   ├─ risk             → half-Kelly × regime_factor             │
-│   ├─ trader           → PostOnly + amend + rate limiter        │
-│   ├─ mtf_filter       → EMA50(15m) refresh every 5m            │
-│   ├─ funding_rate     → Bybit fetch every 5m                   │
-│   ├─ anti_manip       → L2 spoof detection                     │
-│   ├─ persistence      → SQLite write on every trade            │
-│   ├─ performance      → Sharpe/PF/DD Welford streaming         │
-│   ├─ watchdog         → heartbeat + auto-restart               │
-│   ├─ daily_report     → Telegram 23:59 UTC                     │
-│   └─ telegram_ui      → 11 commands + /regime + /setparam(26)  │
+│  Async Event Loop                                                 │
+│   ├─ regime_filter    → ADX Wilder + ATR pct + Hurst              │
+│   ├─ book_pressure    → cum.delta + accel + 2-check absorption    │
+│   ├─ strategy         → 10-signal weighted score                  │
+│   ├─ position_manager → TP1/2/3 + fill-poll + trail + pyramid     │
+│   ├─ risk             → half-Kelly × regime_factor                │
+│   ├─ trader           → PostOnly + amend + rate limiter           │
+│   ├─ mtf_filter       → EMA50(15m) refresh every 5m               │
+│   ├─ funding_rate     → Bybit fetch every 5m                      │
+│   ├─ anti_manip       → thread-safe spoof detection               │
+│   ├─ persistence      → SQLite WAL, correlated records            │
+│   ├─ performance      → Sharpe/PF/DD Welford streaming            │
+│   ├─ watchdog         → heartbeat + auto-restart                  │
+│   ├─ daily_report     → Telegram 23:59 UTC                        │
+│   └─ telegram_ui      → 12 commands + /setparam(25)               │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -208,7 +250,7 @@ python -m apex_scalper.optimizer --symbol BTCUSDT
 # 2. Walk-forward OOS (must return MAINNET READY)
 python -m apex_scalper.walk_forward --symbol BTCUSDT --windows 6
 
-# 3. Testnet minimum 5 days — watch /regime logs
+# 3. Testnet minimum 5 days — watch /regime and /signals logs
 BYBIT_TESTNET=true python -m apex_scalper.main
 
 # 4. Calibrate BP_BASE_THRESHOLD from /signals bp.cum_delta range
@@ -236,6 +278,8 @@ See [.env.example](.env.example) for all 50+ parameters with comments.
 | `MAX_DAILY_LOSS_USDT` | `50` | Daily loss limit |
 | `KELLY_FRACTION` | `0.5` | Half-Kelly multiplier |
 | `BP_BASE_THRESHOLD` | `50000` | Book pressure delta threshold (calibrate from testnet) |
+| `ABSORPTION_NEAR_LEVELS` | `3` | Levels considered near-touch for absorption Check A |
+| `DEEP_WALL_MULT` | `5.0` | Deep wall vs near-touch ratio threshold for Check B |
 | `ADX_TRENDING_MIN` | `25.0` | ADX threshold for TRENDING regime |
 | `USE_LIMIT_ORDERS` | `true` | PostOnly entry orders |
 
@@ -243,21 +287,32 @@ See [.env.example](.env.example) for all 50+ parameters with comments.
 
 ## Codebase Overview
 
-| Module | Version | Lines | Purpose |
-|---|---|---|---|
-| `strategy.py` | v0.7.1 | ~220 | 10-signal scoring + entry/exit logic |
-| `indicators.py` | v0.7.1 | ~230 | EMA/RSI/ATR/BB/VWAP/VolZ/MACD/StochRSI |
-| `position_manager.py` | v0.7.1 | ~240 | TP1/2/3 scale-out + trailing + pyramid |
-| `trader.py` | v0.7.0 | ~350 | Bybit V5 REST, PostOnly, amend, rate limiter |
-| `risk.py` | v0.7.0 | ~130 | Half-Kelly sizing + daily loss guard |
-| `regime_filter.py` | v0.7.0 | ~145 | ADX + ATR pct + Hurst classification |
-| `book_pressure.py` | v0.7.0 | ~115 | Cum delta + acceleration + absorption |
-| `telegram_ui.py` | v0.7.1 | ~195 | 12 commands + live /setparam(26 params) |
-| `config.py` | v0.7.1 | ~175 | 5 symbol profiles, all params complete |
-| `main.py` | v0.7.1 | ~125 | inject_profile + startup + tasks |
-| `walk_forward.py` | v0.7.0 | ~210 | Rolling OOS + Monte Carlo + verdict |
-| `backtester.py` | v0.7.0 | ~430 | Vectorized backtest + fee modeling |
-| `optimizer.py` | v0.7.0 | ~210 | Optuna Sharpe optimization |
+| Module | Version | Purpose |
+|---|---|---|
+| `main.py` | v0.7.1 | inject_profile + startup + async tasks |
+| `config.py` | v0.7.1 | 5 symbol profiles, all 50+ env params |
+| `state.py` | v0.7.0 | Shared mutable state + threading.Lock |
+| `feed.py` | v0.7.2 | WebSocket OB + kline, level-granular bp.on_tick |
+| `trader.py` | v0.7.0 | Bybit V5 REST, PostOnly, amend, rate limiter |
+| `strategy.py` | v0.7.2 | 10-signal weighted scoring + entry/exit logic |
+| `position_manager.py` | v0.7.2 | TP1/2/3 fill-poll + trailing SL + pyramid |
+| `limit_order_manager.py` | v0.5.1 | PostOnly Limit + amend + SL/TP on fallback |
+| `risk.py` | v0.7.1 | Half-Kelly sizing + daily loss + consec losses |
+| `book_pressure.py` | v0.7.1 | Cum delta + accel + 2-check granular absorption |
+| `regime_filter.py` | v0.7.1 | ADX Wilder + ATR percentile (bisect) + Hurst |
+| `anti_manipulation.py` | v0.4.2 | Thread-safe spoof/wash detection |
+| `indicators.py` | v0.7.1 | EMA/RSI/ATR/BB/VWAP/VolZ/MACD/StochRSI |
+| `orderbook_analytics.py` | v0.7.0 | OB imbalance + pressure score for strategy |
+| `persistence.py` | v0.4.1 | SQLite WAL, correlated open/close records |
+| `telegram_ui.py` | v0.7.2 | 12 commands + /setparam(25) + /resume fix |
+| `funding_rate.py` | v0.7.0 | Funding rate gate (fetch every 5m) |
+| `mtf_filter.py` | v0.7.0 | Multi-timeframe EMA50(15m) confirmation |
+| `watchdog.py` | v0.7.0 | Heartbeat + auto-restart (max 3/hour) |
+| `performance.py` | v0.7.0 | Sharpe/PF/MaxDD Welford streaming |
+| `daily_report.py` | v0.7.0 | Telegram 23:59 UTC automated summary |
+| `backtester.py` | v0.7.0 | Vectorized backtest + fee modeling |
+| `optimizer.py` | v0.7.0 | Optuna Sharpe optimization |
+| `walk_forward.py` | v0.7.0 | Rolling OOS + Monte Carlo + verdict |
 
 ---
 

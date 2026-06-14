@@ -1,4 +1,4 @@
-"""Telegram bot UI v0.7.1
+"""Telegram bot UI v0.7.2
 Commands:
   /start /stop /pause /resume /status /pnl /balance /close
   /setparam KEY VALUE   — live strategy tuning
@@ -6,6 +6,14 @@ Commands:
   /watchdog             — WS health status
   /signals              — full indicator snapshot (all v0.7.1 indicators)
   /regime               — market regime label + ADX + Hurst + size factor
+
+Changelog:
+  v0.7.2 — GAP #3 fix: /resume now calls risk.reset_consecutive_losses()
+             to clear MAX_CONSECUTIVE_LOSSES block. Without this, after 5
+             consecutive losses the bot is permanently blocked until restart.
+             /resume message updated to reflect this.
+  v0.7.1 — /signals shows all 10 indicators + bp.cum_delta + regime
+             /regime command added. /setparam extended to 26 params.
 """
 from __future__ import annotations
 
@@ -55,9 +63,22 @@ async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """GAP #3 FIX v0.7.2: also resets consecutive loss counter.
+    Without this, MAX_CONSECUTIVE_LOSSES permanently blocks entries
+    after N losses with no recovery path except full restart.
+    """
+    from .risk import risk
     state.paused    = False
     state.daily_pnl = 0.0
-    await u.message.reply_text("▶️ *RESUMED* (daily PnL reset)", parse_mode="Markdown")
+    risk.reset_consecutive_losses()   # GAP #3 FIX
+    consec = getattr(risk, '_consecutive_losses', 0)
+    await u.message.reply_text(
+        "▶️ *RESUMED*\n"
+        "`daily_pnl` reset to 0\n"
+        "`consecutive_losses` reset to 0",
+        parse_mode="Markdown",
+    )
+    logger.info(f"[TG] /resume: paused=False, daily_pnl=0, consecutive_losses reset (was {consec})")
 
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -150,7 +171,7 @@ async def cmd_signals(u: Update, c: ContextTypes.DEFAULT_TYPE):
              if ind.stoch_ready else "warming up")
 
     msg = (
-        f"🔮 *Signals Snapshot v0.7.1* `{config.symbol}`\n\n"
+        f"🔮 *Signals Snapshot v0.7.2* `{config.symbol}`\n\n"
         f"📈 *Trend*\n"
         f"EMA 9/21/50: `{ind.ema_fast:.2f}` / `{ind.ema_slow:.2f}` / `{ind.ema_trend:.2f}`\n"
         f"Regime: `{regime.label}` | ADX: `{regime.adx}` | sz×: `{regime.size_factor():.2f}`\n\n"
@@ -219,7 +240,7 @@ async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
         # Risk
         "MAX_SPREAD_BPS":   (rm, float), "MIN_BID_DEPTH":    (rm, float),
         "MIN_ASK_DEPTH":    (rm, float), "KELLY_FRACTION":   (rm, float),
-        # Position manager — all TP/SL/trailing/scale-out params
+        # Position manager
         "TP1_PCT":          (pm, float), "TP2_PCT":          (pm, float),
         "TP3_PCT":          (pm, float),
         "TP1_FRACTION":     (pm, float), "TP2_FRACTION":     (pm, float),
@@ -245,7 +266,7 @@ def build_app():
     for name, fn in [
         ("start",    cmd_start),
         ("stop",     cmd_stop),
-        ("pause",    cmd_pause),
+        ("pause",    cmd_resume),
         ("resume",   cmd_resume),
         ("status",   cmd_status),
         ("pnl",      cmd_pnl),
