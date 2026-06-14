@@ -1,26 +1,19 @@
-"""SQLite persistence v0.4.1 — WAL connection + correlated trade records.
+"""SQLite persistence v0.8.2 — Bug 14+15 fix: fallback complet in close_trade_record().
 
-Fixes vs v0.4.0:
-  FIX #3 — Persistent WAL connection replaces per-call sqlite3.connect():
-    A single sqlite3.Connection is created at __init__ with WAL journal mode.
-    All methods reuse self._conn_obj under self._lock.
-    Eliminates 'database is locked' errors under concurrent record_trade calls
-    and removes the overhead of connection setup/teardown per write.
+Changelog:
+  v0.8.2 — BUG 14 FIX: close_trade_record() fallback scria symbol='', side='', entry=0
+    -> rand corupt in DB -> analytics/daily_report primeau date murdare.
+    Fix: close_trade_record() accepta symbol, side, entry, qty optionali
+    si le foloseste in fallback-ul record_trade() cu valorile corecte.
 
-  FIX #9 — Open trades correlated with close records:
-    New method record_open_trade(): inserts with reason='OPEN', exit_price=0.
-    New method close_trade_record(): updates the matching OPEN row to fill in
-      exit_price, pnl_usdt, pnl_pct, and reason (TP1/TP2/TP3/SL/TRAIL/TIMEOUT).
-    If no matching OPEN row exists (e.g. bot was restarted mid-trade), falls back
-    to inserting a new row (backward-compatible).
-    Result: one complete row per trade lifecycle, no duplicate/orphaned records.
+    BUG 15 FIX: fallback nu actualiza daily_pnl pentru simbolul corect
+    (symbol='' -> load_daily_pnl(symbol) nu gasea randul).
+    Fix: symbol corect transmis in record_trade() din fallback.
 
-Schema unchanged (backward-compatible). record_trade() retained for legacy callers
-(e.g. SL_OFFLINE reconstruction in trader.py).
+  v0.4.1 — WAL connection + correlated trade records (FIX #3 + #9).
 """
 from __future__ import annotations
 
-import bisect
 import sqlite3
 import threading
 from datetime import datetime, timezone, date
@@ -36,7 +29,6 @@ class Database:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self._path = path
         self._lock = threading.Lock()
-        # FIX #3: single persistent connection with WAL mode
         self._conn_obj: sqlite3.Connection = sqlite3.connect(
             self._path, check_same_thread=False
         )
@@ -47,7 +39,6 @@ class Database:
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
-        """Return the persistent connection. All callers use this."""
         return self._conn_obj
 
     def _init_schema(self) -> None:
@@ -87,10 +78,6 @@ class Database:
             self._conn_obj.commit()
         logger.info(f"SQLite DB initialised (WAL) at {self._path}")
 
-    # -------------------------------------------------------------------------
-    # FIX #9 — trade lifecycle: open → close as a single correlated row
-    # -------------------------------------------------------------------------
-
     def record_open_trade(
         self,
         symbol: str,
@@ -122,8 +109,19 @@ class Database:
         pnl_usdt: float,
         pnl_pct: float,
         reason: str,
+        # BUG 14+15 FIX: parametri optionali pentru fallback complet
+        symbol: str = "",
+        side: str = "",
+        entry: float = 0.0,
+        qty: float = 0.0,
     ) -> None:
-        """Update the OPEN row with exit data. Falls back to insert if not found."""
+        """Update the OPEN row with exit data.
+
+        v0.8.2 BUG 14+15 FIX:
+          Fallback foloseste acum symbol/side/entry/qty corecte in loc de
+          valori goale, astfel incat daily_pnl e actualizat corect pentru
+          simbolul tranzactionat si randul din DB e complet.
+        """
         if trade_id and trade_id > 0:
             with self._lock:
                 rows_affected = self._conn_obj.execute(
@@ -136,18 +134,45 @@ class Database:
                 ).rowcount
                 self._conn_obj.commit()
             if rows_affected:
-                return  # success path
+                # Actualizeaza si daily_pnl (UPDATE nu o face automat)
+                self._update_daily_pnl(symbol, pnl_usdt)
+                return
 
-        # Fallback: insert a new close row (bot restarted mid-trade, no open row)
+        # Fallback: insert complet (bot restartat mid-trade sau trade_id invalid)
+        # BUG 14+15 FIX: transmitem simbolul si datele corecte
         self.record_trade(
-            symbol="", side="", entry=0.0,
-            exit_price=exit_price, qty=0.0,
-            pnl_usdt=pnl_usdt, pnl_pct=pnl_pct, reason=reason,
+            symbol=symbol,
+            side=side,
+            entry=entry,
+            exit_price=exit_price,
+            qty=qty,
+            pnl_usdt=pnl_usdt,
+            pnl_pct=pnl_pct,
+            reason=reason,
         )
 
-    # -------------------------------------------------------------------------
-    # Legacy record_trade — kept for backward compat (SL_OFFLINE, partials)
-    # -------------------------------------------------------------------------
+    def _update_daily_pnl(self, symbol: str, pnl_usdt: float) -> None:
+        """Actualizeaza daily_pnl table dupa un UPDATE pe trades (nu INSERT).
+
+        record_trade() face asta automat la INSERT, dar close_trade_record()
+        face UPDATE pe randul existent -> daily_pnl nu era actualizat.
+        """
+        if not symbol:
+            return
+        today = date.today().isoformat()
+        with self._lock:
+            self._conn_obj.execute(
+                """
+                INSERT INTO daily_pnl (date, symbol, realized_pnl, total_trades, win_trades)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    realized_pnl  = realized_pnl  + excluded.realized_pnl,
+                    total_trades  = total_trades  + 1,
+                    win_trades    = win_trades    + excluded.win_trades
+                """,
+                (today, symbol, round(pnl_usdt, 6), 1 if pnl_usdt > 0 else 0),
+            )
+            self._conn_obj.commit()
 
     def record_trade(
         self,

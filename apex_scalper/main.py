@@ -1,8 +1,11 @@
-"""Entrypoint v0.7.8.
+"""Entrypoint v0.8.2.
 
-New in v0.7.8 vs v0.7.7:
-  - log_sink.py: structured JSON logs in logs/apex_structured.jsonl
-    Zero dependente noi. Parsabil cu jq din terminal sau Grafana Loki.
+Changelog:
+  v0.8.2 — BUG 13 FIX: _midnight_reset_loop() nu reseta state.total_trades/win_trades.
+    La UTC midnight daily_pnl era resetat dar total_trades si win_trades ramaneau
+    cumulate din ziua precedenta -> pulse afisa win rate incorect dupa mai multe zile.
+    Fix: state.total_trades = 0, state.win_trades = 0 adaugate la reset nocturn.
+  v0.7.8 — log_sink.py: structured JSON logs.
 """
 from __future__ import annotations
 
@@ -31,20 +34,17 @@ from .log_sink import setup_json_sink
 
 def setup_logging() -> None:
     logger.remove()
-    # Sink 1: stderr (color, human readable)
     logger.add(
         sys.stderr,
         level=config.log_level,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
     )
-    # Sink 2: text file rotativ
     logger.add(
         "logs/apex_scalper.log",
         rotation="10 MB",
         retention="14 days",
         level=config.log_level,
     )
-    # Sink 3: JSON structurat (parsabil jq / Grafana Loki)
     setup_json_sink()
 
 
@@ -117,16 +117,26 @@ def inject_profile(symbol: str) -> None:
 
 
 async def _midnight_reset_loop() -> None:
+    """Reset daily counters la UTC midnight.
+
+    v0.8.2 BUG 13 FIX: adaugat reset state.total_trades si state.win_trades.
+    Inainte: doar daily_pnl era resetat -> win rate in pulse incorect dupa >1 zi.
+    """
     from datetime import datetime, timezone, timedelta
     while True:
         now    = datetime.now(timezone.utc)
-        target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        target = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=5, microsecond=0
+        )
         await asyncio.sleep((target - now).total_seconds())
         from .risk import risk as r
         r.reset_daily()
         with state.lock:
-            state.daily_pnl = 0.0
-        logger.info("Daily PnL counters reset at UTC midnight")
+            state.daily_pnl    = 0.0
+            # BUG 13 FIX: reseteaza si contoarele zilnice din state
+            state.total_trades = 0
+            state.win_trades   = 0
+        logger.info("Daily counters reset at UTC midnight (pnl + trades + wins)")
 
 
 async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
@@ -154,7 +164,7 @@ async def main() -> None:
     setup_logging()
     env_label = "TESTNET" if config.testnet else "⚠️  MAINNET"
     logger.info(
-        f"⚡ Apex Scalper v0.7.8 | {config.symbol} | "
+        f"⚡ Apex Scalper v0.8.2 | {config.symbol} | "
         f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
@@ -205,13 +215,13 @@ async def main() -> None:
     asyncio.create_task(run_pulse_loop(config.symbol))
     logger.info(
         "Background tasks: watchdog | MTF | funding | daily_report | "
-        "midnight_reset | pulse (1min) ✅"
+        "midnight_reset | pulse (1min) \u2705"
     )
 
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.7.8 active\n"
+        f"state.running = True — strategy v0.8.2 active\n"
         f"  JSON logs:   logs/apex_structured.jsonl (jq parsabil)\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"
