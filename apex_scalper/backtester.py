@@ -1,30 +1,17 @@
-"""Backtester v0.6.0 — real fee simulation, aligned weights with strategy.py.
+"""Backtester v0.8.5 — real fee simulation, aligned weights with strategy.py.
 
-Fixes vs v0.4.0:
-  🔴 CRITICAL:
-  - Fee simulation corrected:
-    Entry fee: 0.020% maker (Limit PostOnly) — was MISSING
-    Exit fee:  0.020% maker (Limit close)    — was 0.055% taker
-    Delta: real Sharpe is ~15-25% lower than v0.4.0 results showed.
-    If OOS Sharpe was 1.2 before, expect ~0.9-1.0 with real fees.
-  - Signal weights aligned with strategy.py v0.6.0:
-    ema_cross=0.23, trend=0.18, rsi=0.18, imbalance=0.18,
-    volume=0.10, atr=0.03, bb=0.05, vwap=0.05
-    Previously backtester used different weights (ema_cross=0.25, trend=0.20)
-    causing optimized params to not match live behavior.
-  - BB + VWAP signals added to backtest scoring (were missing in v0.4.0)
-    Backtester now has 8/8 signals matching strategy.py.
-  - RSI overbought/oversold penalty added (matches strategy.py v0.6.0)
-  - ENTRY_THRESHOLD default raised to 0.65
+Changelog:
+  v0.8.5 — BUG 21 FIX: TP1 partial exit nu halves pos.entry_fee.
+    La TP1: partial qty inchisa, dar pos.entry_fee ramana intacta.
+    La exit final: pos.entry_fee dedusa din nou complet -> fee ~1.5x per trade.
+    Sharpe si PnL net subestimat sistematic pe toate trade-urile cu TP1.
+    Fix: pos.entry_fee /= 2 la TP1 partial exit.
 
-  🟡 IMPORTANT:
-  - Slippage model added: 0.5 tick slippage on entry + exit (realistic for 1m)
-    Can be overridden via profile["slippage_ticks"]
-  - Fee report in summary: shows total fees paid vs total PnL
+  v0.8.5 — BUG 22 FIX: Sharpe BtResult.sharpe folosea population std (/ n).
+    Subestima deviatia pe seturi mici de trade-uri -> Sharpe supraestimat.
+    Fix: / (len(returns) - 1) consistent cu Welford din performance.py.
 
-Usage:
-    python -m apex_scalper.backtester --symbol BTCUSDT --days 90
-    python -m apex_scalper.backtester --symbol ETHUSDT --days 90 --output results.json
+  v0.6.0 — fee simulation corecta, slippage model, BB+VWAP signals.
 """
 from __future__ import annotations
 
@@ -44,16 +31,14 @@ from .indicators import IndicatorState, update_all
 
 KLINE_LIMIT = 200
 
-# Fee constants (mainnet 2026, non-VIP Bybit USDT Perp)
-MAKER_FEE = 0.00020   # 0.020% — Limit PostOnly entry + exit
-TAKER_FEE = 0.00055   # 0.055% — Market fallback only
+MAKER_FEE = 0.00020
+TAKER_FEE = 0.00055
 
-# Signal weights — must match strategy.py exactly
 _W = {
     "ema_cross":  0.23,
     "trend":      0.18,
     "rsi":        0.18,
-    "imbalance":  0.18,   # not available in BT -> neutral credit 0.09 (50%)
+    "imbalance":  0.18,
     "volume":     0.10,
     "atr":        0.03,
     "bb":         0.05,
@@ -112,7 +97,7 @@ class BtPosition:
     entry_idx: int
     tp1_done: bool = False
     trailing_stop: float = 0.0
-    entry_fee: float = 0.0   # recorded at open
+    entry_fee: float = 0.0
 
 
 @dataclass
@@ -122,8 +107,8 @@ class BtResult:
     total_trades:  int   = 0
     win_trades:    int   = 0
     total_pnl:     float = 0.0
-    total_fees:    float = 0.0   # NEW v0.6.0
-    gross_pnl:     float = 0.0   # before fees
+    total_fees:    float = 0.0
+    gross_pnl:     float = 0.0
     trades:        list  = field(default_factory=list)
     equity_curve:  list  = field(default_factory=list)
 
@@ -133,11 +118,14 @@ class BtResult:
 
     @property
     def sharpe(self) -> float:
-        returns = [t["pnl_pct_net"] for t in self.trades]  # net of fees
-        if len(returns) < 2:
+        returns = [t["pnl_pct_net"] for t in self.trades]
+        n = len(returns)
+        if n < 2:
             return 0.0
-        mu  = sum(returns) / len(returns)
-        std = math.sqrt(sum((r - mu) ** 2 for r in returns) / len(returns))
+        mu  = sum(returns) / n
+        # BUG 22 FIX: sample std (/ n-1) in loc de population std (/ n)
+        variance = sum((r - mu) ** 2 for r in returns) / (n - 1)
+        std = math.sqrt(variance) if variance > 0 else 0.0
         return round((mu / std) * math.sqrt(252 * 24 * 60) if std > 0 else 0.0, 3)
 
     @property
@@ -160,18 +148,18 @@ class BtResult:
 
     def summary(self) -> dict:
         return {
-            "symbol":           self.symbol,
-            "days":             self.days,
-            "total_trades":     self.total_trades,
-            "win_trades":       self.win_trades,
-            "winrate_pct":      self.winrate,
-            "gross_pnl_usdt":   round(self.gross_pnl, 4),
-            "total_fees_usdt":  round(self.total_fees, 4),
-            "net_pnl_usdt":     round(self.total_pnl, 4),
-            "sharpe":           self.sharpe,
+            "symbol":            self.symbol,
+            "days":              self.days,
+            "total_trades":      self.total_trades,
+            "win_trades":        self.win_trades,
+            "winrate_pct":       self.winrate,
+            "gross_pnl_usdt":    round(self.gross_pnl, 4),
+            "total_fees_usdt":   round(self.total_fees, 4),
+            "net_pnl_usdt":      round(self.total_pnl, 4),
+            "sharpe":            self.sharpe,
             "max_drawdown_usdt": self.max_drawdown,
-            "profit_factor":    self.profit_factor,
-            "fee_model":        f"maker={MAKER_FEE*100:.3f}% entry+exit + 0.5tick slippage",
+            "profit_factor":     self.profit_factor,
+            "fee_model":         f"maker={MAKER_FEE*100:.3f}% entry+exit + 0.5tick slippage",
         }
 
 
@@ -190,21 +178,17 @@ def _score(
     rsi_ob_penalty: float = 65.0,
     rsi_os_penalty: float = 35.0,
 ) -> float:
-    """Mirrors strategy.py _score_long / _score_short exactly."""
     score = 0.0
     RSI_OB_LIMIT = 70.0
     RSI_OS_LIMIT = 30.0
 
-    # 1. EMA cross — always True here (called only after cross confirmed)
     score += _W["ema_cross"]
 
-    # 2. Trend
     if side == "long" and close > ind.ema_trend:
         score += _W["trend"]
     elif side == "short" and close < ind.ema_trend:
         score += _W["trend"]
 
-    # 3. RSI with overbought/oversold penalty
     if side == "long" and rsi_long_min <= ind.rsi_value <= RSI_OB_LIMIT:
         rsi_conf = min((ind.rsi_value - rsi_long_min) / (RSI_OB_LIMIT - rsi_long_min), 1.0)
         rsi_s = _W["rsi"] * rsi_conf
@@ -220,18 +204,14 @@ def _score(
             rsi_s *= max(pf, 0.0)
         score += rsi_s
 
-    # 4. Imbalance — OB not available in backtest -> 50% neutral credit
     score += _W["imbalance"] * 0.5
 
-    # 5. Volume
     if ind.vol_ready and ind.vol_zscore >= vol_zscore_min:
         score += _W["volume"] * min(max(ind.vol_zscore / 2.0, 0), 1)
 
-    # 6. ATR gate
     if atr_min_pct <= atr_pct <= atr_max_pct:
         score += _W["atr"]
 
-    # 7. BB
     if ind.bb_ready and ind.bb_mid > 0:
         if side == "long":
             if close <= ind.bb_lower:
@@ -246,7 +226,6 @@ def _score(
                 bb_c = (close - ind.bb_mid) / (ind.bb_upper - ind.bb_mid) if ind.bb_upper > ind.bb_mid else 0
                 score += _W["bb"] * min(bb_c, 1.0)
 
-    # 8. VWAP
     if ind.vwap > 0:
         if side == "long":
             if close > ind.vwap:
@@ -283,7 +262,7 @@ def run_backtest(
     max_hold         = p["max_hold_candles"]
     order_size_usdt  = p["order_size_usdt"]
     leverage         = p["leverage"]
-    entry_threshold  = p.get("entry_threshold", 0.65)   # raised default
+    entry_threshold  = p.get("entry_threshold", 0.65)
     rsi_long_min     = p["rsi_long_min"]
     rsi_short_max    = p["rsi_short_max"]
     imb_long         = p["imbalance_long"]
@@ -291,9 +270,9 @@ def run_backtest(
     atr_min_pct      = p["atr_min_pct"]
     atr_max_pct      = p["atr_max_pct"]
     vol_zscore_min   = p["vol_zscore_min"]
-    slippage_ticks   = p.get("slippage_ticks", 0.5)     # NEW: 0.5 tick slippage model
-    tick_size        = p.get("tick_size", 0.10)          # BTC default
-    slippage_usdt    = slippage_ticks * tick_size        # per unit
+    slippage_ticks   = p.get("slippage_ticks", 0.5)
+    tick_size        = p.get("tick_size", 0.10)
+    slippage_usdt    = slippage_ticks * tick_size
 
     if candles is None:
         logger.info(f"Downloading {days}d klines for {symbol}...")
@@ -323,7 +302,6 @@ def run_backtest(
 
         atr_pct = ind.atr_value / close if close > 0 else 0
 
-        # ── POSITION MANAGEMENT ──
         if pos is not None:
             hold_count += 1
             pnl_pct = (
@@ -344,7 +322,7 @@ def run_backtest(
                         if pos.trailing_stop > 0 else new_trail
                     )
 
-            # TP1 partial
+            # TP1 partial exit
             if not pos.tp1_done and pnl_pct >= tp1_pct:
                 partial_qty = pos.qty / 2
                 partial_notional = partial_qty * close
@@ -353,13 +331,15 @@ def run_backtest(
                 partial_pnl = pnl_pct * partial_qty * pos.entry - exit_fee - slip_cost
                 pos.qty = round(pos.qty / 2, 3)
                 pos.tp1_done = True
+                # BUG 21 FIX: halve entry_fee — jumatate din qty inchisa la TP1
+                # La exit final ramane doar jumatate din entry_fee, nu toata
+                pos.entry_fee /= 2
                 equity += partial_pnl
                 result.gross_pnl  += pnl_pct * partial_qty * pos.entry
                 result.total_fees += exit_fee + slip_cost
                 result.total_pnl  += partial_pnl
                 result.equity_curve.append(round(equity, 4))
 
-            # Exit conditions
             sl_hit    = pnl_pct <= -sl_pct
             tp2_hit   = pnl_pct >= tp2_pct
             trail_hit = (
@@ -376,12 +356,12 @@ def run_backtest(
                     "TP2" if tp2_hit else
                     "TRAIL" if trail_hit else "TIMEOUT"
                 )
-                notional  = pos.qty * close
-                # SL = Market (taker), TP/TRAIL/TIMEOUT = Limit (maker)
+                notional      = pos.qty * close
                 exit_fee_rate = TAKER_FEE if sl_hit else MAKER_FEE
-                exit_fee  = notional * exit_fee_rate
-                slip_cost = pos.qty * slippage_usdt
-                gross_pnl = pnl_pct * pos.qty * pos.entry
+                exit_fee      = notional * exit_fee_rate
+                slip_cost     = pos.qty * slippage_usdt
+                gross_pnl     = pnl_pct * pos.qty * pos.entry
+                # BUG 21 FIX: pos.entry_fee e deja halved daca tp1_done=True
                 pnl_usdt  = gross_pnl - pos.entry_fee - exit_fee - slip_cost
 
                 equity += pnl_usdt
@@ -406,7 +386,6 @@ def run_backtest(
                 pos = None
                 hold_count = 0
 
-        # ── ENTRY ──
         if pos is None and ind.rsi_ready and ind.atr_ready:
             cross_up   = prev_fast <= prev_slow and ind.ema_fast > ind.ema_slow
             cross_down = prev_fast >= prev_slow and ind.ema_fast < ind.ema_slow
@@ -423,7 +402,6 @@ def run_backtest(
 
                 if score >= entry_threshold:
                     qty = max(round((order_size_usdt * leverage) / close, 3), 0.001)
-                    # FIX v0.6.0: entry fee recorded at open (maker 0.020%)
                     entry_notional = qty * close
                     entry_fee      = entry_notional * MAKER_FEE
                     slip_cost      = qty * slippage_usdt
@@ -441,7 +419,7 @@ def run_backtest(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Apex Scalper Backtester v0.6.0")
+    parser = argparse.ArgumentParser(description="Apex Scalper Backtester v0.8.5")
     parser.add_argument("--symbol",  default="BTCUSDT")
     parser.add_argument("--days",    type=int, default=90)
     parser.add_argument("--output",  default=None)
@@ -452,19 +430,18 @@ if __name__ == "__main__":
     s = result.summary()
 
     print("\n" + "=" * 60)
-    print(f"  BACKTEST v0.6.0 — {s['symbol']} ({s['days']}d) [REAL FEES]")
+    print(f"  BACKTEST v0.8.5 — {s['symbol']} ({s['days']}d) [REAL FEES]")
     print("=" * 60)
     print(f"  Trades:         {s['total_trades']}")
     print(f"  Win Rate:       {s['winrate_pct']}%")
     print(f"  Gross PnL:      {s['gross_pnl_usdt']} USDT  (before fees)")
-    print(f"  Total Fees:     {s['total_fees_usdt']} USDT  (maker 0.020% + slippage)")
+    print(f"  Total Fees:     {s['total_fees_usdt']} USDT")
     print(f"  Net PnL:        {s['net_pnl_usdt']} USDT  (after fees)")
-    print(f"  Sharpe:         {s['sharpe']}  (net of fees)")
+    print(f"  Sharpe:         {s['sharpe']}  (sample std, net of fees)")
     print(f"  Max Drawdown:   {s['max_drawdown_usdt']} USDT")
     print(f"  Profit Factor:  {s['profit_factor']}")
     print(f"  Fee model:      {s['fee_model']}")
     print("=" * 60)
-    print()
     if s['sharpe'] < 1.0:
         print("  ⚠️  Sharpe < 1.0 — strategy needs redesign before mainnet")
     elif s['sharpe'] < 1.5:
