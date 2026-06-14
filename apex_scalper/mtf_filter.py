@@ -1,16 +1,16 @@
-"""Multi-TimeFrame (MTF) trend filter v0.4.1.
+"""Multi-TimeFrame (MTF) trend filter v0.7.5.
+
+Fix v0.7.5:
+  trader._session does not exist. Trader exposes _client (pybit HTTP).
+  All references to trader._session replaced with trader._client.
+  Crashed with AttributeError at startup before any candle was processed.
 
 Fix vs v0.4.0:
-- _ready is initialized to False and the background loop is separate
-- main.py calls await mtf.refresh() SYNCHRONOUSLY before state.running=True
-  so the first candle is never processed without MTF confirmation
-- If refresh fails at startup, MTF is still not ready (_ready=False)
+  _ready initialized to False, background loop is separate.
+  main.py calls await mtf.refresh() synchronously before state.running=True
+  so the first candle is never processed without MTF confirmation.
+  If refresh fails at startup, MTF stays not ready (_ready=False)
   and allow_long/allow_short return False (block entries) until ready.
-  This is safer than the previous True (pass-through) on not ready.
-
-Note: _ready=False blocks entries until first successful MTF fetch.
-This means the bot waits up to MTF_REFRESH_S before first entry, which
-is acceptable (avoids unfiltered entries at startup).
 """
 from __future__ import annotations
 
@@ -36,14 +36,15 @@ class MTFFilter:
     async def refresh(self, symbol: Optional[str] = None) -> None:
         """Fetch 15m candles and compute EMA50. Sets _ready=True on success."""
         sym = symbol or config.symbol
-        if not trader._session:
-            logger.warning("MTF: trader session not ready")
+        # v0.7.5 fix: trader exposes _client, not _session
+        if not trader._client:
+            logger.warning("MTF: trader._client not ready (call trader.setup() first)")
             return
         loop = asyncio.get_running_loop()
         try:
             resp = await loop.run_in_executor(
                 None,
-                lambda: trader._session.get_kline(
+                lambda: trader._client.get_kline(
                     category="linear",
                     symbol=sym,
                     interval=MTF_INTERVAL,
@@ -75,7 +76,7 @@ class MTFFilter:
     def allow_long(self, price: float) -> bool:
         """Block LONG if MTF not ready or price below 15m EMA50."""
         if not self._ready:
-            return False   # safer: block until we have MTF data
+            return False
         return price > self._ema50
 
     def allow_short(self, price: float) -> bool:
