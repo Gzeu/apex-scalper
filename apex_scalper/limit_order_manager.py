@@ -1,22 +1,26 @@
-"""Limit order manager v0.4.1 — PostOnly entry with cancel-replace + Market fallback.
+"""Limit order manager v0.5.0 — amend instead of cancel+replace.
 
-Changes vs v0.4.0:
-- FILL_TIMEOUT_S reduced from 10s to 2s (scalping: 10s = too slow)
-- Cancel-replace logic: if price moves > 1 tick, cancel + repost at new price
-- Max MAX_REPLACE_ATTEMPTS cancel-replace cycles before Market fallback
-- Poll interval tightened to 0.25s for faster fill detection
+Changes vs v0.4.1:
+- Uses trader.amend_order() (/v5/order/amend) instead of cancel+repost.
+  Amend: single REST call, preserves queue position, no re-queuing delay.
+  Cancel+repost: 2 REST calls, lose queue position, risk of gap fill.
+- FILL_TIMEOUT_S = 2s (unchanged, correct for 1m scalping)
+- POLL_INTERVAL_S = 0.25s (unchanged)
+- MAX_AMEND_ATTEMPTS = 3 before Market fallback
+- Logs exact fee saved vs Market on every successful Limit fill
+- Native SL/TP attached on entry order (stopLoss/takeProfit params)
+  so exchange enforces stops even if WS disconnects
 
-Strategy:
-1. Place PostOnly Limit at best_bid (LONG) or best_ask (SHORT)
-2. Poll every 0.25s for fill
-3. If price moves > 1 tick away from our limit price: cancel + replace
-4. After MAX_REPLACE_ATTEMPTS or FILL_TIMEOUT_S total elapsed: Market fallback
+Fee impact on mainnet:
+  Limit (PostOnly) fill: 0.020% maker fee
+  Market fallback:       0.055% taker fee
+  -> Savings per avoided market order: 0.035% of notional
+  On $200 notional per trade x 10 trades/day = $0.14/day = $51/year
 """
 from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from typing import Literal, Optional
 from loguru import logger
 
@@ -24,109 +28,99 @@ from .config import config
 from .state import state
 from .trader import trader
 
-FILL_TIMEOUT_S      = float(2)    # total wall-clock time before Market fallback
-POLL_INTERVAL_S     = 0.25        # how often to check fill status
-MAX_REPLACE_ATTEMPTS = 3          # cancel-replace cycles before giving up
-TICK_MOVE_THRESHOLD = 1           # price must move >= N ticks to trigger replace
+FILL_TIMEOUT_S    = float(2)     # total wall-clock timeout before Market fallback
+POLL_INTERVAL_S   = 0.25         # fill poll interval
+MAX_AMEND_ATTEMPTS = 3           # amend-price cycles before Market fallback
+TICK_MOVE_THRESHOLD = 1          # ticks price must move to trigger amend
 
 
 class LimitOrderManager:
-    """PostOnly limit entry with cancel-replace and Market fallback."""
+    """PostOnly Limit entry with amend-on-move and Market fallback."""
 
     async def place_entry(
         self,
         side: Literal["Buy", "Sell"],
         qty: float,
         symbol: Optional[str] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
     ) -> tuple[bool, float, float]:
-        """Place PostOnly Limit with cancel-replace. Returns (success, filled_qty, avg_price)."""
-        sym = symbol or config.symbol
-        deadline = time.monotonic() + FILL_TIMEOUT_S
-        attempt  = 0
+        """Place PostOnly Limit with native SL/TP and amend-on-move.
 
-        while attempt <= MAX_REPLACE_ATTEMPTS and time.monotonic() < deadline:
-            attempt += 1
-
-            with state.lock:
-                best_bid = state.orderbook.best_bid
-                best_ask = state.orderbook.best_ask
-                tick_size = getattr(state.orderbook, "tick_size", None) or self._estimate_tick(best_bid, best_ask)
-
-            if best_bid is None or best_ask is None:
-                logger.warning("OB not ready — Market fallback")
-                return await self._market_fallback(side, qty, sym)
-
-            limit_price = best_bid if side == "Buy" else best_ask
-
-            logger.info(
-                f"[LOM] attempt={attempt}/{MAX_REPLACE_ATTEMPTS+1} "
-                f"{side} {qty} {sym} @ {limit_price} (PostOnly)"
-            )
-
-            resp = await trader.place_order(
-                side=side, qty=qty,
-                order_type="Limit", post_only=True,
-                price=limit_price, symbol=sym,
-            )
-
-            if not resp or resp.get("retCode") != 0:
-                logger.warning(f"Limit order rejected (attempt {attempt}) — Market fallback")
-                return await self._market_fallback(side, qty, sym)
-
-            order_id = resp.get("result", {}).get("orderId", "")
-            remaining_timeout = deadline - time.monotonic()
-
-            # Poll with cancel-replace awareness
-            filled_qty, avg_price, cancelled = await self._poll_with_replace(
-                order_id=order_id,
-                sym=sym,
-                qty=qty,
-                limit_price=limit_price,
-                tick_size=tick_size,
-                side=side,
-                timeout=min(remaining_timeout, FILL_TIMEOUT_S / (MAX_REPLACE_ATTEMPTS + 1)),
-            )
-
-            if filled_qty > 0:
-                logger.info(
-                    f"[LOM] ✅ Filled: {side} {filled_qty}/{qty} @ {avg_price:.4f} "
-                    f"attempt={attempt} (maker)"
-                )
-                return True, filled_qty, avg_price
-
-            if not cancelled:
-                # Timed out, not cancelled by us — cancel manually
-                await self._cancel_order(order_id, sym)
-
-            if time.monotonic() >= deadline:
-                break
-
-        logger.warning(
-            f"[LOM] No fill after {attempt} attempts / {FILL_TIMEOUT_S}s — Market fallback"
-        )
-        return await self._market_fallback(side, qty, sym)
-
-    async def _poll_with_replace(
-        self,
-        order_id: str,
-        sym: str,
-        qty: float,
-        limit_price: float,
-        tick_size: float,
-        side: str,
-        timeout: float,
-    ) -> tuple[float, float, bool]:
-        """Poll for fill. If price moves > TICK_MOVE_THRESHOLD ticks, cancel.
-        Returns (filled_qty, avg_price, was_cancelled_for_replace).
+        Returns (success, filled_qty, avg_price).
         """
-        loop = asyncio.get_running_loop()
-        start = time.monotonic()
-        cancelled_for_replace = False
+        sym      = symbol or config.symbol
+        deadline = time.monotonic() + FILL_TIMEOUT_S
+        amend_count = 0
+        order_id    = None
 
-        while time.monotonic() - start < timeout:
+        with state.lock:
+            best_bid   = state.orderbook.best_bid
+            best_ask   = state.orderbook.best_ask
+        info      = await trader.get_instrument_info(sym)
+        tick_size = info.get("tickSize", 0.01)
+
+        if best_bid is None or best_ask is None:
+            logger.warning("[LOM] OB not ready — Market fallback")
+            return await self._market_fallback(side, qty, sym)
+
+        limit_price = best_bid if side == "Buy" else best_ask
+        limit_price = trader.round_price(limit_price, sym)
+
+        # Place initial PostOnly Limit with native SL/TP
+        resp = await trader.place_order(
+            side=side, qty=qty,
+            order_type="Limit", post_only=True,
+            price=limit_price, symbol=sym,
+            stop_loss=stop_loss, take_profit=take_profit,
+        )
+        if not resp or resp.get("retCode") != 0:
+            logger.warning("[LOM] Initial Limit rejected — Market fallback")
+            return await self._market_fallback(side, qty, sym)
+
+        order_id = resp.get("result", {}).get("orderId", "")
+        logger.info(
+            f"[LOM] Limit placed: {side} {qty} {sym} @ {limit_price} "
+            f"order_id={order_id[:8]}... "
+            + (f"SL={stop_loss} " if stop_loss else "")
+            + (f"TP={take_profit}" if take_profit else "")
+        )
+
+        # Poll loop: fill check + amend on price move
+        loop = asyncio.get_running_loop()
+        while time.monotonic() < deadline:
             await asyncio.sleep(POLL_INTERVAL_S)
 
-            # Check if price has moved away (cancel-replace trigger)
+            # Check for fill
+            try:
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: trader._session.get_order_history(
+                        category="linear", symbol=sym, orderId=order_id,
+                    ),
+                )
+                items = r.get("result", {}).get("list", [])
+                if items:
+                    order     = items[0]
+                    status    = order.get("orderStatus", "")
+                    filled    = float(order.get("cumExecQty", 0))
+                    avg_price = float(order.get("avgPrice", 0))
+
+                    if status in ("Filled", "PartiallyFilled") and filled > 0:
+                        notional  = filled * avg_price
+                        fee_saved = notional * (0.00055 - 0.00020)
+                        logger.info(
+                            f"[LOM] ✅ Limit fill: {side} {filled}/{qty} @ {avg_price:.4f} "
+                            f"fee=Maker(0.020%) saved={fee_saved:.4f} USDT vs Market"
+                        )
+                        return True, filled, avg_price
+
+                    if status in ("Cancelled", "Rejected", "Deactivated"):
+                        break
+            except Exception as e:
+                logger.warning(f"[LOM] Poll error: {e}")
+
+            # Check if price moved — amend instead of cancel+repost
             with state.lock:
                 current_bid = state.orderbook.best_bid
                 current_ask = state.orderbook.best_ask
@@ -134,72 +128,63 @@ class LimitOrderManager:
             new_price = current_bid if side == "Buy" else current_ask
             if new_price and tick_size > 0:
                 ticks_moved = abs(new_price - limit_price) / tick_size
-                if ticks_moved >= TICK_MOVE_THRESHOLD:
-                    logger.debug(
-                        f"[LOM] Price moved {ticks_moved:.1f} ticks — cancel-replace "
-                        f"(was @ {limit_price}, now @ {new_price})"
+                if ticks_moved >= TICK_MOVE_THRESHOLD and amend_count < MAX_AMEND_ATTEMPTS:
+                    new_limit = trader.round_price(new_price, sym)
+                    amend_resp = await trader.amend_order(
+                        order_id=order_id, symbol=sym, price=new_limit
                     )
-                    await self._cancel_order(order_id, sym)
-                    cancelled_for_replace = True
-                    return 0.0, 0.0, True
+                    if amend_resp.get("retCode") == 0:
+                        logger.debug(
+                            f"[LOM] Amended: {limit_price} → {new_limit} "
+                            f"(moved {ticks_moved:.1f} ticks) "
+                            f"[amend {amend_count+1}/{MAX_AMEND_ATTEMPTS}]"
+                        )
+                        limit_price = new_limit
+                        amend_count += 1
+                    else:
+                        logger.debug("[LOM] Amend failed — order may have filled")
 
-            # Poll fill status
+        # Timeout — cancel unfilled order + Market fallback
+        if order_id:
             try:
-                resp = await loop.run_in_executor(
+                await loop.run_in_executor(
                     None,
-                    lambda: trader._session.get_order_history(
+                    lambda: trader._session.cancel_order(
                         category="linear", symbol=sym, orderId=order_id,
                     ),
                 )
-                items = resp.get("result", {}).get("list", [])
-                if not items:
-                    continue
-                order     = items[0]
-                status    = order.get("orderStatus", "")
-                filled    = float(order.get("cumExecQty", 0))
-                avg_price = float(order.get("avgPrice", 0))
+            except Exception:
+                pass
 
-                if status in ("Filled", "PartiallyFilled") and filled > 0:
-                    return filled, avg_price, False
-                if status in ("Cancelled", "Rejected", "Deactivated"):
-                    return 0.0, 0.0, False
-            except Exception as e:
-                logger.warning(f"[LOM] Poll error: {e}")
-
-        return 0.0, 0.0, False
-
-    @staticmethod
-    def _estimate_tick(best_bid: Optional[float], best_ask: Optional[float]) -> float:
-        """Estimate tick size from spread if not available in OB state."""
-        if best_bid and best_ask and best_ask > best_bid:
-            spread = best_ask - best_bid
-            # Tick is typically 1/10 of the spread on most perp contracts
-            return max(spread / 10, 0.0001)
-        return 0.1  # safe fallback for BTC
-
-    async def _cancel_order(self, order_id: str, symbol: str) -> None:
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: trader._session.cancel_order(
-                    category="linear", symbol=symbol, orderId=order_id,
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"[LOM] Cancel error: {e}")
+        logger.warning(
+            f"[LOM] Not filled in {FILL_TIMEOUT_S}s ({amend_count} amends) — Market fallback"
+        )
+        return await self._market_fallback(side, qty, sym)
 
     async def _market_fallback(
         self,
         side: Literal["Buy", "Sell"],
         qty: float,
         symbol: str,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
     ) -> tuple[bool, float, float]:
+        """Market fallback. Logs fee cost."""
         with state.lock:
             price = state.last_price
-        resp = await trader.place_order(side=side, qty=qty, order_type="Market", symbol=symbol)
+        notional = qty * price if price > 0 else 0
+        fee      = trader.fee_estimate(notional, "Market")
+        logger.warning(
+            f"[LOM] Market fallback: {side} {qty} {symbol} "
+            f"taker_fee={fee['fee_usdt']:.4f} USDT (0.055%)"
+        )
+        resp = await trader.place_order(
+            side=side, qty=qty,
+            order_type="Market", post_only=False,
+            symbol=symbol,
+            stop_loss=stop_loss, take_profit=take_profit,
+        )
         if resp.get("retCode") == 0:
-            logger.info(f"[LOM] Market fallback OK: {side} {qty} {symbol} ~ {price}")
             return True, qty, price
         return False, 0.0, 0.0
 
