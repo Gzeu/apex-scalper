@@ -1,12 +1,9 @@
-"""Position manager v0.3.1: partial TP, pyramid, trailing stop.
+"""Position manager v0.3.2: partial TP, pyramid with native SL/TP, trailing stop.
 
-Fixes vs v0.3.0:
-- Module-level TP/SL vars now injected by main.inject_profile() per symbol.
-  Previously they were frozen at import time from os.getenv() and ignored profiles.
-- PnL double-counting fixed: update_pnl() called only once per exit event,
-  routed through risk.update_pnl() (single source of truth for perf tracking).
-- state clearing after full exit now done by trader.close_position() (v0.3.1),
-  removed duplicate clearing here.
+Fixes vs v0.3.1:
+- try_pyramid() now passes stop_loss / take_profit to trader.place_order()
+  so pyramid-added positions have native exchange stops. Previously the add
+  was placed as a naked order — open without protection if WS disconnected.
 """
 from __future__ import annotations
 
@@ -17,7 +14,6 @@ from .trader import trader
 from .risk import risk
 
 # All injected by main.inject_profile() on startup per symbol.
-# ENV fallback for single-symbol / manual override mode.
 TP1_PCT          = float(os.getenv("TP1_PCT",         "0.0010"))
 TP2_PCT          = float(os.getenv("TP2_PCT",         "0.0020"))
 SL_PCT           = float(os.getenv("SL_PCT",          "0.0008"))
@@ -94,7 +90,6 @@ class PositionManager:
                 state.open_qty = round(current_qty - half_qty, 3)
             self._tp1_done = True
             pnl_usdt = pnl_pct * half_qty * entry
-            # FIX: single call to risk.update_pnl (was double-counting in v0.3.0)
             risk.update_pnl(pnl_usdt)
             await _notify(
                 f"🟡 *TP1* scaled out `{half_qty}` | `pnl: +{pnl_usdt:.4f} USDT`"
@@ -122,7 +117,6 @@ class PositionManager:
                 remaining_qty = state.open_qty
 
             logger.info(f"EXIT {pos.upper()} | reason={reason} | pnl={pnl_pct:.4%}")
-            # trader.close_position() clears state fields (v0.3.1 fix)
             await trader.close_position()
 
             pnl_usdt = pnl_pct * remaining_qty * entry
@@ -158,15 +152,27 @@ class PositionManager:
         )
         if pnl_pct >= 0.0005 and signal_strength >= 0.7:
             qty = risk.calc_qty(price)
-            logger.info(f"PYRAMID add {side} qty={qty} (#{self._pyramid_count + 1})")
+
+            # 🟡 FIX: compute native SL/TP for pyramid add using same pct as profile.
+            # Without this the pyramid order is naked — no exchange stop attached.
+            if side == "long":
+                py_sl = round(price * (1 - SL_PCT), 4)
+                py_tp = round(price * (1 + TP2_PCT), 4)
+            else:
+                py_sl = round(price * (1 + SL_PCT), 4)
+                py_tp = round(price * (1 - TP2_PCT), 4)
+
+            logger.info(f"PYRAMID add {side} qty={qty} (#{self._pyramid_count + 1}) SL={py_sl} TP={py_tp}")
             await trader.place_order(
-                "Buy" if side == "long" else "Sell", qty
+                "Buy" if side == "long" else "Sell", qty,
+                stop_loss=py_sl, take_profit=py_tp,
             )
             with state.lock:
                 state.open_qty = round(state.open_qty + qty, 3)
             self._pyramid_count += 1
             await _notify(
-                f"🔼 *PYRAMID* add `{qty}` {side} | `strength={signal_strength:.2f}`"
+                f"🔼 *PYRAMID* add `{qty}` {side} | `strength={signal_strength:.2f}`\n"
+                f"`SL={py_sl}` `TP={py_tp}`"
             )
 
 

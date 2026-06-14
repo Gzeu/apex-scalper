@@ -1,4 +1,13 @@
-"""Backtester v0.4.0 — replay Bybit kline history through the full strategy.
+"""Backtester v0.4.1 — replay Bybit kline history through the full strategy.
+
+Changes vs v0.4.0:
+  🔴 FIX: Fee simulation now uses REAL Bybit fees:
+    - Entry: MAKER fee 0.020% (PostOnly Limit, as in live bot)
+    - Exit:  TAKER fee 0.055% (market close, worst case)
+    Previously: entry fee was 0%, exit was 0.055% — understated costs by ~0.020%
+    per trade. On a $200 notional trade this is $0.04/trade, or ~$2/day at 50
+    trades/day — enough to flip a marginal strategy from profit to loss.
+    The reported Sharpe ratio now reflects real net-of-fees performance.
 
 Usage:
     python -m apex_scalper.backtester --symbol BTCUSDT --days 30
@@ -26,6 +35,10 @@ from .indicators import IndicatorState, update_all
 
 
 KLINE_LIMIT = 200  # max per Bybit request
+
+# 🔴 FIX: Real Bybit fee rates
+MAKER_FEE_RATE = 0.00020  # 0.020% — PostOnly Limit (entry)
+TAKER_FEE_RATE = 0.00055  # 0.055% — Market (exit)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,7 +76,6 @@ def fetch_klines(
         if not rows:
             break
 
-        # Bybit returns newest-first; each row = [ts, open, high, low, close, vol, turnover]
         for row in reversed(rows):
             ts = int(row[0])
             if ts < start_ms:
@@ -81,7 +93,7 @@ def fetch_klines(
         if oldest_ts <= start_ms or len(rows) < KLINE_LIMIT:
             break
         end_ms = oldest_ts - 1
-        time.sleep(0.15)  # rate limit
+        time.sleep(0.15)
 
     candles.sort(key=lambda c: c["ts"])
     return candles
@@ -93,7 +105,7 @@ def fetch_klines(
 
 @dataclass
 class BtPosition:
-    side: str            # 'long' | 'short'
+    side: str
     qty: float
     entry: float
     entry_idx: int
@@ -108,6 +120,7 @@ class BtResult:
     total_trades: int = 0
     win_trades:   int = 0
     total_pnl:    float = 0.0
+    total_fees:   float = 0.0
     trades:       list = field(default_factory=list)
     equity_curve: list = field(default_factory=list)
 
@@ -117,7 +130,7 @@ class BtResult:
 
     @property
     def sharpe(self) -> float:
-        returns = [t["pnl_pct"] for t in self.trades]
+        returns = [t["pnl_pct_net"] for t in self.trades]
         if len(returns) < 2:
             return 0.0
         mu  = sum(returns) / len(returns)
@@ -144,15 +157,18 @@ class BtResult:
 
     def summary(self) -> dict:
         return {
-            "symbol":       self.symbol,
-            "days":         self.days,
-            "total_trades": self.total_trades,
-            "win_trades":   self.win_trades,
-            "winrate_pct":  self.winrate,
-            "total_pnl_usdt": round(self.total_pnl, 4),
-            "sharpe":       self.sharpe,
+            "symbol":            self.symbol,
+            "days":              self.days,
+            "total_trades":      self.total_trades,
+            "win_trades":        self.win_trades,
+            "winrate_pct":       self.winrate,
+            "total_pnl_usdt":    round(self.total_pnl, 4),
+            "total_fees_usdt":   round(self.total_fees, 4),
+            "gross_pnl_usdt":    round(self.total_pnl + self.total_fees, 4),
+            "sharpe":            self.sharpe,
             "max_drawdown_usdt": self.max_drawdown,
-            "profit_factor": self.profit_factor,
+            "profit_factor":     self.profit_factor,
+            "fee_rates":         {"entry": "0.020% maker", "exit": "0.055% taker"},
         }
 
 
@@ -166,7 +182,6 @@ def run_backtest(
     """Core backtest engine. Pass candles to avoid re-downloading (for optimizer)."""
     p = profile or SYMBOL_PROFILES.get(symbol, SYMBOL_PROFILES[DEFAULT_SYMBOL])
 
-    # Params from profile
     tp1_pct         = p["tp1_pct"]
     tp2_pct         = p["tp2_pct"]
     sl_pct          = p["sl_pct"]
@@ -234,7 +249,7 @@ def run_backtest(
                         if pos.trailing_stop > 0 else new_trail
                     )
 
-            # TP1 scale-out (simulated: record partial PnL)
+            # TP1 scale-out
             if not pos.tp1_done and pnl_pct >= tp1_pct:
                 partial_pnl = pnl_pct * (pos.qty / 2) * pos.entry
                 pos.qty = round(pos.qty / 2, 3)
@@ -260,25 +275,31 @@ def run_backtest(
                     "TP2" if tp2_hit else
                     "TRAIL" if trail_hit else "TIMEOUT"
                 )
-                pnl_usdt = pnl_pct * pos.qty * pos.entry
-                # Simulated taker fee (market close)
-                fee = close * pos.qty * 0.00055
-                pnl_usdt -= fee
+                notional = pos.qty * close
+                # 🔴 FIX: exit fee is TAKER (market close)
+                exit_fee = notional * TAKER_FEE_RATE
+                pnl_usdt = pnl_pct * pos.qty * pos.entry - exit_fee
 
                 equity += pnl_usdt
                 result.total_pnl += pnl_usdt
+                result.total_fees += exit_fee
                 result.total_trades += 1
                 if pnl_usdt > 0:
                     result.win_trades += 1
+                # pnl_pct_net accounts for fees for Sharpe calculation
+                notional_entry = pos.qty * pos.entry
+                pnl_pct_net = (pnl_usdt) / notional_entry if notional_entry > 0 else 0.0
                 result.trades.append({
-                    "idx":      i,
-                    "ts":       c["ts"],
-                    "side":     pos.side,
-                    "entry":    pos.entry,
-                    "exit":     close,
-                    "pnl_usdt": round(pnl_usdt, 4),
-                    "pnl_pct":  round(pnl_pct, 6),
-                    "reason":   reason,
+                    "idx":          i,
+                    "ts":           c["ts"],
+                    "side":         pos.side,
+                    "entry":        pos.entry,
+                    "exit":         close,
+                    "pnl_usdt":     round(pnl_usdt, 4),
+                    "pnl_pct":      round(pnl_pct, 6),
+                    "pnl_pct_net":  round(pnl_pct_net, 6),
+                    "exit_fee":     round(exit_fee, 6),
+                    "reason":       reason,
                 })
                 result.equity_curve.append(round(equity, 4))
                 pos = None
@@ -289,34 +310,32 @@ def run_backtest(
             cross_up   = prev_fast <= prev_slow and ind.ema_fast > ind.ema_slow
             cross_down = prev_fast >= prev_slow and ind.ema_fast < ind.ema_slow
 
-            # Score computation (mirrors strategy.py weights)
             if cross_up or cross_down:
                 side = "long" if cross_up else "short"
                 score = 0.0
 
-                # EMA cross (0.25)
                 score += 0.25
-                # EMA50 trend (0.20)
                 if side == "long" and close > ind.ema_trend:
                     score += 0.20
                 elif side == "short" and close < ind.ema_trend:
                     score += 0.20
-                # RSI (0.20)
                 if side == "long" and rsi_long_min <= ind.rsi_value <= 70:
                     score += 0.20 * min((ind.rsi_value - rsi_long_min) / (70 - rsi_long_min), 1)
                 elif side == "short" and 30 <= ind.rsi_value <= rsi_short_max:
                     score += 0.20 * min((rsi_short_max - ind.rsi_value) / (rsi_short_max - 30), 1)
-                # Imbalance: not available in backtester (no OB history) → partial score
                 score += 0.10   # neutral imbalance credit
-                # Volume (0.10)
                 if ind.vol_ready and ind.vol_zscore >= vol_zscore_min:
                     score += 0.10 * min(max(ind.vol_zscore / 2.0, 0), 1)
-                # ATR gate (0.05)
                 if atr_min_pct <= atr_pct <= atr_max_pct:
                     score += 0.05
 
                 if score >= entry_threshold:
                     qty = max(round((order_size_usdt * leverage) / close, 3), 0.001)
+                    # 🔴 FIX: deduct MAKER fee (PostOnly Limit) on entry
+                    entry_fee = qty * close * MAKER_FEE_RATE
+                    result.total_fees += entry_fee
+                    result.total_pnl  -= entry_fee
+                    equity            -= entry_fee
                     pos = BtPosition(side=side, qty=qty, entry=close, entry_idx=i)
                     hold_count = 0
 
@@ -341,16 +360,19 @@ if __name__ == "__main__":
     result = run_backtest(args.symbol, days=args.days, testnet=args.testnet)
     s = result.summary()
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 55)
     print(f"  BACKTEST RESULTS — {s['symbol']} ({s['days']}d)")
-    print("=" * 50)
-    print(f"  Trades:        {s['total_trades']}")
-    print(f"  Win Rate:      {s['winrate_pct']}%")
-    print(f"  Total PnL:     {s['total_pnl_usdt']} USDT")
-    print(f"  Sharpe:        {s['sharpe']}")
-    print(f"  Max Drawdown:  {s['max_drawdown_usdt']} USDT")
-    print(f"  Profit Factor: {s['profit_factor']}")
-    print("=" * 50 + "\n")
+    print("=" * 55)
+    print(f"  Trades:          {s['total_trades']}")
+    print(f"  Win Rate:        {s['winrate_pct']}%")
+    print(f"  Gross PnL:       {s['gross_pnl_usdt']} USDT  (pre-fee)")
+    print(f"  Total Fees:      -{s['total_fees_usdt']} USDT")
+    print(f"  Net PnL:         {s['total_pnl_usdt']} USDT  ← real number")
+    print(f"  Sharpe (net):    {s['sharpe']}")
+    print(f"  Max Drawdown:    {s['max_drawdown_usdt']} USDT")
+    print(f"  Profit Factor:   {s['profit_factor']}")
+    print(f"  Fees:            {s['fee_rates']}")
+    print("=" * 55 + "\n")
 
     if args.output:
         with open(args.output, "w") as f:
