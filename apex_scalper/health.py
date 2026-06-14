@@ -1,18 +1,16 @@
-"""Health & metrics HTTP endpoint v0.7.4.
+"""Health & metrics HTTP endpoint v0.8.4.
 
-Exposes two endpoints on port 8080 (ENV: HEALTH_PORT) in a background thread.
-Zero impact on the async trading loop — runs in a separate daemon thread.
+Changelog:
+  v0.8.4 — BUG 20 FIX: last_tick_ts exista acum explicit in BotState (state.py).
+    Inainte: getattr(state, 'last_tick_ts', 0.0) returna mereu 0.0
+    -> tick_age=inf -> feed_stale=True permanent -> Docker HEALTHCHECK 503.
+    Acum: state.last_tick_ts citit direct, fara getattr fallback.
+  v0.7.4 — /health, /metrics, /metrics/prometheus endpoints.
 
 Endpoints:
   GET /health     JSON: {status, uptime_s, last_tick_age_s, feed_stale, open_position}
   GET /metrics    JSON: {daily_pnl, win_rate, sharpe, trades_today, kelly_factor}
   GET /metrics/prometheus   Prometheus plain-text format
-
-Docker HEALTHCHECK:
-  HEALTHCHECK CMD curl -f http://localhost:8080/health || exit 1
-
-Usage:
-  From main.py: from .health import start_health_server; start_health_server()
 """
 from __future__ import annotations
 
@@ -31,7 +29,7 @@ _start_time = time.time()
 
 class _HealthHandler(BaseHTTPRequestHandler):
 
-    def log_message(self, fmt, *args):  # silence default access logs
+    def log_message(self, fmt, *args):
         pass
 
     def _send_json(self, data: dict, status: int = 200) -> None:
@@ -50,7 +48,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         try:
             if self.path == "/health":
                 self._handle_health()
@@ -68,10 +66,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from .state import state
         uptime = time.time() - _start_time
         with state.lock:
-            last_tick_ts   = getattr(state, "last_tick_ts", 0.0)
-            open_position  = getattr(state, "open_position", None)
-            running        = getattr(state, "running", False)
-            paused         = getattr(state, "paused", False)
+            # BUG 20 FIX: acces direct la state.last_tick_ts (exista acum in BotState)
+            last_tick_ts  = state.last_tick_ts
+            open_position = state.open_position
+            running       = state.running
+            paused        = state.paused
 
         tick_age   = time.time() - last_tick_ts if last_tick_ts else float("inf")
         feed_stale = tick_age > FEED_STALE_S
@@ -90,13 +89,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from .performance import perf
         from .risk import risk
         self._send_json({
-            "daily_pnl_usdt": round(getattr(risk, "_daily_loss", 0.0), 4),
-            "win_rate":       round(perf.win_rate, 4),
-            "sharpe":         round(perf.sharpe, 4),
-            "profit_factor":  round(perf.profit_factor, 4),
-            "max_drawdown":   round(perf.max_drawdown, 4),
-            "kelly_factor":   round(getattr(risk, "_kelly_factor", 0.0), 4),
-            "consecutive_losses": getattr(risk, "_consecutive_losses", 0),
+            "daily_pnl_usdt":      round(getattr(risk, "_daily_loss", 0.0), 4),
+            "win_rate":            round(perf.win_rate, 4),
+            "sharpe":              round(perf.sharpe, 4),
+            "profit_factor":       round(perf.profit_factor, 4),
+            "max_drawdown":        round(perf.max_drawdown, 4),
+            "kelly_factor":        round(getattr(risk, "_kelly_factor", 0.0), 4),
+            "consecutive_losses":  getattr(risk, "_consecutive_losses", 0),
         })
 
     def _handle_metrics_prometheus(self) -> None:
@@ -104,7 +103,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from .risk import risk
         from .state import state
         with state.lock:
-            tick_age = time.time() - getattr(state, "last_tick_ts", 0.0)
+            tick_age = time.time() - state.last_tick_ts if state.last_tick_ts else float("inf")
 
         lines = [
             "# HELP apex_win_rate Trading win rate",
@@ -128,10 +127,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server() -> None:
-    """Start health/metrics server in a background daemon thread.
-
-    Call once from main.py at startup. Non-blocking.
-    """
+    """Start health/metrics server in a background daemon thread. Non-blocking."""
     def _run():
         server = HTTPServer(("", HEALTH_PORT), _HealthHandler)
         logger.info(

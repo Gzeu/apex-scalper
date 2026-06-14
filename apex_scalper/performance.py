@@ -1,27 +1,50 @@
-"""Live performance metrics: Sharpe ratio, max drawdown, avg win/loss.
+"""Live performance metrics v0.8.4 — O(1) running counters, bounded trades deque.
 
-All metrics computed incrementally (no full history scan on each trade).
+Changelog:
+  v0.8.4 — BUG 18 FIX: trades List[float] crestea nelimitat.
+    avg_win / avg_loss / profit_factor / win_rate rescaneaza toata lista O(n)
+    dupa mii de trade-uri -> RAM leak + latenta per calcul.
+    Fix:
+      - trades: deque(maxlen=MAX_TRADES_HISTORY) capateaza memoria
+      - running counters (_n_wins, _gross_profit, _n_losses, _gross_loss)
+        actualizati incremental in record() -> O(1) per proprietate
+      - Sharpe Welford nemodificat (era deja O(1))
 """
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List
+from typing import Deque
+
+MAX_TRADES_HISTORY = 1_000  # cap memorie: ~8KB la 1000 float-uri
 
 
 @dataclass
 class PerfMetrics:
-    trades: List[float] = field(default_factory=list)  # PnL per trade in USDT
-    # Running Sharpe components (Welford online algorithm)
+    # BUG 18 FIX: deque cu maxlen in loc de list nelimitata
+    trades: Deque[float] = field(default_factory=lambda: deque(maxlen=MAX_TRADES_HISTORY))
+
+    # Welford online Sharpe (nemodificat)
     _n: int = 0
     _mean: float = 0.0
     _M2: float = 0.0
-    # Drawdown tracking
+
+    # BUG 18 FIX: running counters O(1) pentru win/loss stats
+    _n_wins: int = 0
+    _n_losses: int = 0
+    _gross_profit: float = 0.0
+    _gross_loss: float = 0.0    # stored as positive value
+    _sum_win: float = 0.0
+    _sum_loss: float = 0.0      # stored as negative value
+
+    # Drawdown
     _peak_equity: float = 0.0
     _equity: float = 0.0
     max_drawdown: float = 0.0
     max_drawdown_pct: float = 0.0
-    # Streak
+
+    # Streaks
     win_streak: int = 0
     lose_streak: int = 0
     _cur_win_streak: int = 0
@@ -29,12 +52,24 @@ class PerfMetrics:
 
     def record(self, pnl: float, balance: float = 0.0) -> None:
         self.trades.append(pnl)
-        # Welford online mean + variance
+
+        # Welford online mean + variance (O(1))
         self._n += 1
         delta = pnl - self._mean
         self._mean += delta / self._n
         self._M2 += delta * (pnl - self._mean)
-        # Equity drawdown
+
+        # BUG 18 FIX: running win/loss counters (O(1))
+        if pnl > 0:
+            self._n_wins += 1
+            self._gross_profit += pnl
+            self._sum_win += pnl
+        else:
+            self._n_losses += 1
+            self._gross_loss += abs(pnl)
+            self._sum_loss += pnl
+
+        # Drawdown
         self._equity += pnl
         if self._equity > self._peak_equity:
             self._peak_equity = self._equity
@@ -43,6 +78,7 @@ class PerfMetrics:
             self.max_drawdown = dd
         if self._peak_equity > 0:
             self.max_drawdown_pct = self.max_drawdown / self._peak_equity * 100
+
         # Streaks
         if pnl > 0:
             self._cur_win_streak  += 1
@@ -59,32 +95,31 @@ class PerfMetrics:
         if self._n < 2:
             return 0.0
         variance = self._M2 / (self._n - 1)
-        std = math.sqrt(variance) if variance > 0 else 0
+        std = math.sqrt(variance) if variance > 0 else 0.0
         if std == 0:
             return 0.0
         return (self._mean / std) * math.sqrt(525_600)
 
     @property
     def avg_win(self) -> float:
-        wins = [t for t in self.trades if t > 0]
-        return sum(wins) / len(wins) if wins else 0.0
+        """BUG 18 FIX: O(1) via running counter."""
+        return self._sum_win / self._n_wins if self._n_wins > 0 else 0.0
 
     @property
     def avg_loss(self) -> float:
-        losses = [t for t in self.trades if t < 0]
-        return sum(losses) / len(losses) if losses else 0.0
+        """BUG 18 FIX: O(1) via running counter."""
+        return self._sum_loss / self._n_losses if self._n_losses > 0 else 0.0
 
     @property
     def profit_factor(self) -> float:
-        gross_profit = sum(t for t in self.trades if t > 0)
-        gross_loss   = abs(sum(t for t in self.trades if t < 0))
-        return gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        """BUG 18 FIX: O(1) via running counter."""
+        return self._gross_profit / self._gross_loss if self._gross_loss > 0 else float("inf")
 
     @property
     def win_rate(self) -> float:
-        if not self.trades:
-            return 0.0
-        return len([t for t in self.trades if t > 0]) / len(self.trades) * 100
+        """BUG 18 FIX: O(1) via running counter."""
+        total = self._n_wins + self._n_losses
+        return self._n_wins / total * 100 if total > 0 else 0.0
 
     @property
     def expectancy(self) -> float:
@@ -94,7 +129,7 @@ class PerfMetrics:
 
     def summary(self) -> str:
         return (
-            f"Trades: {len(self.trades)} | WR: {self.win_rate:.1f}% | "
+            f"Trades: {self._n} | WR: {self.win_rate:.1f}% | "
             f"Sharpe: {self.sharpe:.2f} | PF: {self.profit_factor:.2f} | "
             f"Expectancy: {self.expectancy:+.4f} USDT | "
             f"MaxDD: {self.max_drawdown:.4f} USDT ({self.max_drawdown_pct:.2f}%) | "

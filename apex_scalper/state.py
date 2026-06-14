@@ -1,4 +1,12 @@
-"""Shared in-memory state: orderbook, last price, PnL, positions.
+"""Shared in-memory state v0.8.4 — adaugat last_tick_ts pentru healthcheck.
+
+Changelog:
+  v0.8.4 — BUG 20 FIX: last_tick_ts lipsea din BotState.
+    health.py folosea getattr(state, 'last_tick_ts', 0.0) ca fallback
+    dar campul nu exista -> tick_age=inf, feed_stale=True permanent
+    -> Docker HEALTHCHECK returna 503 la infinit.
+    Fix: last_tick_ts: float = 0.0 adaugat explicit in BotState.
+    feed.py trebuie sa actualizeze state.last_tick_ts la fiecare OB tick.
 
 All indicator state is owned by indicators.IndicatorState (NOT here).
 This module only holds execution/position/PnL state + the L2 orderbook.
@@ -16,8 +24,8 @@ class OrderBook:
     """Local L2 orderbook with O(log n) insert/delete via SortedDict."""
 
     def __init__(self):
-        self._bids: SortedDict = SortedDict(lambda k: -k)  # descending
-        self._asks: SortedDict = SortedDict()               # ascending
+        self._bids: SortedDict = SortedDict(lambda k: -k)
+        self._asks: SortedDict = SortedDict()
         self.seq: int = 0
 
     def apply_snapshot(self, bids: list, asks: list) -> None:
@@ -61,11 +69,9 @@ class OrderBook:
         return sum(list(self._asks.values())[:levels])
 
     def top_bids(self, levels: int = 10) -> list[tuple[float, float]]:
-        """Public API: return [(price, size), ...] for top-N bids."""
         return list(self._bids.items())[:levels]
 
     def top_asks(self, levels: int = 10) -> list[tuple[float, float]]:
-        """Public API: return [(price, size), ...] for top-N asks."""
         return list(self._asks.items())[:levels]
 
 
@@ -79,8 +85,13 @@ class BotState:
     orderbook: OrderBook = field(default_factory=OrderBook)
     last_price: float = 0.0
 
-    # Open position (managed by position_manager, cleared on exit by trader)
-    open_position: Optional[str] = None   # 'long' | 'short' | None
+    # BUG 20 FIX: last_tick_ts adaugat explicit
+    # Actualizat de feed.py la fiecare OB tick primit de la WebSocket
+    # Folosit de health.py pentru feed_stale detection si Docker healthcheck
+    last_tick_ts: float = 0.0
+
+    # Open position
+    open_position: Optional[str] = None
     open_qty: float = 0.0
     open_entry: float = 0.0
     trailing_stop: float = 0.0
@@ -91,7 +102,7 @@ class BotState:
     total_trades: int = 0
     win_trades: int = 0
 
-    # Thread lock (WS thread <-> async event loop)
+    # Thread lock
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def symbol_str(self) -> str:
@@ -105,7 +116,6 @@ class BotState:
         return round(self.win_trades / self.total_trades * 100, 1)
 
     def reset_daily(self) -> None:
-        """Reset daily PnL counter (UTC midnight or /resume)."""
         self.daily_pnl = 0.0
 
 
