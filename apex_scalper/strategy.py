@@ -1,11 +1,17 @@
-"""Strategy v0.7.9 — score_snapshot() async helper pentru pulse (Bug 5 fix).
+"""Strategy v0.8.0 — 3 bug-uri fixate (risk.on_open, await on_open, lazy Lock).
 
 Changelog:
-  v0.7.9 — BUG FIX: _score_long/_score_short apelate in pulse din alt task
-    asyncio cu ind partial-updated => scoruri eronate in Telegram.
-    Adaugat _ind_lock = asyncio.Lock() + score_snapshot(price, ob) async
-    function care ia lock-ul si returneaza (score_l, score_s) atomic.
-    update_indicators() achizitioneaza acelasi lock la scriere.
+  v0.8.0 — BUG FIXES:
+    BUG 3: risk.on_open() niciodata apelat -> _open_count=0 permanent
+      -> MAX_OPEN_POSITIONS complet nefunctional.
+      Fix: risk.on_open() apelat la fiecare entry confirmat (LONG + SHORT).
+    BUG 1 (partial): pm.on_open() acum async -> await pm.on_open()
+      strategy.py updatat sa foloseasca await.
+    BUG 4: _ind_lock = asyncio.Lock() creat la import-time -> pe Python 3.12+
+      Lock legat de un loop inexistent -> fallback fara lock la fiecare candle.
+      Fix: _ind_lock creat lazy la prima utilizare in running event loop.
+      _get_ind_lock() returneaza sau creeaza lock-ul corect.
+  v0.7.9 — score_snapshot() async helper pentru pulse (Bug 5 fix).
 """
 from __future__ import annotations
 
@@ -30,8 +36,18 @@ BASE_SPREAD_BPS  = 3.0
 ATR_SPREAD_MULT  = 2.0
 ATR_BASELINE     = 0.001
 
-# Lock pentru acces concurent la ind (update_indicators vs pulse.score_snapshot)
-_ind_lock = asyncio.Lock()
+# BUG 4 FIX: Lock creat lazy in running event loop, nu la import-time.
+# asyncio.Lock() la import-time pe Python 3.12+ nu are loop asociat si
+# poate cauza fallback fara lock in update_indicators().
+_ind_lock: asyncio.Lock | None = None
+
+
+def _get_ind_lock() -> asyncio.Lock:
+    """Returneaza _ind_lock, creandu-l daca nu exista (lazy, in running loop)."""
+    global _ind_lock
+    if _ind_lock is None:
+        _ind_lock = asyncio.Lock()
+    return _ind_lock
 
 
 class IndicatorState:
@@ -175,33 +191,32 @@ async def score_snapshot(price: float, ob) -> tuple[float, float]:
 
     v0.7.9 Bug 5 fix: pulse.py apeleaza asta in loc de _score_long(ind,...)
     direct. Previne citirea ind partial-updated in mid-candle.
+    v0.8.0: foloseste _get_ind_lock() lazy pentru compatibilitate Python 3.12+.
     """
-    async with _ind_lock:
-        # Copiem campurile relevante in variabile locale sub lock
+    async with _get_ind_lock():
         snap = IndicatorState()
-        snap.rsi_value   = ind.rsi_value
-        snap.rsi_ready   = ind.rsi_ready
-        snap.atr_value   = ind.atr_value
-        snap.atr_ready   = ind.atr_ready
-        snap.ema_fast    = ind.ema_fast
-        snap.ema_slow    = ind.ema_slow
-        snap.ema_trend   = ind.ema_trend
-        snap.bb_upper    = ind.bb_upper
-        snap.bb_mid      = ind.bb_mid
-        snap.bb_lower    = ind.bb_lower
-        snap.bb_ready    = ind.bb_ready
-        snap.vwap        = ind.vwap
-        snap.vol_zscore  = ind.vol_zscore
-        snap.vol_ready   = ind.vol_ready
+        snap.rsi_value      = ind.rsi_value
+        snap.rsi_ready      = ind.rsi_ready
+        snap.atr_value      = ind.atr_value
+        snap.atr_ready      = ind.atr_ready
+        snap.ema_fast       = ind.ema_fast
+        snap.ema_slow       = ind.ema_slow
+        snap.ema_trend      = ind.ema_trend
+        snap.bb_upper       = ind.bb_upper
+        snap.bb_mid         = ind.bb_mid
+        snap.bb_lower       = ind.bb_lower
+        snap.bb_ready       = ind.bb_ready
+        snap.vwap           = ind.vwap
+        snap.vol_zscore     = ind.vol_zscore
+        snap.vol_ready      = ind.vol_ready
         snap.macd_line      = ind.macd_line
         snap.macd_signal    = ind.macd_signal
         snap.macd_histogram = ind.macd_histogram
         snap.macd_ready     = ind.macd_ready
-        snap.stoch_k     = ind.stoch_k
-        snap.stoch_d     = ind.stoch_d
-        snap.stoch_ready = ind.stoch_ready
+        snap.stoch_k        = ind.stoch_k
+        snap.stoch_d        = ind.stoch_d
+        snap.stoch_ready    = ind.stoch_ready
 
-    # Calculul scorurilor e in afara lock-ului (nu modifica ind)
     score_l = _score_long(snap, ob, price)
     score_s = _score_short(snap, ob, price)
     return score_l, score_s
@@ -210,14 +225,14 @@ async def score_snapshot(price: float, ob) -> tuple[float, float]:
 def update_indicators(price: float, kline_data: dict) -> None:
     """Update all indicators from latest confirmed candle.
 
-    v0.7.9: achizitioneaza _ind_lock la scriere pentru a preveni
-    citire partiala din score_snapshot() in pulse.
+    v0.8.0 BUG 4 FIX: foloseste _get_ind_lock() in loc de _ind_lock direct.
+      Previne fallback fara lock pe Python 3.12+ unde Lock la import-time
+      nu are event loop asociat.
     Apelata din pybit WebSocket thread via run_coroutine_threadsafe.
     """
     from .indicators import compute_all
     results = compute_all(price, kline_data)
 
-    # Scriem atomic sub lock
     loop = asyncio.get_event_loop()
     future = asyncio.run_coroutine_threadsafe(
         _update_ind_locked(results, price), loop
@@ -226,40 +241,39 @@ def update_indicators(price: float, kline_data: dict) -> None:
         future.result(timeout=1.0)
     except Exception as e:
         logger.warning(f"[strategy] update_indicators lock timeout: {e}")
-        # Fallback: scrie fara lock (mai bine date usor inconsistente decat nimic)
         _apply_ind(results, price)
 
 
 async def _update_ind_locked(results: dict, price: float) -> None:
-    """Scrie rezultatele in ind sub _ind_lock."""
-    async with _ind_lock:
+    """Scrie rezultatele in ind sub _ind_lock (lazy)."""
+    async with _get_ind_lock():
         _apply_ind(results, price)
 
 
 def _apply_ind(results: dict, price: float) -> None:
     """Aplica results dict pe ind. Apelata sub lock sau in fallback."""
-    ind.last_price   = price
-    ind.ema_fast     = results.get("ema_fast",  ind.ema_fast)
-    ind.ema_slow     = results.get("ema_slow",  ind.ema_slow)
-    ind.ema_trend    = results.get("ema_trend", ind.ema_trend)
-    ind.rsi_value    = results.get("rsi",       ind.rsi_value)
-    ind.rsi_ready    = results.get("rsi_ready", ind.rsi_ready)
-    ind.atr_value    = results.get("atr",       ind.atr_value)
-    ind.atr_ready    = results.get("atr_ready", ind.atr_ready)
-    ind.bb_upper     = results.get("bb_upper",  ind.bb_upper)
-    ind.bb_mid       = results.get("bb_mid",    ind.bb_mid)
-    ind.bb_lower     = results.get("bb_lower",  ind.bb_lower)
-    ind.bb_ready     = results.get("bb_ready",  ind.bb_ready)
-    ind.vwap         = results.get("vwap",      ind.vwap)
-    ind.vol_zscore   = results.get("vol_zscore",  ind.vol_zscore)
-    ind.vol_ready    = results.get("vol_ready",   ind.vol_ready)
-    ind.macd_line      = results.get("macd_line",      ind.macd_line)
-    ind.macd_signal    = results.get("macd_signal",    ind.macd_signal)
-    ind.macd_histogram = results.get("macd_histogram", ind.macd_histogram)
-    ind.macd_ready     = results.get("macd_ready",     ind.macd_ready)
-    ind.stoch_k      = results.get("stoch_k",   ind.stoch_k)
-    ind.stoch_d      = results.get("stoch_d",   ind.stoch_d)
-    ind.stoch_ready  = results.get("stoch_ready", ind.stoch_ready)
+    ind.last_price      = price
+    ind.ema_fast        = results.get("ema_fast",       ind.ema_fast)
+    ind.ema_slow        = results.get("ema_slow",       ind.ema_slow)
+    ind.ema_trend       = results.get("ema_trend",      ind.ema_trend)
+    ind.rsi_value       = results.get("rsi",            ind.rsi_value)
+    ind.rsi_ready       = results.get("rsi_ready",      ind.rsi_ready)
+    ind.atr_value       = results.get("atr",            ind.atr_value)
+    ind.atr_ready       = results.get("atr_ready",      ind.atr_ready)
+    ind.bb_upper        = results.get("bb_upper",       ind.bb_upper)
+    ind.bb_mid          = results.get("bb_mid",         ind.bb_mid)
+    ind.bb_lower        = results.get("bb_lower",       ind.bb_lower)
+    ind.bb_ready        = results.get("bb_ready",       ind.bb_ready)
+    ind.vwap            = results.get("vwap",           ind.vwap)
+    ind.vol_zscore      = results.get("vol_zscore",     ind.vol_zscore)
+    ind.vol_ready       = results.get("vol_ready",      ind.vol_ready)
+    ind.macd_line       = results.get("macd_line",      ind.macd_line)
+    ind.macd_signal     = results.get("macd_signal",    ind.macd_signal)
+    ind.macd_histogram  = results.get("macd_histogram", ind.macd_histogram)
+    ind.macd_ready      = results.get("macd_ready",     ind.macd_ready)
+    ind.stoch_k         = results.get("stoch_k",        ind.stoch_k)
+    ind.stoch_d         = results.get("stoch_d",        ind.stoch_d)
+    ind.stoch_ready     = results.get("stoch_ready",    ind.stoch_ready)
 
 
 async def evaluate(price: float) -> None:
@@ -333,7 +347,6 @@ async def evaluate(price: float) -> None:
             return
         if price <= mtf.ema50:
             return
-        # Entry LONG
         from .limit_order_manager import place_entry_order
         sl = price * (1 - 0.0008)
         tp = price * (1 + 0.004)
@@ -350,7 +363,10 @@ async def evaluate(price: float) -> None:
             stop_loss=sl, take_profit=tp,
         )
         if trade_id:
-            pm.on_open("long", qty, price, trade_id)
+            # BUG 1 FIX: await pm.on_open() (acum async, sub _snapshot_lock)
+            await pm.on_open("long", qty, price, trade_id)
+            # BUG 3 FIX: risk.on_open() apelat pentru a incrementa _open_count
+            risk.on_open()
             with state.lock:
                 state.open_position = "long"
                 state.open_qty = qty
@@ -380,7 +396,10 @@ async def evaluate(price: float) -> None:
             stop_loss=sl, take_profit=tp,
         )
         if trade_id:
-            pm.on_open("short", qty, price, trade_id)
+            # BUG 1 FIX: await pm.on_open() (acum async, sub _snapshot_lock)
+            await pm.on_open("short", qty, price, trade_id)
+            # BUG 3 FIX: risk.on_open() apelat pentru a incrementa _open_count
+            risk.on_open()
             with state.lock:
                 state.open_position = "short"
                 state.open_qty = qty

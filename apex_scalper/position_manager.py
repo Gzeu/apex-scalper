@@ -1,23 +1,20 @@
-"""Position Manager v0.7.9 — race-condition fix pentru pulse snapshot.
+"""Position Manager v0.8.0 — 3 bug-uri critice fixate.
 
 Changelog:
-  v0.7.9 — BUG FIX: race condition intre pulse.py si evaluate().
-    - Adaugat PositionSnapshot dataclass cu toate campurile relevante.
-    - Adaugat _snapshot_lock asyncio.Lock() intern in PositionManager.
-    - evaluate() si try_pyramid() achizitioneaza _snapshot_lock la scriere.
-    - snapshot() metoda publica achizitioneaza acelasi lock la citire.
-    - pulse.py consuma snapshot() in loc sa acceseze pm._* direct.
-    - Elimina potentialul ZeroDivisionError cand entry_price=0 la reset concurent.
-  v0.7.3 — Interface alignment (all AttributeErrors eliminated):
-    - place_limit_order/place_market_order -> trader.place_order(order_type=)
-    - risk.position_size() -> risk.calc_qty() (correct method name)
-    - risk.on_close() called at ALL exit paths (TP1/2/3, trail, timeout)
-    - on_entry() renamed to on_open(side, qty, entry_price) to match strategy.py
-    - evaluate(price) now returns bool: True=position closed, False=still open
-    - try_pyramid() added as public method called by strategy.py
-    - _prev_fast/_prev_slow dead code removed from strategy interface
-  v0.7.2 — _api_call_with_retry import fix (trader._api_call -> module-level fn)
-  v0.7.1 — fill confirmation via get_order_history poll (retCode!=fill proof)
+  v0.8.0 — BUG FIXES:
+    BUG 1: on_open() acum async + achizitioneaza _snapshot_lock la scriere.
+      Elimina race window intre strategy.py (A: pm.on_open) si
+      (B: state.open_position=) unde pulse citea entry_price=0 / side=''.
+    BUG 2: TP3 reset() mutat DUPA calculul pnl_usdt.
+      Inainte: reset() -> _entry_price=0 -> _pnl_usdt()=0 -> risk.on_close(0)
+      Acum: entry_price salvat local -> _pnl_usdt(entry_price_local) -> reset()
+      _daily_loss si _consecutive_losses se actualizeaza corect la TP3.
+    BUG 5: pnl_pct calculat o singura data, consistent, fara double-read.
+      hold_candles incrementat sub lock, pnl_pct calculat o data dupa.
+  v0.7.9 — race-condition fix pentru pulse snapshot (PositionSnapshot + lock).
+  v0.7.3 — Interface alignment (all AttributeErrors eliminated).
+  v0.7.2 — _api_call_with_retry import fix.
+  v0.7.1 — fill confirmation via get_order_history poll.
 
 Interfaces consumed (verified against source):
   trader.place_order(side, qty, order_type, post_only, price, reduce_only)
@@ -25,7 +22,7 @@ Interfaces consumed (verified against source):
   trader.close_position()
   risk.calc_qty(price, order_size_usdt, leverage, regime_factor)
   risk.on_close(pnl_usdt, pnl_pct)
-  strategy.py calls: on_open(side, qty, price), evaluate(price) -> bool,
+  strategy.py calls: await on_open(side, qty, price), evaluate(price) -> bool,
                      try_pyramid(side, price, score, sl, tp)
 """
 from __future__ import annotations
@@ -115,10 +112,10 @@ class PositionManager:
     """Manages an open position: TP scale-out, trailing SL, timeout, pyramid.
 
     Public interface (matches strategy.py calls exactly):
-      on_open(side, qty, entry_price, trade_id=None)  <- called at entry
-      evaluate(price) -> bool                          <- called every candle
-      try_pyramid(side, price, score, sl, tp)          <- called by strategy
-      snapshot() -> PositionSnapshot                   <- atomic read for pulse
+      await on_open(side, qty, entry_price, trade_id=None)  <- called at entry
+      evaluate(price) -> bool                               <- called every candle
+      try_pyramid(side, price, score, sl, tp)               <- called by strategy
+      snapshot() -> PositionSnapshot                        <- atomic read for pulse
     """
 
     def __init__(self):
@@ -133,11 +130,10 @@ class PositionManager:
         self._entry_qty      = 0.0
         self._entry_side     = ""
         self._trade_id: int | None = None
-        # v0.7.9: lock pentru acces concurent pulse <-> evaluate()
         self._snapshot_lock  = asyncio.Lock()
 
-    def reset(self) -> None:
-        """Reset intern — apelat NUMAI din evaluate() sub _snapshot_lock."""
+    def _reset_fields(self) -> None:
+        """Reset intern — apelat NUMAI sub _snapshot_lock."""
         self._tp1_hit        = False
         self._tp2_hit        = False
         self._tp3_hit        = False
@@ -150,11 +146,14 @@ class PositionManager:
         self._entry_side     = ""
         self._trade_id       = None
 
+    # v0.7.x legacy alias — intern, sub lock
+    def reset(self) -> None:
+        self._reset_fields()
+
     async def snapshot(self) -> PositionSnapshot:
         """Returneaza un snapshot imutabil al starii curente, atomic sub lock.
 
         Singura interfata publica pentru citire din afara clasei (pulse, /tp).
-        Zero race conditions: lock achizitionat pe durata copierii campurilor.
         """
         async with self._snapshot_lock:
             return PositionSnapshot(
@@ -171,7 +170,7 @@ class PositionManager:
                 trade_id     = self._trade_id,
             )
 
-    def on_open(
+    async def on_open(
         self,
         side: str,
         qty: float,
@@ -180,16 +179,17 @@ class PositionManager:
     ) -> None:
         """Record entry. Called by strategy.py after fill confirmed.
 
-        v0.7.3: renamed from on_entry() to on_open() to match strategy.py call.
-        Signature: on_open(side, qty, entry_price) — qty now tracked for risk.
-        Note: called from async context, _snapshot_lock not needed here because
-        strategy.py calls this before the position is visible in state.
+        v0.8.0 BUG 1 FIX: acum async + achizitioneaza _snapshot_lock.
+          Elimina race window unde pulse vedea entry_price=0 / side=''
+          intre (A: on_open apelat) si (B: state.open_position setat).
+        v0.7.3: renamed from on_entry() to on_open().
         """
-        self.reset()
-        self._entry_side  = side
-        self._entry_qty   = qty
-        self._entry_price = entry_price
-        self._trade_id    = trade_id
+        async with self._snapshot_lock:
+            self._reset_fields()
+            self._entry_side  = side
+            self._entry_qty   = qty
+            self._entry_price = entry_price
+            self._trade_id    = trade_id
         logger.info(
             f"[PM] Entry: side={side} qty={qty} price={entry_price}"
         )
@@ -205,8 +205,14 @@ class PositionManager:
             return (current_price - self._entry_price) / self._entry_price
         return (self._entry_price - current_price) / self._entry_price
 
-    def _pnl_usdt(self, pnl_pct: float, qty: float) -> float:
-        return pnl_pct * qty * self._entry_price
+    def _pnl_usdt(self, pnl_pct: float, qty: float, entry_price: float | None = None) -> float:
+        """Calculeaza PnL in USDT.
+
+        v0.8.0 BUG 2 FIX: accepta entry_price optional pentru a evita
+          situatia in care self._entry_price=0 dupa reset() la TP3.
+        """
+        ep = entry_price if entry_price is not None else self._entry_price
+        return pnl_pct * qty * ep
 
     def _bybit_side(self, position_side: str, closing: bool) -> str:
         if position_side == "long":
@@ -290,7 +296,8 @@ class PositionManager:
         )
         with state.lock:
             state.open_position = None
-        self.reset()
+        async with self._snapshot_lock:
+            self._reset_fields()
 
     # ------------------------------------------------------------------ #
     #  Main evaluate loop — called every candle by strategy.py            #
@@ -299,31 +306,31 @@ class PositionManager:
     async def evaluate(self, current_price: float) -> bool:
         """Check TP levels, trailing SL, and timeout every candle.
 
-        v0.7.9: toate scrierile pe campuri interne sub _snapshot_lock
-          pentru a preveni race condition cu pulse.snapshot().
+        v0.8.0 BUG 5 FIX: pnl_pct calculat O SINGURA DATA dupa lock.
+          hold_candles incrementat sub lock atomic.
+          Elimina double-read inconsistent (sub lock + fara lock).
+        v0.7.9: toate scrierile pe campuri interne sub _snapshot_lock.
         Returns True if position was fully closed.
         """
         if not state.open_position:
             return True
 
+        # Incrementeaza hold_candles atomic sub lock, citeste entry_price stabil
         async with self._snapshot_lock:
-            pnl_pct = self._unrealised_pnl_pct(current_price)
             self._hold_candles += 1
+            hold = self._hold_candles
+            entry_price_now = self._entry_price
 
-            # --- TP1 ---
-            if not self._tp1_hit and pnl_pct >= TP1_PCT:
-                # Release lock during IO (place_order + poll)
-                pass
-
-        # IO in afara lock-ului — evitam deadlock la await
+        # Un singur calcul pnl_pct, consistent pentru toate ramurile de mai jos
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
+        # --- TP1 ---
         if not self._tp1_hit and pnl_pct >= TP1_PCT:
             filled, qty_closed = await self._close_partial(TP1_FRACTION, "TP1")
             if filled:
                 async with self._snapshot_lock:
                     self._tp1_hit = True
-                partial_pnl = self._pnl_usdt(pnl_pct, qty_closed)
+                partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, entry_price_now)
                 risk.on_close(partial_pnl, pnl_pct)
                 logger.info(f"[PM] TP1 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f}")
 
@@ -332,19 +339,22 @@ class PositionManager:
             if filled:
                 async with self._snapshot_lock:
                     self._tp2_hit = True
-                partial_pnl = self._pnl_usdt(pnl_pct, qty_closed)
+                partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, entry_price_now)
                 risk.on_close(partial_pnl, pnl_pct)
                 logger.info(f"[PM] TP2 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f}")
 
         elif self._tp2_hit and not self._tp3_hit and pnl_pct >= TP3_PCT:
             filled, qty_closed = await self._close_partial(TP3_FRACTION, "TP3")
             if filled:
+                # BUG 2 FIX: salveaza entry_price INAINTE de reset()
+                # Altfel _pnl_usdt() primeste entry_price=0 -> risk.on_close(0)
+                saved_entry = self._entry_price
+                partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, saved_entry)
                 async with self._snapshot_lock:
                     self._tp3_hit = True
-                    self.reset()
-                partial_pnl = self._pnl_usdt(pnl_pct, qty_closed)
+                    self._reset_fields()
                 risk.on_close(partial_pnl, pnl_pct)
-                logger.info(f"[PM] TP3 @ {pnl_pct:.4%} — trade complete")
+                logger.info(f"[PM] TP3 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f} — trade complete")
                 with state.lock:
                     state.open_position = None
                 return True
@@ -374,8 +384,6 @@ class PositionManager:
                 return True
 
         # --- Timeout ---
-        async with self._snapshot_lock:
-            hold = self._hold_candles
         if hold >= MAX_HOLD_CANDLES:
             logger.info(f"[PM] Timeout ({MAX_HOLD_CANDLES} candles) — closing")
             await self._close_full("TIMEOUT", pnl_pct)

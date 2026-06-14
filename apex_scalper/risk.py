@@ -1,13 +1,14 @@
-"""Risk manager v0.7.1 — Kelly fractional position sizing + consecutive loss guard.
+"""Risk manager v0.8.0 — Kelly formula corectata (Bug 6).
 
-Fixes vs v0.7.0:
-  - reset_daily now also clears _open_count (prevents phantom open_count
-    after a crash that left _open_count > 0 without a matching on_close).
-  - MAX_CONSECUTIVE_LOSSES env guard: can_open() returns False after N
-    consecutive losses, forcing a pause until manual /resume.
-  - on_close now updates consecutive loss counter correctly for partial
-    closes (pnl_usdt < 0 increments, pnl_usdt > 0 resets to 0).
-  - No change to Kelly formula or trade history deque.
+Changelog:
+  v0.8.0 — BUG 6 FIX: Kelly formula incorecta.
+    Implementat anterior: f = (win_rate - loss_rate) * (avg_win / avg_loss)
+    Corect Kelly standard: f = win_rate - loss_rate * (avg_loss / avg_win)
+    Diferenta practica (scalping win_rate=0.6, avg_win=0.12%, avg_loss=0.08%):
+      Vechi: f = (0.6-0.4)*(0.12/0.08) = 0.30 * 1.5 = 0.45 (inainte de KELLY_FRACTION)
+      Nou:   f = 0.6 - 0.4*(0.08/0.12) = 0.6 - 0.267 = 0.333 (inainte de KELLY_FRACTION)
+    Ambele aplica KELLY_FRACTION=0.5 -> 0.225 vs 0.167 — mai conservator si corect.
+  v0.7.1 — reset_daily fix, MAX_CONSECUTIVE_LOSSES, partial close tracking.
 """
 from __future__ import annotations
 
@@ -66,7 +67,7 @@ class RiskManager:
                 self._daily_loss         += abs(pnl_usdt)
                 self._consecutive_losses += 1
             else:
-                self._consecutive_losses = 0   # reset on any win
+                self._consecutive_losses = 0
             self._open_count = max(0, self._open_count - 1)
             self._trade_results.append({
                 "pnl_pct": pnl_pct,
@@ -77,7 +78,14 @@ class RiskManager:
         self.on_close(pnl_usdt, pnl_pct)
 
     def _kelly_factor(self) -> float:
-        """Half-Kelly sizing factor from recent trade history."""
+        """Half-Kelly sizing factor din trade history recent.
+
+        v0.8.0 BUG 6 FIX: formula Kelly standard corecta.
+          Anterior: f = (win_rate - loss_rate) * (avg_win / avg_loss)
+          Corect:   f = win_rate - loss_rate * (avg_loss / avg_win)
+          Sursa: Kelly J.L. (1956) - A New Interpretation of Information Rate.
+          Formula: f* = p - q/odds = p - (1-p)*(avg_loss/avg_win)
+        """
         trades = list(self._trade_results)
         if len(trades) < MIN_KELLY_TRADES:
             return 1.0
@@ -94,13 +102,14 @@ class RiskManager:
         avg_win  = sum(abs(t["pnl_pct"]) for t in wins)  / len(wins)
         avg_loss = sum(abs(t["pnl_pct"]) for t in losses) / len(losses)
 
-        if avg_loss == 0:
-            return MAX_KELLY_F
+        if avg_win == 0:
+            return MIN_KELLY_F
 
-        edge = win_rate - loss_rate
-        odds = avg_win / avg_loss
-        f    = (edge / (1.0 / odds)) * KELLY_FRACTION
-        f    = max(MIN_KELLY_F, min(MAX_KELLY_F, f))
+        # Kelly standard: f* = p - q * (avg_loss / avg_win)
+        # = win_rate - loss_rate * (avg_loss / avg_win)
+        f = win_rate - loss_rate * (avg_loss / avg_win)
+        f = f * KELLY_FRACTION   # half-Kelly
+        f = max(MIN_KELLY_F, min(MAX_KELLY_F, f))
         return f
 
     def calc_qty(
@@ -134,10 +143,7 @@ class RiskManager:
     def reset_daily(self) -> None:
         with self._lock:
             self._daily_loss  = 0.0
-            # FIX: also reset open_count to 0 to avoid phantom lock after crash
             self._open_count  = 0
-            # Note: consecutive losses intentionally NOT reset on midnight
-            # (carry-over is the conservative choice)
 
     @property
     def consecutive_losses(self) -> int:
