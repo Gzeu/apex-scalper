@@ -5,4 +5,4 @@ numpy>=1.26.0
 pandas>=2.2.0
 aiohttp>=3.9.0
 loguru>=0.7.2
-asteval>=2.0.0
+sortedcontainers>=2.4.0
