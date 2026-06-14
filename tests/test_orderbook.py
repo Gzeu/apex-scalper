@@ -1,5 +1,4 @@
-"""Unit tests for OrderBook delta logic."""
-import pytest
+"""Unit tests for OrderBook."""
 from apex_scalper.state import OrderBook
 
 
@@ -14,13 +13,22 @@ def test_snapshot():
 def test_delta_remove():
     ob = OrderBook()
     ob.apply_snapshot([["50000", "1.0"]], [["50001", "1.5"]])
-    ob.apply_delta("b", "50000", "0")  # remove
+    ob.apply_delta("b", "50000", "0")
     assert ob.best_bid is None
+
+
+def test_depth():
+    ob = OrderBook()
+    ob.apply_snapshot(
+        [["50000", "1.0"], ["49999", "2.0"], ["49998", "0.5"]],
+        [["50001", "1.5"], ["50002", "0.5"]],
+    )
+    assert abs(ob.bid_depth(3) - 3.5) < 0.001
+    assert abs(ob.ask_depth(2) - 2.0) < 0.001
 
 
 def test_spread_bps():
     ob = OrderBook()
     ob.apply_snapshot([["50000", "1.0"]], [["50005", "1.5"]])
-    mid = ob.mid_price
-    spread_bps = (ob.spread / mid) * 10_000
-    assert 0 < spread_bps < 2.0
+    bps = ob.spread / ob.mid_price * 10_000
+    assert 0 < bps < 2.0
