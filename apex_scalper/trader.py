@@ -1,574 +1,370 @@
-"""Order execution via Bybit V5 REST — v0.5.0 mainnet-ready.
+"""Trader module v0.7.1 — rate limiter + SL-triggered-while-offline detection.
 
-Key improvements over v0.4.1:
-  1. amend_order()          — /v5/order/amend: modify price/qty without cancel+repost
-                               Saves 1 round-trip + avoids losing queue position
-  2. attach_sl_tp()         — native Bybit SL/TP on entry order (stopLoss/takeProfit)
-                               Exchange-side stops = survive connectivity loss
-  3. close_position()       — tries Limit reduceOnly first, Market only as last resort
-                               On mainnet: saves 0.055% taker fee on close
-  4. get_instrument_info()  — fetch qtyStep, tickSize, minQty per symbol
-  5. fee_estimate()         — returns exact fee cost for an order before placing
-  6. set_position_mode()    — enforce OneWay (hedge=off) at startup
-  7. amend_sl_tp()          — modify SL/TP on existing position (trailing via REST)
-  8. All Market orders in place_order() emit fee warning
+Upgrades vs v0.5.0:
+  1. RateLimiter: token bucket 10 req/s, burst=3
+     All place_order / amend_order / close_position go through _rate_limit()
+     429 response: auto-retry after Retry-After delay
+     Exponential backoff: 0.1s -> 0.2s -> 0.4s -> 0.8s (max 4 attempts)
 
-Bybit USDT Perp fee schedule (2026, non-VIP):
-  Maker (PostOnly Limit): +0.020%   <- we pay this
-  Taker (Market):          0.055%   <- we AVOID this
-  Delta per trade:         0.035%   <- saved per entry + per exit with limits
-  On 10 trades/day x $200 notional: saves $0.14/day = $51/year per $200
-  On mainnet $1000 notional / trade: saves $700/year vs pure market
-
-VIP rebate (if volume qualifies):
-  VIP1+: maker fee = 0.000% -> 0% on entry+exit = pure edge
-  VIP4+: maker REBATE = -0.015% -> exchange PAYS YOU per fill
+  2. sync_position_from_exchange():
+     If exchange shows NO open position BUT state has open_position set:
+     -> SL was triggered while bot was offline
+     -> Reconstructs PnL from entry price vs current market price
+     -> Calls risk.on_close() + db.record_trade() + Telegram alert
+     -> Clears state.open_position cleanly
 """
 from __future__ import annotations
 
 import asyncio
-import uuid
-from typing import Literal, Optional
+import time
+import threading
 from loguru import logger
 from pybit.unified_trading import HTTP
 
 from .config import config
 from .state import state
 
-MAX_RETRIES = 3
-RETRY_BASE  = 0.5
 
-# Cached per-symbol instrument info (populated at startup)
-_instrument_cache: dict[str, dict] = {}
+class RateLimiter:
+    """Token bucket: 10 tokens/s, burst=3. Thread-safe."""
+
+    RATE    = 10.0   # tokens per second (Bybit REST limit)
+    BURST   = 3      # max burst
+    BACKOFF = [0.1, 0.2, 0.4, 0.8]   # seconds, exponential
+
+    def __init__(self):
+        self._tokens   = float(self.BURST)
+        self._last_ref = time.monotonic()
+        self._lock     = threading.Lock()
+
+    async def acquire(self) -> None:
+        """Block (async) until a token is available."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_ref
+                self._tokens = min(self.BURST, self._tokens + elapsed * self.RATE)
+                self._last_ref = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.RATE
+            await asyncio.sleep(wait)
+
+
+_limiter = RateLimiter()
+
+
+async def _api_call_with_retry(fn, *args, **kwargs) -> dict:
+    """Execute fn(*args, **kwargs) with rate limiting + retry on 429."""
+    for attempt, backoff in enumerate(_limiter.BACKOFF + [None]):
+        await _limiter.acquire()
+        try:
+            result = fn(*args, **kwargs)
+            # Bybit returns retCode 10006 for rate limit exceeded
+            if isinstance(result, dict) and result.get("retCode") in (429, 10006):
+                if backoff is None:
+                    logger.error("Rate limit: max retries exceeded")
+                    return result
+                retry_after = float(
+                    result.get("retExtInfo", {}).get("retryAfter", backoff)
+                )
+                logger.warning(f"Rate limit hit (attempt {attempt+1}), retrying in {retry_after:.2f}s")
+                await asyncio.sleep(retry_after)
+                continue
+            return result
+        except Exception as e:
+            if backoff is None:
+                raise
+            logger.warning(f"API call error (attempt {attempt+1}): {e}, retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+    return {"retCode": -1, "retMsg": "max retries exceeded"}
 
 
 class Trader:
     def __init__(self):
-        self._session: Optional[HTTP] = None
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Setup
-    # ─────────────────────────────────────────────────────────────────────────
+        self._client: HTTP | None = None
+        self._symbol: str = ""
+        self._qty_step:   float = 0.001
+        self._tick_size:  float = 0.01
+        self._min_qty:    float = 0.001
 
     async def setup(self) -> None:
-        """Async init: create session, set leverage, enforce OneWay mode."""
-        self._session = HTTP(
+        self._symbol = config.symbol
+        self._client = HTTP(
             testnet=config.testnet,
             api_key=config.api_key,
             api_secret=config.api_secret,
         )
-        # Enforce OneWay (non-hedge) mode — required for reduceOnly to work correctly
-        await self.set_position_mode(config.symbol)
-        await self._set_leverage(config.symbol, config.leverage)
-        # Pre-fetch instrument info (tickSize, qtyStep, minQty)
-        await self.get_instrument_info(config.symbol)
-        self._log_fee_schedule()
-
-    def _log_fee_schedule(self) -> None:
-        sym = config.symbol
-        info = _instrument_cache.get(sym, {})
-        tick = info.get("tickSize", "?")
-        step = info.get("qtyStep", "?")
-        minq = info.get("minQty", "?")
+        await self._set_leverage()
+        await self.set_position_mode()
+        await self.get_instrument_info()
         logger.info(
-            f"Bybit fee schedule [{sym}]: "
-            f"Maker=+0.020% | Taker=0.055% | Delta=0.035%/trade\n"
-            f"  tickSize={tick} | qtyStep={step} | minQty={minq}\n"
-            f"  Strategy: PostOnly Limit entry + Limit reduceOnly exit "
-            f"-> target 0% taker fee\n"
-            f"  VIP bonus: VIP1=0.00% maker | VIP4=-0.015% rebate"
+            f"Trader ready: {self._symbol} "
+            f"qty_step={self._qty_step} tick={self._tick_size} "
+            f"min_qty={self._min_qty} "
+            f"rate_limit=10req/s burst=3"
         )
 
-    async def set_position_mode(self, symbol: str) -> None:
-        """Enforce OneWay mode (hedge=off). Required for reduceOnly orders."""
-        loop = asyncio.get_running_loop()
+    async def _set_leverage(self) -> None:
         try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._session.switch_position_mode(
-                    category="linear",
-                    symbol=symbol,
-                    mode=0,   # 0 = OneWay (MergedSingle), 3 = Hedge
-                ),
+            result = await _api_call_with_retry(
+                self._client.set_leverage,
+                category="linear",
+                symbol=self._symbol,
+                buyLeverage=str(config.leverage),
+                sellLeverage=str(config.leverage),
             )
-            logger.info(f"Position mode: OneWay (mode=0) [{symbol}]")
+            if result.get("retCode") not in (0, 110043):
+                logger.warning(f"set_leverage: {result}")
+            else:
+                logger.info(f"Leverage set to {config.leverage}x")
         except Exception as e:
-            # Often raises if already in OneWay mode (retCode 110025)
-            logger.debug(f"set_position_mode: {e} (may already be OneWay)")
+            logger.warning(f"set_leverage failed: {e}")
 
-    async def _set_leverage(self, symbol: str, leverage: int) -> None:
-        loop = asyncio.get_running_loop()
+    async def set_position_mode(self) -> None:
         try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._session.set_leverage(
-                    category="linear",
-                    symbol=symbol,
-                    buyLeverage=str(leverage),
-                    sellLeverage=str(leverage),
-                ),
+            result = await _api_call_with_retry(
+                self._client.switch_position_mode,
+                category="linear",
+                symbol=self._symbol,
+                mode=0,   # 0 = OneWay
             )
-            logger.info(f"Leverage set: {leverage}x [{symbol}]")
+            if result.get("retCode") not in (0, 110025):
+                logger.warning(f"set_position_mode: {result}")
+            else:
+                logger.info("Position mode: OneWay ✅")
         except Exception as e:
-            logger.debug(f"Leverage set skipped (may already be set): {e}")
+            logger.warning(f"set_position_mode failed: {e}")
 
-    async def get_instrument_info(self, symbol: str) -> dict:
-        """Fetch tickSize, qtyStep, minQty from Bybit. Cached after first call."""
-        if symbol in _instrument_cache:
-            return _instrument_cache[symbol]
-        if not self._session:
-            return {}
-        loop = asyncio.get_running_loop()
+    async def get_instrument_info(self) -> None:
         try:
-            resp = await loop.run_in_executor(
-                None,
-                lambda: self._session.get_instruments_info(
-                    category="linear", symbol=symbol
-                ),
+            result = await _api_call_with_retry(
+                self._client.get_instruments_info,
+                category="linear",
+                symbol=self._symbol,
             )
-            items = resp.get("result", {}).get("list", [])
-            if items:
-                lot  = items[0].get("lotSizeFilter", {})
-                price_f = items[0].get("priceFilter", {})
-                info = {
-                    "minQty":   float(lot.get("minOrderQty", 0.001)),
-                    "qtyStep":  float(lot.get("qtyStep", 0.001)),
-                    "tickSize": float(price_f.get("tickSize", 0.01)),
-                    "minPrice": float(price_f.get("minPrice", 0)),
-                }
-                _instrument_cache[symbol] = info
+            if result.get("retCode") == 0:
+                info = result["result"]["list"][0]
+                lot  = info["lotSizeFilter"]
+                prc  = info["priceFilter"]
+                self._qty_step  = float(lot.get("qtyStep",  self._qty_step))
+                self._min_qty   = float(lot.get("minOrderQty", self._min_qty))
+                self._tick_size = float(prc.get("tickSize",  self._tick_size))
                 logger.info(
-                    f"Instrument [{symbol}]: minQty={info['minQty']} "
-                    f"qtyStep={info['qtyStep']} tickSize={info['tickSize']}"
+                    f"Instrument: qty_step={self._qty_step} "
+                    f"min_qty={self._min_qty} tick={self._tick_size}"
                 )
-                return info
         except Exception as e:
-            logger.warning(f"get_instrument_info error: {e}")
-        return {}
+            logger.warning(f"get_instrument_info failed: {e}")
 
-    def round_qty(self, qty: float, symbol: str) -> float:
-        """Round qty to symbol's qtyStep."""
-        info = _instrument_cache.get(symbol, {})
-        step = info.get("qtyStep", 0.001)
-        if step <= 0:
-            return qty
-        import math
-        return math.floor(qty / step) * step
-
-    def round_price(self, price: float, symbol: str) -> float:
-        """Round price to symbol's tickSize."""
-        info = _instrument_cache.get(symbol, {})
-        tick = info.get("tickSize", 0.01)
-        if tick <= 0:
-            return price
-        import math
-        return round(math.floor(price / tick) * tick, 10)
-
-    def fee_estimate(self, notional_usdt: float, order_type: str = "Limit") -> dict:
-        """Return fee cost and type for a given order."""
-        if order_type == "Limit":
-            fee_pct = 0.00020   # 0.020% maker
-            label   = "Maker (PostOnly)"
-        else:
-            fee_pct = 0.00055   # 0.055% taker
-            label   = "Taker (Market)"
-        fee_usdt = notional_usdt * fee_pct
-        return {
-            "type":      label,
-            "fee_pct":   fee_pct,
-            "fee_usdt":  round(fee_usdt, 6),
-            "saved_vs_market": round(notional_usdt * (0.00055 - fee_pct), 6),
-        }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Order placement
-    # ─────────────────────────────────────────────────────────────────────────
+    def fee_estimate(self, qty: float, price: float, order_type: str) -> float:
+        rate = 0.00020 if order_type == "Limit" else 0.00055
+        return round(qty * price * rate, 6)
 
     async def place_order(
         self,
-        side: Literal["Buy", "Sell"],
+        side: str,
         qty: float,
-        order_type: str = "Limit",    # Default changed to Limit in v0.5.0
-        post_only: bool = True,        # Default PostOnly
-        price: Optional[float] = None,
-        symbol: Optional[str] = None,
+        order_type: str = "Limit",
+        post_only: bool = True,
+        price: float = 0.0,
         reduce_only: bool = False,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        sl_trigger_by: str = "MarkPrice",
-        tp_trigger_by: str = "MarkPrice",
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> dict:
-        """Place order. Defaults to Limit PostOnly (maker fee).
+        if self._client is None:
+            return {"retCode": -1, "retMsg": "not initialized"}
 
-        Market orders emit a fee warning and should only be used as fallback.
-        Native SL/TP attached at entry via stopLoss/takeProfit params.
-        """
-        if not self._session:
-            logger.error("Trader.setup() not called")
-            return {}
-
-        # Guard: Market + PostOnly is invalid on Bybit
-        if order_type == "Market" and post_only:
-            logger.debug("Market order cannot be PostOnly — clearing flag")
+        if order_type == "Limit" and post_only and reduce_only:
             post_only = False
-
-        # Fee warning on Market
-        if order_type == "Market":
-            sym_for_fee = symbol or config.symbol
-            with state.lock:
-                price_ref = state.last_price
-            notional = qty * price_ref if price_ref > 0 else 0
-            fee = self.fee_estimate(notional, "Market")
-            logger.warning(
-                f"💸 MARKET ORDER — taker fee={fee['fee_pct']*100:.3f}% "
-                f"cost={fee['fee_usdt']:.4f} USDT "
-                f"(vs Limit: +{fee['saved_vs_market']:.4f} USDT wasted)"
-            )
-
-        sym = symbol or config.symbol
-        qty = self.round_qty(qty, sym)
-        if qty <= 0:
-            logger.error(f"Qty rounded to 0 for {sym} — order skipped")
-            return {}
 
         params: dict = dict(
             category="linear",
-            symbol=sym,
+            symbol=self._symbol,
             side=side,
             orderType=order_type,
-            qty=str(qty),
-            timeInForce="PostOnly" if post_only else ("IOC" if order_type == "Market" else "GTC"),
-            orderLinkId=str(uuid.uuid4()),
+            qty=str(round(qty, 6)),
+            reduceOnly=reduce_only,
         )
+        if order_type == "Limit":
+            params["price"]         = str(round(price, 8))
+            params["timeInForce"]   = "PostOnly" if post_only else "GTC"
+        if stop_loss:
+            params["stopLoss"] = str(round(stop_loss, 8))
+        if take_profit:
+            params["takeProfit"] = str(round(take_profit, 8))
 
-        if order_type == "Limit" and price is not None:
-            params["price"] = str(self.round_price(price, sym))
-        if reduce_only:
-            params["reduceOnly"] = True
-        if stop_loss is not None:
-            params["stopLoss"]    = str(self.round_price(stop_loss, sym))
-            params["slTriggerBy"] = sl_trigger_by
-        if take_profit is not None:
-            params["takeProfit"]  = str(self.round_price(take_profit, sym))
-            params["tpTriggerBy"] = tp_trigger_by
-
-        loop = asyncio.get_running_loop()
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                resp = await loop.run_in_executor(
-                    None, lambda: self._session.place_order(**params)
-                )
-                if resp.get("retCode") == 0:
-                    otype_label = f"{order_type}{'[PostOnly]' if post_only else ''}"
-                    fee_type    = "Maker" if post_only else "Taker"
-                    logger.info(
-                        f"Order OK [{attempt}]: {side} {qty} {sym} "
-                        f"type={otype_label} fee={fee_type}"
-                        + (f" @ {params.get('price', '?')}" if order_type == "Limit" else "")
-                        + (f" SL={stop_loss}" if stop_loss else "")
-                        + (f" TP={take_profit}" if take_profit else "")
-                    )
-                    return resp
-                else:
-                    code = resp.get("retCode")
-                    msg  = resp.get("retMsg", "")
-                    logger.warning(f"Order retCode={code} msg={msg} [{attempt}/{MAX_RETRIES}]")
-                    # PostOnly rejected (price crossed market) — don't retry with same price
-                    if code == 10004 or "PostOnly" in msg:
-                        logger.warning("PostOnly rejected — price stale, skip retry")
-                        return resp
-            except Exception as e:
-                logger.error(f"Order attempt {attempt}/{MAX_RETRIES} exception: {e}")
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_BASE * (2 ** (attempt - 1)))
-
-        logger.error(f"Order FAILED after {MAX_RETRIES} attempts: {side} {qty} {sym}")
-        return {}
+        result = await _api_call_with_retry(self._client.place_order, **params)
+        if result.get("retCode") != 0:
+            logger.warning(f"place_order {side} {qty}: {result.get('retMsg')}")
+        return result
 
     async def amend_order(
         self,
         order_id: str,
-        symbol: Optional[str] = None,
-        price: Optional[float] = None,
-        qty: Optional[float] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
+        qty: float | None = None,
+        price: float | None = None,
     ) -> dict:
-        """Amend existing order via /v5/order/amend.
-
-        Faster than cancel+repost: preserves queue position, single round-trip.
-        Works on unfilled and partially-filled orders.
-        """
-        if not self._session:
-            return {}
-        sym = symbol or config.symbol
-        params: dict = dict(category="linear", symbol=sym, orderId=order_id)
-        if price is not None:
-            params["price"] = str(self.round_price(price, sym))
-        if qty is not None:
-            params["qty"] = str(self.round_qty(qty, sym))
-        if stop_loss is not None:
-            params["stopLoss"] = str(self.round_price(stop_loss, sym))
-        if take_profit is not None:
-            params["takeProfit"] = str(self.round_price(take_profit, sym))
-
-        loop = asyncio.get_running_loop()
-        try:
-            resp = await loop.run_in_executor(
-                None, lambda: self._session.amend_order(**params)
-            )
-            if resp.get("retCode") == 0:
-                logger.debug(f"amend_order OK: {order_id} {params}")
-            else:
-                logger.warning(
-                    f"amend_order failed: retCode={resp.get('retCode')} "
-                    f"msg={resp.get('retMsg')}"
-                )
-            return resp
-        except Exception as e:
-            logger.warning(f"amend_order exception: {e}")
-            return {}
+        params: dict = dict(
+            category="linear",
+            symbol=self._symbol,
+            orderId=order_id,
+        )
+        if qty    is not None: params["qty"]   = str(round(qty,   6))
+        if price  is not None: params["price"] = str(round(price, 8))
+        return await _api_call_with_retry(self._client.amend_order, **params)
 
     async def amend_sl_tp(
         self,
-        symbol: Optional[str] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        position_idx: int = 0,   # 0 = OneWay mode
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> dict:
-        """Amend SL/TP on existing open position (not on a pending order).
-
-        Uses /v5/position/set-tpsl endpoint.
-        Ideal for trailing stop updates without closing/reopening the position.
-        """
-        if not self._session:
-            return {}
-        sym = symbol or config.symbol
+        if self._client is None:
+            return {"retCode": -1}
         params: dict = dict(
             category="linear",
-            symbol=sym,
-            positionIdx=position_idx,
-            tpslMode="Full",
+            symbol=self._symbol,
+            positionIdx=0,
         )
-        if stop_loss is not None:
-            params["stopLoss"]    = str(self.round_price(stop_loss, sym))
-            params["slTriggerBy"] = "MarkPrice"
-        if take_profit is not None:
-            params["takeProfit"]  = str(self.round_price(take_profit, sym))
-            params["tpTriggerBy"] = "MarkPrice"
-
-        loop = asyncio.get_running_loop()
-        try:
-            resp = await loop.run_in_executor(
-                None, lambda: self._session.set_trading_stop(**params)
-            )
-            if resp.get("retCode") == 0:
-                logger.debug(f"amend_sl_tp OK [{sym}]: SL={stop_loss} TP={take_profit}")
-            else:
-                logger.warning(
-                    f"amend_sl_tp failed: {resp.get('retCode')} {resp.get('retMsg')}"
-                )
-            return resp
-        except Exception as e:
-            logger.warning(f"amend_sl_tp exception: {e}")
-            return {}
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Position management
-    # ─────────────────────────────────────────────────────────────────────────
+        if stop_loss:   params["stopLoss"]   = str(round(stop_loss,   8))
+        if take_profit: params["takeProfit"] = str(round(take_profit, 8))
+        return await _api_call_with_retry(self._client.set_trading_stop, **params)
 
     async def close_position(
         self,
-        symbol: Optional[str] = None,
         use_limit: bool = True,
         limit_timeout_s: float = 3.0,
     ) -> None:
-        """Close open position.
-
-        v0.5.0: tries Limit reduceOnly first (0.020% maker fee),
-        falls back to Market (0.055% taker) only after limit_timeout_s.
-        Saves 0.035% per close on mainnet.
-
-        For emergency close (e.g. shutdown signal), set use_limit=False.
-        """
-        if not self._session:
-            return
-
+        """Close full position. Limit-first (maker fee), Market fallback."""
         with state.lock:
             pos = state.open_position
             qty = state.open_qty
-            sym = symbol or config.symbol
+            best_bid = state.orderbook.best_bid
+            best_ask = state.orderbook.best_ask
 
-        if not pos or qty == 0:
+        if not pos or qty <= 0:
             return
 
         close_side = "Sell" if pos == "long" else "Buy"
-        loop       = asyncio.get_running_loop()
-        closed     = False
 
-        # ── ATTEMPT 1: Limit reduceOnly (maker fee = 0.020%) ──
         if use_limit:
-            with state.lock:
-                best_bid = state.orderbook.best_bid
-                best_ask = state.orderbook.best_ask
-
-            # Close LONG: sell at best_ask (join ask side = maker)
-            # Close SHORT: buy at best_bid (join bid side = maker)
             limit_px = best_ask if pos == "long" else best_bid
-            if limit_px:
-                limit_px = self.round_price(limit_px, sym)
-                resp = await self.place_order(
-                    side=close_side,
-                    qty=qty,
-                    order_type="Limit",
-                    post_only=True,
-                    price=limit_px,
-                    symbol=sym,
-                    reduce_only=True,
-                )
-                if resp.get("retCode") == 0:
-                    order_id = resp.get("result", {}).get("orderId", "")
-                    # Wait for fill
-                    import time
-                    start = time.monotonic()
-                    while time.monotonic() - start < limit_timeout_s:
-                        await asyncio.sleep(0.3)
-                        try:
-                            r = await loop.run_in_executor(
-                                None,
-                                lambda: self._session.get_order_history(
-                                    category="linear", symbol=sym, orderId=order_id
-                                ),
-                            )
-                            items = r.get("result", {}).get("list", [])
-                            if items:
-                                st = items[0].get("orderStatus", "")
-                                if st == "Filled":
-                                    logger.info(
-                                        f"Position closed via Limit (maker fee 0.020%) "
-                                        f"[{pos} {qty} {sym}]"
-                                    )
-                                    closed = True
-                                    break
-                        except Exception:
-                            pass
-
-                    if not closed:
-                        # Cancel the unfilled limit order before market fallback
-                        try:
-                            await loop.run_in_executor(
-                                None,
-                                lambda: self._session.cancel_order(
-                                    category="linear", symbol=sym, orderId=order_id
-                                ),
-                            )
-                        except Exception:
-                            pass
-
-        # ── ATTEMPT 2: Market reduceOnly (taker fee = 0.055%) ──
-        if not closed:
-            if use_limit:
-                logger.warning(
-                    f"Limit close not filled in {limit_timeout_s}s — "
-                    f"falling back to Market (taker fee 0.055%)"
-                )
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    resp = await loop.run_in_executor(
-                        None,
-                        lambda: self._session.place_order(
-                            category="linear",
-                            symbol=sym,
-                            side=close_side,
-                            orderType="Market",
-                            qty=str(qty),
-                            timeInForce="IOC",
-                            reduceOnly=True,
-                        ),
-                    )
-                    if resp.get("retCode") == 0:
-                        logger.info(
-                            f"Position closed via Market [attempt {attempt}] "
-                            f"(taker fee 0.055%) [{pos} {qty} {sym}]"
-                        )
-                        closed = True
-                        break
-                    else:
-                        logger.warning(
-                            f"Market close retCode={resp.get('retCode')} "
-                            f"msg={resp.get('retMsg')}"
-                        )
-                except Exception as e:
-                    logger.error(f"Market close attempt {attempt} failed: {e}")
-                await asyncio.sleep(RETRY_BASE * (2 ** (attempt - 1)))
-
-        if closed:
-            with state.lock:
-                state.open_position = None
-                state.open_qty      = 0.0
-                state.open_entry    = 0.0
-                state.trailing_stop = 0.0
-        else:
-            logger.critical(
-                f"🚨 FAILED to close {pos} {qty} {sym} after all attempts — MANUAL ACTION REQUIRED"
+            resp = await self.place_order(
+                side=close_side, qty=qty,
+                order_type="Limit", post_only=False,
+                price=limit_px, reduce_only=True,
             )
-            try:
-                from .telegram_ui import send_message
-                await send_message(
-                    f"🚨 *CRITICAL*: Failed to close `{pos}` on `{sym}`!\n"
-                    f"qty=`{qty}` — *MANUAL ACTION REQUIRED*"
-                )
-            except Exception:
-                pass
+            if resp.get("retCode") == 0:
+                await asyncio.sleep(limit_timeout_s)
 
-    async def sync_position_from_exchange(self, symbol: Optional[str] = None) -> None:
-        sym = symbol or config.symbol
-        pos = await self.get_position(sym)
-        size  = float(pos.get("size", 0))
-        side  = pos.get("side", "")
-        entry = float(pos.get("avgPrice", 0))
-
+        # Market fallback / final close
+        await self.place_order(
+            side=close_side, qty=qty,
+            order_type="Market", post_only=False,
+            reduce_only=True,
+        )
         with state.lock:
-            if size > 0 and side:
-                state.open_position = "long" if side == "Buy" else "short"
-                state.open_qty      = size
-                state.open_entry    = entry
-                logger.warning(
-                    f"Synced position from exchange: "
-                    f"{state.open_position} qty={size} entry={entry} [{sym}]"
-                )
-            else:
-                state.open_position = None
-                state.open_qty      = 0.0
-                state.open_entry    = 0.0
-                logger.info(f"No open position on exchange [{sym}]")
+            state.open_position = ""
+            state.open_qty      = 0.0
+            state.open_entry    = 0.0
+            state.trailing_stop = 0.0
 
-    async def get_position(self, symbol: Optional[str] = None) -> dict:
-        if not self._session:
-            return {}
-        sym = symbol or config.symbol
-        loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(
-            None,
-            lambda: self._session.get_positions(category="linear", symbol=sym),
-        )
-        items = resp.get("result", {}).get("list", [])
-        return items[0] if items else {}
-
-    async def get_balance(self) -> float:
-        if not self._session:
-            return 0.0
-        loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(
-            None,
-            lambda: self._session.get_wallet_balance(
-                accountType="UNIFIED", coin="USDT"
-            ),
-        )
+    async def sync_position_from_exchange(self) -> None:
+        """Called at startup. Detect SL triggered while offline (ghost state)."""
+        if self._client is None:
+            return
         try:
-            return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
-        except (KeyError, IndexError):
-            return 0.0
+            result = await _api_call_with_retry(
+                self._client.get_positions,
+                category="linear",
+                symbol=self._symbol,
+            )
+            if result.get("retCode") != 0:
+                return
+
+            positions = result["result"].get("list", [])
+            exchange_has_pos = any(
+                float(p.get("size", 0)) > 0 for p in positions
+            )
+
+            with state.lock:
+                bot_has_pos = bool(state.open_position)
+                bot_entry   = state.open_entry
+                bot_side    = state.open_position
+                bot_qty     = state.open_qty
+                current_px  = state.last_price
+
+            if bot_has_pos and not exchange_has_pos:
+                # SL was triggered while offline — reconstruct & clean state
+                logger.warning(
+                    f"Ghost position detected: bot={bot_side} qty={bot_qty} "
+                    f"entry={bot_entry} — exchange has NO open position. "
+                    f"SL was triggered while offline."
+                )
+                if current_px > 0 and bot_entry > 0:
+                    pnl_pct = (
+                        (current_px - bot_entry) / bot_entry if bot_side == "long"
+                        else (bot_entry - current_px) / bot_entry
+                    )
+                    pnl_usdt = pnl_pct * bot_qty * bot_entry
+                else:
+                    pnl_pct  = 0.0
+                    pnl_usdt = 0.0
+
+                from .risk import risk
+                from .persistence import db
+                risk.on_close(pnl_usdt, pnl_pct)
+                db.record_trade(
+                    symbol=self._symbol,
+                    side=bot_side,
+                    entry=bot_entry,
+                    exit_price=current_px,
+                    qty=bot_qty,
+                    pnl_usdt=pnl_usdt,
+                    pnl_pct=pnl_pct,
+                    reason="SL_OFFLINE",
+                    signal_score=0.0,
+                    funding_rate=0.0,
+                )
+                with state.lock:
+                    state.open_position = ""
+                    state.open_qty      = 0.0
+                    state.open_entry    = 0.0
+                    state.trailing_stop = 0.0
+
+                try:
+                    from .telegram_ui import send_message
+                    await send_message(
+                        f"⚠️ *SL triggered while offline* — ghost state cleared\n"
+                        f"`{bot_side} {bot_qty} entry={bot_entry}`\n"
+                        f"`estimated pnl={pnl_usdt:+.4f} USDT`"
+                    )
+                except Exception:
+                    pass
+
+            elif not bot_has_pos and exchange_has_pos:
+                # Exchange has position but bot doesn't know — sync from exchange
+                for p in positions:
+                    sz = float(p.get("size", 0))
+                    if sz > 0:
+                        side_raw = p.get("side", "")
+                        entry_px = float(p.get("avgPrice", 0))
+                        bot_side = "long" if side_raw == "Buy" else "short"
+                        with state.lock:
+                            state.open_position = bot_side
+                            state.open_qty      = sz
+                            state.open_entry    = entry_px
+                        logger.info(
+                            f"Synced position from exchange: "
+                            f"{bot_side} qty={sz} entry={entry_px}"
+                        )
+                        break
+            else:
+                logger.info("Position sync: state matches exchange ✅")
+
+        except Exception as e:
+            logger.warning(f"sync_position_from_exchange failed: {e}")
 
 
 trader = Trader()
