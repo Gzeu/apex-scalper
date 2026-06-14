@@ -1,8 +1,8 @@
 """Shared in-memory state: orderbook, last price, PnL, positions.
 
-IMPORTANT: pybit WebSocket callbacks run in a separate thread (not the asyncio
-event loop). We use a threading.Lock here so both the WS thread and the async
-strategy coroutine can safely access shared state without deadlock.
+All indicator state is owned by indicators.IndicatorState (NOT here).
+This module only holds execution/position/PnL state + the L2 orderbook.
+Mutations from WS thread use threading.Lock.
 """
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ class OrderBook:
     """Local L2 orderbook with O(log n) insert/delete via SortedDict."""
 
     def __init__(self):
-        self._bids: SortedDict = SortedDict(lambda k: -k)
-        self._asks: SortedDict = SortedDict()
+        self._bids: SortedDict = SortedDict(lambda k: -k)  # descending
+        self._asks: SortedDict = SortedDict()               # ascending
         self.seq: int = 0
 
     def apply_snapshot(self, bids: list, asks: list) -> None:
@@ -60,31 +60,38 @@ class OrderBook:
     def ask_depth(self, levels: int = 5) -> float:
         return sum(list(self._asks.values())[:levels])
 
+    def top_bids(self, levels: int = 10) -> list[tuple[float, float]]:
+        """Public API: return [(price, size), ...] for top-N bids."""
+        return list(self._bids.items())[:levels]
+
+    def top_asks(self, levels: int = 10) -> list[tuple[float, float]]:
+        """Public API: return [(price, size), ...] for top-N asks."""
+        return list(self._asks.items())[:levels]
+
 
 @dataclass
 class BotState:
+    # Control
     running: bool = False
     paused: bool = False
+
+    # Market data
     orderbook: OrderBook = field(default_factory=OrderBook)
     last_price: float = 0.0
-    ema_fast: float = 0.0
-    ema_slow: float = 0.0
-    rsi_gains: list = field(default_factory=list)
-    rsi_losses: list = field(default_factory=list)
-    rsi_avg_gain: float = 0.0
-    rsi_avg_loss: float = 0.0
-    rsi_value: float = 50.0
-    rsi_ready: bool = False
-    rsi_prev_price: float = 0.0
-    rsi_count: int = 0
-    open_position: Optional[str] = None
+
+    # Open position (managed by position_manager, cleared on exit by trader)
+    open_position: Optional[str] = None   # 'long' | 'short' | None
     open_qty: float = 0.0
     open_entry: float = 0.0
     trailing_stop: float = 0.0
+
+    # PnL accounting
     realized_pnl: float = 0.0
     daily_pnl: float = 0.0
     total_trades: int = 0
     win_trades: int = 0
+
+    # Thread lock (WS thread <-> async event loop)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def symbol_str(self) -> str:
@@ -96,6 +103,10 @@ class BotState:
         if self.total_trades == 0:
             return 0.0
         return round(self.win_trades / self.total_trades * 100, 1)
+
+    def reset_daily(self) -> None:
+        """Reset daily PnL counter (UTC midnight or /resume)."""
+        self.daily_pnl = 0.0
 
 
 state = BotState()
