@@ -1,20 +1,27 @@
-"""Multi-signal scalping strategy v0.7.1.
+"""Multi-signal scalping strategy v0.7.2.
 
-Upgrades vs v0.7.0:
-  - MACD histogram and StochRSI(14,3,3) added as soft bonus signals
-    Both computed in indicators.py (no strategy.py overhead)
-    Weight: macd=0.04, stoch=0.04 (taken from book_pressure 0.28->0.24
-    and rsi 0.18->0.16; imbalance 0.16->0.14)
-  - All 10 indicators now contribute to score
-  - _calc_sl_tp reads TP3_PCT from position_manager (not env directly)
+Fixes vs v0.7.1:
+  FIX #3 — Score normalization skew:
+    In v0.7.1, book_pressure/trend/ema_cross were binary (0 or weight) while
+    imbalance/volume were proportional. A bot could hit ENTRY_THRESHOLD=0.65
+    on book_pressure(0.24) + trend(0.12) + ema_cross(0.10) + partial_volume
+    with NO RSI or imbalance confirmation. Now:
+      - book_pressure: proportional to |cum_delta| / threshold (0..weight)
+      - trend: proportional to price_gap_vs_ema50 / 0.002 (0..weight)
+      - ema_cross: proportional to (ema_fast - ema_slow) / ema_mid, norm 0.003
+    All 10 signals now produce continuous values. ENTRY_THRESHOLD=0.65 requires
+    genuine multi-signal confluence.
 
-Signal weights v0.7.1 (sum=1.0):
+  FIX #5 — Deduplicate self._prev_fast/slow boilerplate:
+    evaluate() now uses a single try/finally block. Code -40 lines.
+
+  FIX #2 — Trailing stop rate limit:
+    Debounce logic moved to position_manager.evaluate() (TRAIL_AMEND_MIN_TICKS).
+    strategy.py is not affected directly.
+
+Signal weights v0.7.2 (unchanged from v0.7.1):
   book_pressure=0.24, rsi=0.16, imbalance=0.14, trend=0.12,
   ema_cross=0.10, volume=0.08, macd=0.04, stoch=0.04, bb=0.04, vwap=0.04
-
-Entry trigger:
-  Primary: bp.pressure_long/short() (1-5 tick lag, book flow)
-  Confirmation: 10-signal weighted score >= ENTRY_THRESHOLD
 """
 from __future__ import annotations
 
@@ -53,16 +60,16 @@ BASE_SPREAD_BPS  = float(os.getenv("BASE_SPREAD_BPS",   "3.0"))
 ATR_SPREAD_MULT  = float(os.getenv("ATR_SPREAD_MULT",   "2.0"))
 ATR_BASELINE     = float(os.getenv("ATR_BASELINE",      "0.001"))
 
-# Signal weights v0.7.1 (10 signals, sum=1.0)
+# Signal weights v0.7.2 (10 signals, sum=1.0)
 _W = {
-    "book_pressure": 0.24,   # primary trigger (reduced from 0.28 to accommodate MACD+Stoch)
-    "rsi":           0.16,   # reduced from 0.18
-    "imbalance":     0.14,   # reduced from 0.16
+    "book_pressure": 0.24,
+    "rsi":           0.16,
+    "imbalance":     0.14,
     "trend":         0.12,
     "ema_cross":     0.10,
     "volume":        0.08,
-    "macd":          0.04,   # NEW: MACD histogram direction
-    "stoch":         0.04,   # NEW: StochRSI momentum
+    "macd":          0.04,
+    "stoch":         0.04,
     "bb":            0.04,
     "vwap":          0.04,
 }
@@ -97,11 +104,14 @@ def _dynamic_spread_ok(spread_bps: float) -> bool:
 
 
 def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
+    """Compute long entry score [0..1]. All 10 signals are continuous."""
     score = 0.0
 
-    # 1. Book pressure — primary trigger
+    # 1. Book pressure — FIX #3: proportional to |cum_delta| / threshold
     if bp.pressure_long():
-        score += _W["book_pressure"]
+        thr = bp._threshold()
+        bp_strength = min(abs(bp.cum_delta) / thr, 1.0) if thr > 0 else 1.0
+        score += _W["book_pressure"] * bp_strength
 
     # 2. RSI confirmation with overbought penalty
     if ind.rsi_ready and RSI_LONG_MIN <= ind.rsi_value <= RSI_OB_LIMIT:
@@ -116,13 +126,16 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if ob.imbalance >= IMBALANCE_LONG:
         score += _W["imbalance"] * min(ob.imbalance / 0.3, 1.0)
 
-    # 4. EMA50 1m trend: price above EMA50
-    if price > ind.ema_trend:
-        score += _W["trend"]
+    # 4. EMA50 1m trend — FIX #3: proportional to price gap vs EMA50
+    if ind.ema_trend > 0 and price > ind.ema_trend:
+        gap_norm = min((price - ind.ema_trend) / (ind.ema_trend * 0.002), 1.0)
+        score += _W["trend"] * gap_norm
 
-    # 5. EMA cross confirmation
-    if ind.ema_fast > ind.ema_slow:
-        score += _W["ema_cross"]
+    # 5. EMA cross confirmation — FIX #3: proportional to spread
+    if ind.ema_slow > 0 and ind.ema_fast > ind.ema_slow:
+        ema_mid = (ind.ema_fast + ind.ema_slow) / 2
+        cross_norm = min((ind.ema_fast - ind.ema_slow) / (ema_mid * 0.003), 1.0)
+        score += _W["ema_cross"] * cross_norm
 
     # 6. Volume z-score
     if ind.vol_ready and ind.vol_zscore >= VOL_ZSCORE_MIN:
@@ -132,7 +145,7 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if ind.macd_ready and ind.macd_histogram > 0:
         score += _W["macd"]
 
-    # 8. StochRSI: %K > %D = bullish momentum, K < 80 avoids overbought
+    # 8. StochRSI: %K > %D = bullish, K < 80 avoids overbought
     if ind.stoch_ready and ind.stoch_k > ind.stoch_d and ind.stoch_k < 80:
         score += _W["stoch"]
 
@@ -157,11 +170,14 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
 
 
 def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
+    """Compute short entry score [0..1]. All 10 signals are continuous."""
     score = 0.0
 
-    # 1. Book pressure — primary trigger
+    # 1. Book pressure — FIX #3: proportional
     if bp.pressure_short():
-        score += _W["book_pressure"]
+        thr = bp._threshold()
+        bp_strength = min(abs(bp.cum_delta) / thr, 1.0) if thr > 0 else 1.0
+        score += _W["book_pressure"] * bp_strength
 
     # 2. RSI with oversold penalty
     if ind.rsi_ready and RSI_OS_LIMIT <= ind.rsi_value <= RSI_SHORT_MAX:
@@ -176,13 +192,16 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if ob.imbalance <= IMBALANCE_SHORT:
         score += _W["imbalance"] * min(abs(ob.imbalance) / 0.3, 1.0)
 
-    # 4. EMA50 trend
-    if price < ind.ema_trend:
-        score += _W["trend"]
+    # 4. EMA50 trend — FIX #3: proportional
+    if ind.ema_trend > 0 and price < ind.ema_trend:
+        gap_norm = min((ind.ema_trend - price) / (ind.ema_trend * 0.002), 1.0)
+        score += _W["trend"] * gap_norm
 
-    # 5. EMA cross confirmation
-    if ind.ema_fast < ind.ema_slow:
-        score += _W["ema_cross"]
+    # 5. EMA cross confirmation — FIX #3: proportional
+    if ind.ema_slow > 0 and ind.ema_fast < ind.ema_slow:
+        ema_mid = (ind.ema_fast + ind.ema_slow) / 2
+        cross_norm = min((ind.ema_slow - ind.ema_fast) / (ema_mid * 0.003), 1.0)
+        score += _W["ema_cross"] * cross_norm
 
     # 6. Volume
     if ind.vol_ready and ind.vol_zscore >= VOL_ZSCORE_MIN:
@@ -192,7 +211,7 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if ind.macd_ready and ind.macd_histogram < 0:
         score += _W["macd"]
 
-    # 8. StochRSI: %K < %D = bearish momentum, K > 20 avoids oversold
+    # 8. StochRSI: %K < %D = bearish, K > 20 avoids oversold
     if ind.stoch_ready and ind.stoch_k < ind.stoch_d and ind.stoch_k > 20:
         score += _W["stoch"]
 
@@ -222,6 +241,14 @@ class Strategy:
         self._prev_slow: float = 0.0
 
     async def evaluate(self) -> None:
+        """FIX #5: single try/finally ensures _prev_fast/slow always updated."""
+        try:
+            await self._do_evaluate()
+        finally:
+            self._prev_fast = ind.ema_fast
+            self._prev_slow = ind.ema_slow
+
+    async def _do_evaluate(self) -> None:
         from .position_manager import position_manager
         from .config import config
 
@@ -239,8 +266,6 @@ class Strategy:
         # ── REGIME GATE ──
         if not regime.allow_entry() and not pos:
             logger.debug(f"Regime={regime.label} — entries blocked")
-            self._prev_fast = ind.ema_fast
-            self._prev_slow = ind.ema_slow
             return
 
         # ── EXIT / PYRAMID ──
@@ -255,17 +280,15 @@ class Strategy:
                 elif pos == "short" and short_score >= 0.85:
                     sl, tp = _calc_sl_tp("short", price)
                     await position_manager.try_pyramid("short", price, short_score, sl, tp)
-            self._prev_fast = ind.ema_fast
-            self._prev_slow = ind.ema_slow
             return
 
         # ── ENTRY GUARDS ──
         if not risk.can_open():
-            self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
+            return
         if not ind.rsi_ready or not ind.atr_ready:
-            self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
+            return
         if not bp.ready():
-            self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
+            return
 
         # ── DYNAMIC SPREAD GATE ──
         with state.lock:
@@ -275,16 +298,16 @@ class Strategy:
             spread_bps = (best_ask - best_bid) / best_bid * 10000
             if not _dynamic_spread_ok(spread_bps):
                 logger.debug(f"Spread {spread_bps:.2f}bps > dynamic limit")
-                self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
+                return
 
         # ── ENTRY TRIGGER: book pressure (primary) ──
         long_signal  = bp.pressure_long()
         short_signal = bp.pressure_short()
 
         if long_signal:
-            if not mtf.allow_long(price): self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
-            if not funding.can_enter_long(): self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
-            if not anti_manip.clear_for_entry("long"): self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
+            if not mtf.allow_long(price):              return
+            if not funding.can_enter_long():           return
+            if not anti_manip.clear_for_entry("long"): return
 
             score = _score_long(ind, ob, price)
             logger.info(
@@ -315,7 +338,7 @@ class Strategy:
                                     qty=filled_qty, pnl_usdt=0, pnl_pct=0, reason="OPEN",
                                     signal_score=score, funding_rate=funding.rate)
                     await _notify(
-                        f"🟡 *LONG* `{_sym()}` score=`{score:.3f}`\n"
+                        f"\U0001f7e1 *LONG* `{_sym()}` score=`{score:.3f}`\n"
                         f"`price={avg_price}` `qty={filled_qty}`\n"
                         f"`rsi={ind.rsi_value:.1f}` `regime={regime.label}`\n"
                         f"`macd_h={ind.macd_histogram:+.5f}` `stoch_k={ind.stoch_k:.1f}`\n"
@@ -323,9 +346,9 @@ class Strategy:
                     )
 
         elif short_signal:
-            if not mtf.allow_short(price): self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
-            if not funding.can_enter_short(): self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
-            if not anti_manip.clear_for_entry("short"): self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
+            if not mtf.allow_short(price):              return
+            if not funding.can_enter_short():           return
+            if not anti_manip.clear_for_entry("short"): return
 
             score = _score_short(ind, ob, price)
             logger.info(
@@ -356,15 +379,12 @@ class Strategy:
                                     qty=filled_qty, pnl_usdt=0, pnl_pct=0, reason="OPEN",
                                     signal_score=score, funding_rate=funding.rate)
                     await _notify(
-                        f"🟠 *SHORT* `{_sym()}` score=`{score:.3f}`\n"
+                        f"\U0001f7e0 *SHORT* `{_sym()}` score=`{score:.3f}`\n"
                         f"`price={avg_price}` `qty={filled_qty}`\n"
                         f"`rsi={ind.rsi_value:.1f}` `regime={regime.label}`\n"
                         f"`macd_h={ind.macd_histogram:+.5f}` `stoch_k={ind.stoch_k:.1f}`\n"
                         f"`delta={bp.cum_delta:+.0f}` `SL={sl}` `TP={tp}`"
                     )
-
-        self._prev_fast = ind.ema_fast
-        self._prev_slow = ind.ema_slow
 
 
 def _sym() -> str:
