@@ -1,18 +1,20 @@
-"""Anti-manipulation filter v0.4.1 — per-symbol wall thresholds.
+"""Anti-manipulation filter v0.4.2 — thread-safe signals singleton.
 
-Changes vs v0.4.0:
-- WALL_RATIO and WALL_DISTANCE_TICKS are now read from SYMBOL_PROFILES
-  (injected via inject_wall_params() called from main.py)
-- Different thresholds per symbol: BTC (deep book) vs DOGE (thin book)
-
-BTC:  wall_ratio=8.0, wall_distance=5  (deep book, need big orders to be suspicious)
-ETH:  wall_ratio=7.0, wall_distance=4
-HYPE: wall_ratio=5.0, wall_distance=3  (thin book, 5x already suspicious)
-DOGE: wall_ratio=4.0, wall_distance=3  (very thin)
-NEAR: wall_ratio=5.0, wall_distance=3
+Fixes vs v0.4.1:
+  FIX #6 — Race condition on _signals singleton:
+    _signals (ManipulationSignals) is a module-level mutable object read by
+    clear_for_entry() and written by analyze(). In asyncio, strategy.evaluate()
+    and Telegram message handlers can be interleaved on the same event loop.
+    analyze() runs in the candle callback; clear_for_entry() runs in the entry
+    logic, both potentially within the same event loop iteration.
+    Fix: _signals_lock = threading.Lock() guards all reads and writes.
+    analyze() holds the lock for the full mutation window.
+    clear_for_entry() copies the three relevant fields under lock and works
+    on the snapshot — no reference to _signals outside the lock.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
@@ -27,7 +29,6 @@ MOMENTUM_VOL_THRESHOLD = 0.5
 
 
 def inject_wall_params(wall_ratio: float, wall_distance_ticks: int) -> None:
-    """Called from main.inject_profile() to set per-symbol thresholds."""
     global WALL_RATIO, WALL_DISTANCE_TICKS
     WALL_RATIO          = wall_ratio
     WALL_DISTANCE_TICKS = wall_distance_ticks
@@ -45,7 +46,9 @@ class ManipulationSignals:
     suspicious:        bool = False
 
 
-_signals = ManipulationSignals()
+# FIX #6: lock protects all reads and writes of _signals
+_signals      = ManipulationSignals()
+_signals_lock = threading.Lock()
 
 
 class AntiManipulation:
@@ -58,20 +61,20 @@ class AntiManipulation:
         current_close: Optional[float] = None,
     ) -> ManipulationSignals:
         with state.lock:
-            bids = state.orderbook.top_bids(20)
-            asks = state.orderbook.top_asks(20)
+            bids  = state.orderbook.top_bids(20)
+            asks  = state.orderbook.top_asks(20)
             price = current_close or state.last_price
 
-        _signals.spoof_bid_wall    = False
-        _signals.spoof_ask_wall    = False
-        _signals.momentum_ignition = False
+        # Compute results outside lock to minimise contention
+        spoof_bid = False
+        spoof_ask = False
+        mom_ign   = False
 
-        # Spoof wall detection — uses per-symbol thresholds
         if bids:
             mean_bid = sum(s for _, s in bids) / len(bids)
             for idx, (_, size) in enumerate(bids):
                 if size > mean_bid * WALL_RATIO and idx >= WALL_DISTANCE_TICKS:
-                    _signals.spoof_bid_wall = True
+                    spoof_bid = True
                     logger.debug(
                         f"Spoof BID wall @ level {idx}: "
                         f"size={size:.2f} mean={mean_bid:.2f} "
@@ -83,7 +86,7 @@ class AntiManipulation:
             mean_ask = sum(s for _, s in asks) / len(asks)
             for idx, (_, size) in enumerate(asks):
                 if size > mean_ask * WALL_RATIO and idx >= WALL_DISTANCE_TICKS:
-                    _signals.spoof_ask_wall = True
+                    spoof_ask = True
                     logger.debug(
                         f"Spoof ASK wall @ level {idx}: "
                         f"size={size:.2f} mean={mean_ask:.2f} "
@@ -91,30 +94,37 @@ class AntiManipulation:
                     )
                     break
 
-        # Momentum ignition detection
         if self._prev_close > 0 and price > 0:
             move_pct = abs(price - self._prev_close) / self._prev_close
             if move_pct > MOMENTUM_IGNITION_PCT and vol_zscore < MOMENTUM_VOL_THRESHOLD:
-                _signals.momentum_ignition = True
+                mom_ign = True
                 logger.debug(
                     f"Momentum ignition: move={move_pct:.4%} vol_z={vol_zscore:.2f}"
                 )
 
-        _signals.suspicious = (
-            _signals.spoof_bid_wall
-            or _signals.spoof_ask_wall
-            or _signals.momentum_ignition
-        )
-
         self._prev_close = price
+
+        # FIX #6: single atomic write under lock
+        with _signals_lock:
+            _signals.spoof_bid_wall    = spoof_bid
+            _signals.spoof_ask_wall    = spoof_ask
+            _signals.momentum_ignition = mom_ign
+            _signals.suspicious        = spoof_bid or spoof_ask or mom_ign
+
         return _signals
 
     def clear_for_entry(self, side: str) -> bool:
-        if _signals.momentum_ignition:
+        """FIX #6: read a snapshot under lock — no TOCTOU with analyze()."""
+        with _signals_lock:
+            mom_ign   = _signals.momentum_ignition
+            spoof_bid = _signals.spoof_bid_wall
+            spoof_ask = _signals.spoof_ask_wall
+
+        if mom_ign:
             return False
-        if side == "long"  and _signals.spoof_bid_wall:
+        if side == "long"  and spoof_bid:
             return False
-        if side == "short" and _signals.spoof_ask_wall:
+        if side == "short" and spoof_ask:
             return False
         return True
 

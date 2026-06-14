@@ -1,21 +1,18 @@
-"""Limit order manager v0.5.0 — amend instead of cancel+replace.
+"""Limit order manager v0.5.1.
 
-Changes vs v0.4.1:
-- Uses trader.amend_order() (/v5/order/amend) instead of cancel+repost.
-  Amend: single REST call, preserves queue position, no re-queuing delay.
-  Cancel+repost: 2 REST calls, lose queue position, risk of gap fill.
-- FILL_TIMEOUT_S = 2s (unchanged, correct for 1m scalping)
-- POLL_INTERVAL_S = 0.25s (unchanged)
-- MAX_AMEND_ATTEMPTS = 3 before Market fallback
-- Logs exact fee saved vs Market on every successful Limit fill
-- Native SL/TP attached on entry order (stopLoss/takeProfit params)
-  so exchange enforces stops even if WS disconnects
+Fixes vs v0.5.0:
+  FIX #2 — _market_fallback missing SL/TP:
+    place_entry() was calling: return await self._market_fallback(side, qty, sym)
+    without forwarding stop_loss / take_profit. If Limit placement timed out
+    or was rejected, the Market fallback order had no native SL/TP attached on
+    exchange. If the bot went offline immediately after, the position was
+    unprotected. Now SL/TP are always forwarded.
 
-Fee impact on mainnet:
-  Limit (PostOnly) fill: 0.020% maker fee
-  Market fallback:       0.055% taker fee
-  -> Savings per avoided market order: 0.035% of notional
-  On $200 notional per trade x 10 trades/day = $0.14/day = $51/year
+  FIX #7 — tick_size cached, not fetched per-entry:
+    get_instrument_info() was called inside place_entry() every time the bot
+    entered a position. tick_size is static for the lifetime of the process.
+    Now cached in self._tick_size on first call (lazy init), saved as ~1 REST
+    call per entry. Reduces rate-limit budget consumption.
 """
 from __future__ import annotations
 
@@ -28,14 +25,26 @@ from .config import config
 from .state import state
 from .trader import trader
 
-FILL_TIMEOUT_S    = float(2)     # total wall-clock timeout before Market fallback
-POLL_INTERVAL_S   = 0.25         # fill poll interval
-MAX_AMEND_ATTEMPTS = 3           # amend-price cycles before Market fallback
-TICK_MOVE_THRESHOLD = 1          # ticks price must move to trigger amend
+FILL_TIMEOUT_S     = float(2)
+POLL_INTERVAL_S    = 0.25
+MAX_AMEND_ATTEMPTS = 3
+TICK_MOVE_THRESHOLD = 1
 
 
 class LimitOrderManager:
     """PostOnly Limit entry with amend-on-move and Market fallback."""
+
+    def __init__(self):
+        # FIX #7: cached tick_size — fetched once, reused forever
+        self._tick_size: float | None = None
+
+    async def _get_tick_size(self, sym: str) -> float:
+        """Return tick_size from cache; fetch once if not yet loaded."""
+        if self._tick_size is None:
+            info = await trader.get_instrument_info(sym)
+            self._tick_size = float(info.get("tickSize", 0.01))
+            logger.debug(f"[LOM] tick_size cached: {self._tick_size}")
+        return self._tick_size
 
     async def place_entry(
         self,
@@ -55,14 +64,16 @@ class LimitOrderManager:
         order_id    = None
 
         with state.lock:
-            best_bid   = state.orderbook.best_bid
-            best_ask   = state.orderbook.best_ask
-        info      = await trader.get_instrument_info(sym)
-        tick_size = info.get("tickSize", 0.01)
+            best_bid = state.orderbook.best_bid
+            best_ask = state.orderbook.best_ask
+
+        # FIX #7: use cached tick_size
+        tick_size = await self._get_tick_size(sym)
 
         if best_bid is None or best_ask is None:
             logger.warning("[LOM] OB not ready — Market fallback")
-            return await self._market_fallback(side, qty, sym)
+            # FIX #2: always forward SL/TP
+            return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
         limit_price = best_bid if side == "Buy" else best_ask
         limit_price = trader.round_price(limit_price, sym)
@@ -76,7 +87,8 @@ class LimitOrderManager:
         )
         if not resp or resp.get("retCode") != 0:
             logger.warning("[LOM] Initial Limit rejected — Market fallback")
-            return await self._market_fallback(side, qty, sym)
+            # FIX #2: always forward SL/TP
+            return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
         order_id = resp.get("result", {}).get("orderId", "")
         logger.info(
@@ -159,7 +171,8 @@ class LimitOrderManager:
         logger.warning(
             f"[LOM] Not filled in {FILL_TIMEOUT_S}s ({amend_count} amends) — Market fallback"
         )
-        return await self._market_fallback(side, qty, sym)
+        # FIX #2: always forward SL/TP to Market fallback
+        return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
     async def _market_fallback(
         self,
@@ -169,7 +182,7 @@ class LimitOrderManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
     ) -> tuple[bool, float, float]:
-        """Market fallback. Logs fee cost."""
+        """Market fallback with native SL/TP always attached."""
         with state.lock:
             price = state.last_price
         notional = qty * price if price > 0 else 0
@@ -177,6 +190,8 @@ class LimitOrderManager:
         logger.warning(
             f"[LOM] Market fallback: {side} {qty} {symbol} "
             f"taker_fee={fee['fee_usdt']:.4f} USDT (0.055%)"
+            + (f" SL={stop_loss}" if stop_loss else "")
+            + (f" TP={take_profit}" if take_profit else "")
         )
         resp = await trader.place_order(
             side=side, qty=qty,
