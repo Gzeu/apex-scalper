@@ -1,11 +1,12 @@
-"""Entrypoint v0.7.0.
+"""Entrypoint v0.7.1.
 
-New in v0.7.0:
-  - regime_filter + book_pressure imported (new modules)
-  - inject_profile() injects regime + bp thresholds from profile
-  - risk.calc_qty() receives order_size_usdt + leverage + regime_factor
-  - daily PnL reset on midnight UTC (asyncio task)
-  - Startup banner: regime ADX + book pressure status
+New in v0.7.1 vs v0.7.0:
+  - indicators.py upgraded: MACD(12,26,9) + StochRSI(14,3,3) + VWAP midnight reset
+  - strategy.py upgraded: MACD histogram + StochRSI as soft bonus signals (weight 0.04 each)
+  - inject_profile: injects TP3_PCT, TP1/2/3 fractions, MAX_PYRAMID_ADDS from profile
+  - telegram_ui.py upgraded: /regime command, full /signals, /setparam TP3+fractions
+  - .env.example: all 50+ parameters documented
+  - No structural changes to feed, trader, risk, regime_filter, book_pressure
 """
 from __future__ import annotations
 
@@ -75,13 +76,18 @@ def inject_profile(symbol: str) -> None:
     rm.MIN_ASK_DEPTH    = p["min_ask_depth"]
     rm.MAX_DAILY_LOSS   = p.get("daily_loss_limit_usdt", 50.0)
 
-    # Position manager params
+    # Position manager params — all TP/SL levels + scale-out fractions
     pm.TP1_PCT          = p["tp1_pct"]
     pm.TP2_PCT          = p["tp2_pct"]
+    pm.TP3_PCT          = p.get("tp3_pct",       0.0035)
     pm.SL_PCT           = p["sl_pct"]
     pm.TRAIL_PCT        = p["trail_pct"]
     pm.TRAIL_DELTA      = p["trail_delta"]
     pm.MAX_HOLD_CANDLES = p["max_hold_candles"]
+    pm.MAX_PYRAMID_ADDS = p.get("max_pyramid_adds", 1)
+    pm.TP1_FRACTION     = p.get("tp1_fraction",    0.25)
+    pm.TP2_FRACTION     = p.get("tp2_fraction",    0.25)
+    pm.TP3_FRACTION     = p.get("tp3_fraction",    0.50)
 
     # Regime filter thresholds
     rf.ADX_TRENDING_MIN = p.get("adx_trending_min", 25.0)
@@ -92,7 +98,7 @@ def inject_profile(symbol: str) -> None:
     rf.HURST_RANGE_MAX  = p.get("hurst_range_max",  0.45)
 
     # Book pressure threshold
-    bpm.BASE_THRESHOLD  = p.get("bp_base_threshold", 50_000.0)
+    bpm.BASE_THRESHOLD   = p.get("bp_base_threshold",   50_000.0)
     bpm.ABSORPTION_RATIO = p.get("bp_absorption_ratio", 3.0)
 
     # Anti-manipulation per-symbol thresholds
@@ -102,10 +108,15 @@ def inject_profile(symbol: str) -> None:
     )
 
     logger.info(
-        f"✅ Profile injected [{symbol}]: "
-        f"TP1={p['tp1_pct']:.4f} TP2={p['tp2_pct']:.4f} SL={p['sl_pct']:.4f} "
-        f"lev={p['leverage']}x threshold={p.get('entry_threshold', 0.65)} "
-        f"adx_min={p.get('adx_trending_min', 25)} bp_thr={p.get('bp_base_threshold', 50000):.0f}"
+        f"\u2705 Profile injected [{symbol}]: "
+        f"TP1={p['tp1_pct']:.4f}({p.get('tp1_fraction',0.25):.0%}) "
+        f"TP2={p['tp2_pct']:.4f}({p.get('tp2_fraction',0.25):.0%}) "
+        f"TP3={p.get('tp3_pct',0.0035):.4f}({p.get('tp3_fraction',0.50):.0%}) "
+        f"SL={p['sl_pct']:.4f} lev={p['leverage']}x "
+        f"threshold={p.get('entry_threshold', 0.65)} "
+        f"adx_min={p.get('adx_trending_min', 25)} "
+        f"bp_thr={p.get('bp_base_threshold', 50000):.0f} "
+        f"pyramid_max={p.get('max_pyramid_adds', 1)}"
     )
 
 
@@ -148,7 +159,7 @@ async def main() -> None:
     setup_logging()
     env_label = "TESTNET" if config.testnet else "⚠️  MAINNET"
     logger.info(
-        f"⚡ Apex Scalper v0.7.0 | {config.symbol} | "
+        f"⚡ Apex Scalper v0.7.1 | {config.symbol} | "
         f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
@@ -189,26 +200,39 @@ async def main() -> None:
     else:
         logger.warning("TELEGRAM_TOKEN not set — Telegram disabled")
 
-    # All background tasks
     asyncio.create_task(run_watchdog())
     asyncio.create_task(run_mtf_refresh_loop(config.symbol))
     asyncio.create_task(run_funding_refresh_loop(config.symbol))
     asyncio.create_task(run_daily_report_loop(config.symbol))
     asyncio.create_task(_midnight_reset_loop())
     logger.info(
-        "Background tasks: watchdog | MTF | funding | daily_report | midnight_reset ✅"
+        "Background tasks: watchdog | MTF | funding | daily_report | midnight_reset \u2705"
     )
 
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.7.0 active\n"
-        f"  Trigger: book pressure (delta thr={bp._threshold():.0f}USDT)\n"
-        f"  Regime:  {regime.label} (ADX warm-up in progress)\n"
-        f"  Kelly:   active after {20} trades"
+        f"state.running = True — strategy v0.7.1 active\n"
+        f"  Indicators:  EMA9/21/50 | RSI(14) | ATR(14) | BB(20,2) | VWAP | VolZ | "
+        f"MACD(12,26,9) | StochRSI(14,3,3) | BookPressure | OBImbalance\n"
+        f"  Trigger:     book pressure (delta thr={bp._threshold():.0f}USDT)\n"
+        f"  Regime:      {regime.label} (ADX warm-up in progress)\n"
+        f"  Scale-out:   TP1={pm_info()} | Kelly active after 20 trades"
     )
 
     await start_feed()
+
+
+def pm_info() -> str:
+    try:
+        import apex_scalper.position_manager as pm
+        return (
+            f"{pm.TP1_PCT:.4f}({pm.TP1_FRACTION:.0%}) "
+            f"TP2={pm.TP2_PCT:.4f}({pm.TP2_FRACTION:.0%}) "
+            f"TP3={pm.TP3_PCT:.4f}({pm.TP3_FRACTION:.0%})"
+        )
+    except Exception:
+        return "?"
 
 
 if __name__ == "__main__":

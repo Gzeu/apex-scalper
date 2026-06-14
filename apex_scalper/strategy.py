@@ -1,21 +1,20 @@
-"""Multi-signal scalping strategy v0.7.0.
+"""Multi-signal scalping strategy v0.7.1.
 
-Major upgrades vs v0.6.0:
-  - Book pressure replaces EMA cross as PRIMARY entry trigger
-    EMA cross demoted to confirmation filter (weight 0.10, was 0.23)
-    imbalance weight raised to 0.28 (was 0.18) to reflect new primary role
-    of order flow signals
-  - Regime filter integrated: RANGING blocks entries, VOLATILE halves size
-  - Dynamic spread gate: threshold scales with current ATR vs baseline ATR
-  - Kelly sizing: risk.calc_qty() now receives order_size_usdt + regime_factor
+Upgrades vs v0.7.0:
+  - MACD histogram and StochRSI(14,3,3) added as soft bonus signals
+    Both computed in indicators.py (no strategy.py overhead)
+    Weight: macd=0.04, stoch=0.04 (taken from book_pressure 0.28->0.24
+    and rsi 0.18->0.16; imbalance 0.16->0.14)
+  - All 10 indicators now contribute to score
+  - _calc_sl_tp reads TP3_PCT from position_manager (not env directly)
 
-Signal weights v0.7.0 (sum=1.0):
-  book_pressure=0.28, rsi=0.18, imbalance=0.16, trend=0.12,
-  ema_cross=0.10, volume=0.08, bb=0.04, vwap=0.04
+Signal weights v0.7.1 (sum=1.0):
+  book_pressure=0.24, rsi=0.16, imbalance=0.14, trend=0.12,
+  ema_cross=0.10, volume=0.08, macd=0.04, stoch=0.04, bb=0.04, vwap=0.04
 
-Entry trigger (changed):
-  v0.6.0: EMA fast/slow cross   (3-5 candle lag)
-  v0.7.0: bp.pressure_long/short() (1-5 tick lag) + EMA cross as filter
+Entry trigger:
+  Primary: bp.pressure_long/short() (1-5 tick lag, book flow)
+  Confirmation: 10-signal weighted score >= ENTRY_THRESHOLD
 """
 from __future__ import annotations
 
@@ -50,19 +49,20 @@ ATR_MIN_PCT      = float(os.getenv("ATR_MIN_PCT",     "0.0003"))
 ATR_MAX_PCT      = float(os.getenv("ATR_MAX_PCT",     "0.005"))
 ENTRY_THRESHOLD  = float(os.getenv("ENTRY_THRESHOLD", "0.65"))
 USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
-# Dynamic spread: base * (1 + ATR_SPREAD_MULT * atr_vs_baseline)
 BASE_SPREAD_BPS  = float(os.getenv("BASE_SPREAD_BPS",   "3.0"))
 ATR_SPREAD_MULT  = float(os.getenv("ATR_SPREAD_MULT",   "2.0"))
-ATR_BASELINE     = float(os.getenv("ATR_BASELINE",      "0.001"))  # 0.10% baseline ATR
+ATR_BASELINE     = float(os.getenv("ATR_BASELINE",      "0.001"))
 
-# Signal weights v0.7.0
+# Signal weights v0.7.1 (10 signals, sum=1.0)
 _W = {
-    "book_pressure": 0.28,   # NEW primary trigger
-    "rsi":           0.18,
-    "imbalance":     0.16,
+    "book_pressure": 0.24,   # primary trigger (reduced from 0.28 to accommodate MACD+Stoch)
+    "rsi":           0.16,   # reduced from 0.18
+    "imbalance":     0.14,   # reduced from 0.16
     "trend":         0.12,
-    "ema_cross":     0.10,   # demoted to filter
+    "ema_cross":     0.10,
     "volume":        0.08,
+    "macd":          0.04,   # NEW: MACD histogram direction
+    "stoch":         0.04,   # NEW: StochRSI momentum
     "bb":            0.04,
     "vwap":          0.04,
 }
@@ -75,24 +75,20 @@ def update_indicators(close: float, high: float, low: float, volume: float) -> N
     record_heartbeat()
     update_all(ind, close, high, low, volume)
     anti_manip.analyze(vol_zscore=ind.vol_zscore if ind.vol_ready else 0.0, current_close=close)
-    # Update regime every candle
     if ind.atr_ready:
         regime.update(close, ind.atr_value, high, low)
-    # Update book pressure vol_zscore for adaptive threshold
     if ind.vol_ready:
         bp.set_vol_zscore(ind.vol_zscore)
 
 
 def _calc_sl_tp(side: str, price: float) -> tuple[float, float]:
-    sl_pct  = float(os.getenv("SL_PCT",  "0.0008"))
-    tp2_pct = float(os.getenv("TP2_PCT", "0.0020"))
+    from .position_manager import SL_PCT, TP3_PCT
     if side in ("long", "Buy"):
-        return round(price * (1 - sl_pct), 8), round(price * (1 + tp2_pct), 8)
-    return round(price * (1 + sl_pct), 8), round(price * (1 - tp2_pct), 8)
+        return round(price * (1 - SL_PCT), 8), round(price * (1 + TP3_PCT), 8)
+    return round(price * (1 + SL_PCT), 8), round(price * (1 - TP3_PCT), 8)
 
 
 def _dynamic_spread_ok(spread_bps: float) -> bool:
-    """Dynamic spread gate: allow wider spread when ATR is high."""
     if not ind.atr_ready:
         return True
     atr_ratio = (ind.atr_value / max(1.0, ind.ema_trend)) / ATR_BASELINE
@@ -103,7 +99,7 @@ def _dynamic_spread_ok(spread_bps: float) -> bool:
 def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     score = 0.0
 
-    # 1. Book pressure — primary trigger (replaces EMA cross as dominant signal)
+    # 1. Book pressure — primary trigger
     if bp.pressure_long():
         score += _W["book_pressure"]
 
@@ -116,7 +112,7 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
             rsi_score *= max(pf, 0.0)
         score += rsi_score
 
-    # 3. Orderbook imbalance (level 2 confirmation)
+    # 3. Orderbook imbalance
     if ob.imbalance >= IMBALANCE_LONG:
         score += _W["imbalance"] * min(ob.imbalance / 0.3, 1.0)
 
@@ -124,7 +120,7 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if price > ind.ema_trend:
         score += _W["trend"]
 
-    # 5. EMA cross confirmation (filter role, not trigger)
+    # 5. EMA cross confirmation
     if ind.ema_fast > ind.ema_slow:
         score += _W["ema_cross"]
 
@@ -132,7 +128,15 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if ind.vol_ready and ind.vol_zscore >= VOL_ZSCORE_MIN:
         score += _W["volume"] * min(max(ind.vol_zscore / 2.0, 0), 1)
 
-    # 7. BB: price near lower band
+    # 7. MACD histogram: positive = bullish momentum
+    if ind.macd_ready and ind.macd_histogram > 0:
+        score += _W["macd"]
+
+    # 8. StochRSI: %K > %D = bullish momentum, K < 80 avoids overbought
+    if ind.stoch_ready and ind.stoch_k > ind.stoch_d and ind.stoch_k < 80:
+        score += _W["stoch"]
+
+    # 9. BB: price near lower band
     if ind.bb_ready and ind.bb_mid > ind.bb_lower:
         if price <= ind.bb_lower:
             score += _W["bb"]
@@ -140,7 +144,7 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
             bb_c = (ind.bb_mid - price) / (ind.bb_mid - ind.bb_lower)
             score += _W["bb"] * min(bb_c, 1.0)
 
-    # 8. VWAP
+    # 10. VWAP
     if ind.vwap > 0:
         if price > ind.vwap:
             score += _W["vwap"]
@@ -184,7 +188,15 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     if ind.vol_ready and ind.vol_zscore >= VOL_ZSCORE_MIN:
         score += _W["volume"] * min(max(ind.vol_zscore / 2.0, 0), 1)
 
-    # 7. BB: price near upper band
+    # 7. MACD histogram: negative = bearish momentum
+    if ind.macd_ready and ind.macd_histogram < 0:
+        score += _W["macd"]
+
+    # 8. StochRSI: %K < %D = bearish momentum, K > 20 avoids oversold
+    if ind.stoch_ready and ind.stoch_k < ind.stoch_d and ind.stoch_k > 20:
+        score += _W["stoch"]
+
+    # 9. BB: price near upper band
     if ind.bb_ready and ind.bb_upper > ind.bb_mid:
         if price >= ind.bb_upper:
             score += _W["bb"]
@@ -192,7 +204,7 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
             bb_c = (price - ind.bb_mid) / (ind.bb_upper - ind.bb_mid)
             score += _W["bb"] * min(bb_c, 1.0)
 
-    # 8. VWAP
+    # 10. VWAP
     if ind.vwap > 0:
         if price < ind.vwap:
             score += _W["vwap"]
@@ -279,7 +291,8 @@ class Strategy:
                 f"LONG bp score={score:.3f}/{ENTRY_THRESHOLD} | "
                 f"regime={regime.label}({regime.adx:.1f}) "
                 f"rsi={ind.rsi_value:.1f} imb={ob.imbalance:.3f} "
-                f"cum_delta={bp.cum_delta:+.0f} accel={bp.acceleration:+.0f}"
+                f"macd_hist={ind.macd_histogram:+.5f} stoch_k={ind.stoch_k:.1f} "
+                f"cum_delta={bp.cum_delta:+.0f}"
             )
             if score >= ENTRY_THRESHOLD:
                 qty = risk.calc_qty(
@@ -305,6 +318,7 @@ class Strategy:
                         f"🟡 *LONG* `{_sym()}` score=`{score:.3f}`\n"
                         f"`price={avg_price}` `qty={filled_qty}`\n"
                         f"`rsi={ind.rsi_value:.1f}` `regime={regime.label}`\n"
+                        f"`macd_h={ind.macd_histogram:+.5f}` `stoch_k={ind.stoch_k:.1f}`\n"
                         f"`delta={bp.cum_delta:+.0f}` `SL={sl}` `TP={tp}`"
                     )
 
@@ -318,7 +332,8 @@ class Strategy:
                 f"SHORT bp score={score:.3f}/{ENTRY_THRESHOLD} | "
                 f"regime={regime.label}({regime.adx:.1f}) "
                 f"rsi={ind.rsi_value:.1f} imb={ob.imbalance:.3f} "
-                f"cum_delta={bp.cum_delta:+.0f} accel={bp.acceleration:+.0f}"
+                f"macd_hist={ind.macd_histogram:+.5f} stoch_k={ind.stoch_k:.1f} "
+                f"cum_delta={bp.cum_delta:+.0f}"
             )
             if score >= ENTRY_THRESHOLD:
                 qty = risk.calc_qty(
@@ -344,6 +359,7 @@ class Strategy:
                         f"🟠 *SHORT* `{_sym()}` score=`{score:.3f}`\n"
                         f"`price={avg_price}` `qty={filled_qty}`\n"
                         f"`rsi={ind.rsi_value:.1f}` `regime={regime.label}`\n"
+                        f"`macd_h={ind.macd_histogram:+.5f}` `stoch_k={ind.stoch_k:.1f}`\n"
                         f"`delta={bp.cum_delta:+.0f}` `SL={sl}` `TP={tp}`"
                     )
 
