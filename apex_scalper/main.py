@@ -1,12 +1,10 @@
-"""Entrypoint v0.7.1.
+"""Entrypoint v0.7.7.
 
-New in v0.7.1 vs v0.7.0:
-  - indicators.py upgraded: MACD(12,26,9) + StochRSI(14,3,3) + VWAP midnight reset
-  - strategy.py upgraded: MACD histogram + StochRSI as soft bonus signals (weight 0.04 each)
-  - inject_profile: injects TP3_PCT, TP1/2/3 fractions, MAX_PYRAMID_ADDS from profile
-  - telegram_ui.py upgraded: /regime command, full /signals, /setparam TP3+fractions
-  - .env.example: all 50+ parameters documented
-  - No structural changes to feed, trader, risk, regime_filter, book_pressure
+New in v0.7.7 vs v0.7.1:
+  - pulse.py: loop 1 minut cu snapshot complet pe Telegram
+  - health.py: HTTP /health /metrics /metrics/prometheus (port 8080)
+  - analytics.py: breakdown per semnal/ora/streak in daily_report
+  - telegram_ui.py: /analytics /tp /funding /pulse on|off + fix /pause
 """
 from __future__ import annotations
 
@@ -28,6 +26,8 @@ from .daily_report import run_daily_report_loop
 from .anti_manipulation import inject_wall_params
 from .regime_filter import regime
 from .book_pressure import bp
+from .pulse import run_pulse_loop
+from .health import start_health_server
 
 
 def setup_logging() -> None:
@@ -46,7 +46,6 @@ def setup_logging() -> None:
 
 
 def inject_profile(symbol: str) -> None:
-    """Inject per-symbol optimal params into all strategy modules."""
     import apex_scalper.strategy         as sm
     import apex_scalper.risk             as rm
     import apex_scalper.position_manager as pm
@@ -55,7 +54,6 @@ def inject_profile(symbol: str) -> None:
 
     p = SYMBOL_PROFILES.get(symbol, SYMBOL_PROFILES["BTCUSDT"])
 
-    # Strategy signal params
     sm.RSI_LONG_MIN     = p["rsi_long_min"]
     sm.RSI_SHORT_MAX    = p["rsi_short_max"]
     sm.IMBALANCE_LONG   = p["imbalance_long"]
@@ -70,13 +68,11 @@ def inject_profile(symbol: str) -> None:
     sm.ATR_SPREAD_MULT  = p.get("atr_spread_mult", 2.0)
     sm.ATR_BASELINE     = p.get("atr_baseline",    0.001)
 
-    # Risk / Kelly params
     rm.MAX_SPREAD_BPS   = p["max_spread_bps"]
     rm.MIN_BID_DEPTH    = p["min_bid_depth"]
     rm.MIN_ASK_DEPTH    = p["min_ask_depth"]
     rm.MAX_DAILY_LOSS   = p.get("daily_loss_limit_usdt", 50.0)
 
-    # Position manager params — all TP/SL levels + scale-out fractions
     pm.TP1_PCT          = p["tp1_pct"]
     pm.TP2_PCT          = p["tp2_pct"]
     pm.TP3_PCT          = p.get("tp3_pct",       0.0035)
@@ -89,7 +85,6 @@ def inject_profile(symbol: str) -> None:
     pm.TP2_FRACTION     = p.get("tp2_fraction",    0.25)
     pm.TP3_FRACTION     = p.get("tp3_fraction",    0.50)
 
-    # Regime filter thresholds
     rf.ADX_TRENDING_MIN = p.get("adx_trending_min", 25.0)
     rf.ADX_RANGING_MAX  = p.get("adx_ranging_max",  20.0)
     rf.ATR_VOLATILE_PCT = p.get("atr_volatile_pct", 80.0)
@@ -97,18 +92,16 @@ def inject_profile(symbol: str) -> None:
     rf.HURST_TREND_MIN  = p.get("hurst_trend_min",  0.55)
     rf.HURST_RANGE_MAX  = p.get("hurst_range_max",  0.45)
 
-    # Book pressure threshold
     bpm.BASE_THRESHOLD   = p.get("bp_base_threshold",   50_000.0)
     bpm.ABSORPTION_RATIO = p.get("bp_absorption_ratio", 3.0)
 
-    # Anti-manipulation per-symbol thresholds
     inject_wall_params(
         wall_ratio=p.get("wall_ratio", 8.0),
         wall_distance_ticks=p.get("wall_distance_ticks", 5),
     )
 
     logger.info(
-        f"\u2705 Profile injected [{symbol}]: "
+        f"✅ Profile injected [{symbol}]: "
         f"TP1={p['tp1_pct']:.4f}({p.get('tp1_fraction',0.25):.0%}) "
         f"TP2={p['tp2_pct']:.4f}({p.get('tp2_fraction',0.25):.0%}) "
         f"TP3={p.get('tp3_pct',0.0035):.4f}({p.get('tp3_fraction',0.50):.0%}) "
@@ -121,7 +114,6 @@ def inject_profile(symbol: str) -> None:
 
 
 async def _midnight_reset_loop() -> None:
-    """Reset daily PnL counters at UTC midnight."""
     from datetime import datetime, timezone, timedelta
     while True:
         now    = datetime.now(timezone.utc)
@@ -159,7 +151,7 @@ async def main() -> None:
     setup_logging()
     env_label = "TESTNET" if config.testnet else "⚠️  MAINNET"
     logger.info(
-        f"⚡ Apex Scalper v0.7.1 | {config.symbol} | "
+        f"⚡ Apex Scalper v0.7.7 | {config.symbol} | "
         f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
@@ -185,6 +177,9 @@ async def main() -> None:
     else:
         logger.warning("MTF fetch failed — entries BLOCKED until first successful refresh.")
 
+    # Health server HTTP (port 8080) — background thread, non-blocking
+    start_health_server()
+
     loop   = asyncio.get_running_loop()
     tg_app = None
 
@@ -205,18 +200,18 @@ async def main() -> None:
     asyncio.create_task(run_funding_refresh_loop(config.symbol))
     asyncio.create_task(run_daily_report_loop(config.symbol))
     asyncio.create_task(_midnight_reset_loop())
+    asyncio.create_task(run_pulse_loop(config.symbol))
     logger.info(
-        "Background tasks: watchdog | MTF | funding | daily_report | midnight_reset \u2705"
+        "Background tasks: watchdog | MTF | funding | daily_report | "
+        "midnight_reset | pulse (1min) ✅"
     )
 
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.7.1 active\n"
-        f"  Indicators:  EMA9/21/50 | RSI(14) | ATR(14) | BB(20,2) | VWAP | VolZ | "
-        f"MACD(12,26,9) | StochRSI(14,3,3) | BookPressure | OBImbalance\n"
-        f"  Trigger:     book pressure (delta thr={bp._threshold():.0f}USDT)\n"
-        f"  Regime:      {regime.label} (ADX warm-up in progress)\n"
+        f"state.running = True — strategy v0.7.7 active\n"
+        f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
+        f"  Health:      http://localhost:8080/health\n"
         f"  Scale-out:   TP1={pm_info()} | Kelly active after 20 trades"
     )
 

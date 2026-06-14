@@ -1,19 +1,20 @@
-"""Telegram bot UI v0.7.2
+"""Telegram bot UI v0.7.7
 Commands:
   /start /stop /pause /resume /status /pnl /balance /close
   /setparam KEY VALUE   — live strategy tuning
   /metrics              — full performance report
   /watchdog             — WS health status
-  /signals              — full indicator snapshot (all v0.7.1 indicators)
+  /signals              — full indicator snapshot
   /regime               — market regime label + ADX + Hurst + size factor
+  /analytics            — breakdown trades by reason/score/streak
+  /tp                   — status TP1/2/3 hit, trail, hold candles
+  /funding              — funding rate + blocked directions
+  /pulse on|off         — toggle 1-minute pulse loop
 
 Changelog:
-  v0.7.2 — GAP #3 fix: /resume now calls risk.reset_consecutive_losses()
-             to clear MAX_CONSECUTIVE_LOSSES block. Without this, after 5
-             consecutive losses the bot is permanently blocked until restart.
-             /resume message updated to reflect this.
-  v0.7.1 — /signals shows all 10 indicators + bp.cum_delta + regime
-             /regime command added. /setparam extended to 26 params.
+  v0.7.7 — FIX: /pause apela cmd_resume (copy-paste bug) — acum corect.
+             NEW: /analytics, /tp, /funding, /pulse on|off
+  v0.7.2 — GAP #3 fix: /resume reseteaza consecutive_losses
 """
 from __future__ import annotations
 
@@ -58,27 +59,22 @@ async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """v0.7.7 FIX: apela cmd_resume in loc de cmd_pause."""
     state.paused = True
     await u.message.reply_text("⏸ *PAUSED* — no new entries", parse_mode="Markdown")
 
 
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """GAP #3 FIX v0.7.2: also resets consecutive loss counter.
-    Without this, MAX_CONSECUTIVE_LOSSES permanently blocks entries
-    after N losses with no recovery path except full restart.
-    """
     from .risk import risk
     state.paused    = False
     state.daily_pnl = 0.0
-    risk.reset_consecutive_losses()   # GAP #3 FIX
-    consec = getattr(risk, '_consecutive_losses', 0)
+    risk.reset_consecutive_losses()
     await u.message.reply_text(
         "▶️ *RESUMED*\n"
-        "`daily_pnl` reset to 0\n"
-        "`consecutive_losses` reset to 0",
+        "`daily_pnl` reset la 0\n"
+        "`consecutive_losses` reset la 0",
         parse_mode="Markdown",
     )
-    logger.info(f"[TG] /resume: paused=False, daily_pnl=0, consecutive_losses reset (was {consec})")
 
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -157,7 +153,6 @@ async def cmd_watchdog(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_signals(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Full indicator snapshot — all v0.7.1 indicators."""
     from .strategy import ind
     from .orderbook_analytics import ob_signals
     from .book_pressure import bp
@@ -171,7 +166,7 @@ async def cmd_signals(u: Update, c: ContextTypes.DEFAULT_TYPE):
              if ind.stoch_ready else "warming up")
 
     msg = (
-        f"🔮 *Signals Snapshot v0.7.2* `{config.symbol}`\n\n"
+        f"🔮 *Signals Snapshot* `{config.symbol}`\n\n"
         f"📈 *Trend*\n"
         f"EMA 9/21/50: `{ind.ema_fast:.2f}` / `{ind.ema_slow:.2f}` / `{ind.ema_trend:.2f}`\n"
         f"Regime: `{regime.label}` | ADX: `{regime.adx}` | sz×: `{regime.size_factor():.2f}`\n\n"
@@ -195,7 +190,6 @@ async def cmd_signals(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_regime(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Current market regime with all underlying metrics."""
     from .regime_filter import regime
     from .strategy import ind
     label  = regime.label
@@ -221,6 +215,90 @@ async def cmd_regime(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def cmd_analytics(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Breakdown trades by reason, score bucket, worst streak."""
+    from .analytics import analytics
+    msg = analytics.telegram_breakdown(config.symbol, days=7)
+    if not msg:
+        msg = "ℹ️ Nu sunt suficiente date (minim 1 trade inchis)."
+    await u.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_tp(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Status detaliat al pozitiei: TP1/2/3 hit, trail, hold candles."""
+    from .position_manager import (
+        position_manager as pm, TP1_PCT, TP2_PCT, TP3_PCT, SL_PCT, MAX_HOLD_CANDLES
+    )
+    with state.lock:
+        pos   = state.open_position
+        price = state.last_price
+        qty   = state.open_qty
+
+    if not pos or pm._entry_price == 0:
+        await u.message.reply_text("▫️ Nicio pozitie deschisa.", parse_mode="Markdown")
+        return
+
+    entry   = pm._entry_price
+    pnl_pct = pm._unrealised_pnl_pct(price)
+    pnl_u   = round(pnl_pct * entry * qty, 4)
+    pnl_i   = "⬆️" if pnl_pct >= 0 else "⬇️"
+    tp1_p   = round(entry * (1 + TP1_PCT if pos == "long" else 1 - TP1_PCT), 2)
+    tp2_p   = round(entry * (1 + TP2_PCT if pos == "long" else 1 - TP2_PCT), 2)
+    tp3_p   = round(entry * (1 + TP3_PCT if pos == "long" else 1 - TP3_PCT), 2)
+    sl_p    = round(entry * (1 - SL_PCT  if pos == "long" else 1 + SL_PCT),  2)
+
+    msg = (
+        f"{'\U0001f7e2' if pos == 'long' else '\U0001f534'} *Pozitie {pos.upper()}*\n"
+        f"Entry: `{entry}` | Acum: `{price}` {pnl_i} `{pnl_pct*100:+.4f}%` (`{pnl_u:+.4f}` USDT)\n"
+        f"Qty: `{qty}` | Hold: `{pm._hold_candles}/{MAX_HOLD_CANDLES}` candle(s)\n\n"
+        f"*Scale-out:*\n"
+        f"  TP1 {'\u2705 HIT' if pm._tp1_hit else f'`{tp1_p}` (Δ`{round(tp1_p - price if pos == chr(108)+chr(111)+chr(110)+chr(103) else price - tp1_p, 2)}`)'} \n"
+        f"  TP2 {'\u2705 HIT' if pm._tp2_hit else f'`{tp2_p}`'} \n"
+        f"  TP3 {'\u2705 HIT' if pm._tp3_hit else f'`{tp3_p}`'}\n"
+        f"  SL: `{sl_p}`\n"
+        f"  Trail: {'\U0001f534 ACTIV' if pm._trail_active else 'inactiv'} "
+        f"| Pyramid adds: `{pm._pyramid_adds}`"
+    )
+    await u.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_funding(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Funding rate curent + directii blocate."""
+    from .funding_rate import funding
+    import time
+    can_l = funding.can_enter_long()
+    can_s = funding.can_enter_short()
+    near  = funding._near_funding()
+    now_ms = int(time.time() * 1000)
+    time_to_next = max(0, (funding._next_funding_ms - now_ms) // 1000) if funding._next_funding_ms else -1
+    ttf_str = f"`{time_to_next // 3600}h {(time_to_next % 3600) // 60}m`" if time_to_next >= 0 else "`necunoscut`"
+
+    msg = (
+        f"💸 *Funding Rate* `{config.symbol}`\n"
+        f"Rata: `{funding.rate_pct}` (`{funding.rate:.8f}`)\n"
+        f"LONG: {'\u2705 permis' if can_l else '\u274c blocat'}\n"
+        f"SHORT: {'\u2705 permis' if can_s else '\u274c blocat'}\n"
+        f"Aproape de plata: `{'DA \u26a0\ufe0f' if near else 'NU'}`\n"
+        f"Urmatoarea plata in: {ttf_str}"
+    )
+    await u.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_pulse(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Toggle pulse loop on/off."""
+    from .pulse import set_pulse_active, is_pulse_active
+    args = c.args
+    if args and args[0].lower() == "off":
+        set_pulse_active(False)
+        await u.message.reply_text("⏸ *Pulse OPRIT* — nu mai primesti rapoarte la 1 min.", parse_mode="Markdown")
+    elif args and args[0].lower() == "on":
+        set_pulse_active(True)
+        await u.message.reply_text("✅ *Pulse PORNIT* — raport la fiecare 1 min.", parse_mode="Markdown")
+    else:
+        status = "activ" if is_pulse_active() else "oprit"
+        await u.message.reply_text(f"⚡ Pulse e `{status}`. Foloseste `/pulse on` sau `/pulse off`.", parse_mode="Markdown")
+
+
 async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
     import apex_scalper.strategy as sm
     import apex_scalper.risk as rm
@@ -231,16 +309,13 @@ async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     key, val = args[0].upper(), args[1]
     targets = {
-        # Strategy
         "RSI_LONG_MIN":     (sm, float), "RSI_SHORT_MAX":    (sm, float),
         "RSI_OB_LIMIT":     (sm, float), "RSI_OS_LIMIT":     (sm, float),
         "IMBALANCE_LONG":   (sm, float), "IMBALANCE_SHORT":  (sm, float),
         "VOL_ZSCORE_MIN":   (sm, float), "ATR_MIN_PCT":      (sm, float),
         "ATR_MAX_PCT":      (sm, float), "ENTRY_THRESHOLD":  (sm, float),
-        # Risk
         "MAX_SPREAD_BPS":   (rm, float), "MIN_BID_DEPTH":    (rm, float),
         "MIN_ASK_DEPTH":    (rm, float), "KELLY_FRACTION":   (rm, float),
-        # Position manager
         "TP1_PCT":          (pm, float), "TP2_PCT":          (pm, float),
         "TP3_PCT":          (pm, float),
         "TP1_FRACTION":     (pm, float), "TP2_FRACTION":     (pm, float),
@@ -264,19 +339,23 @@ async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
 def build_app():
     app = ApplicationBuilder().token(config.telegram_token).build()
     for name, fn in [
-        ("start",    cmd_start),
-        ("stop",     cmd_stop),
-        ("pause",    cmd_resume),
-        ("resume",   cmd_resume),
-        ("status",   cmd_status),
-        ("pnl",      cmd_pnl),
-        ("balance",  cmd_balance),
-        ("close",    cmd_close),
-        ("metrics",  cmd_metrics),
-        ("watchdog", cmd_watchdog),
-        ("signals",  cmd_signals),
-        ("regime",   cmd_regime),
-        ("setparam", cmd_setparam),
+        ("start",     cmd_start),
+        ("stop",      cmd_stop),
+        ("pause",     cmd_pause),     # v0.7.7 FIX: era cmd_resume
+        ("resume",    cmd_resume),
+        ("status",    cmd_status),
+        ("pnl",       cmd_pnl),
+        ("balance",   cmd_balance),
+        ("close",     cmd_close),
+        ("metrics",   cmd_metrics),
+        ("watchdog",  cmd_watchdog),
+        ("signals",   cmd_signals),
+        ("regime",    cmd_regime),
+        ("setparam",  cmd_setparam),
+        ("analytics", cmd_analytics),
+        ("tp",        cmd_tp),
+        ("funding",   cmd_funding),
+        ("pulse",     cmd_pulse),
     ]:
         app.add_handler(CommandHandler(name, fn))
     return app
