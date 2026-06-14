@@ -1,91 +1,69 @@
-"""Daily report v0.6.1 — scheduled Telegram summary at 23:59 UTC.
+"""Daily report v0.7.5 — signal breakdown appended to Telegram summary.
 
-Aliases added (v0.6.1):
-  run_daily_report_loop(symbol) — used by main.py (wraps schedule_daily_report)
+Changelog:
+  v0.7.5 — analytics.telegram_breakdown() appended to nightly report.
+             Answers: which reason/score/hour drove today's losses?
+  v0.7.0 — initial daily summary at 23:59 UTC
 """
 from __future__ import annotations
 
 import asyncio
-import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from loguru import logger
 
-from .performance import perf
-from .risk import risk
 
-
-def _compute_daily_sharpe(trades: list) -> float:
-    if len(trades) < 2:
-        return 0.0
-    returns = [t.get("pnl_pct", 0) for t in trades]
-    mu  = sum(returns) / len(returns)
-    std = math.sqrt(sum((r - mu) ** 2 for r in returns) / len(returns))
-    return round((mu / std) * math.sqrt(252 * 1440) if std > 0 else 0.0, 3)
-
-
-async def send_daily_report() -> None:
+async def send_daily_report(symbol: str) -> None:
+    """Build and send the nightly performance summary + signal breakdown."""
     try:
-        from .telegram_ui import send_message
         from .persistence import db
+        from .performance import perf
+        from .risk import risk
+        from .analytics import analytics
+        from .telegram_ui import send_message
         from .config import config
 
-        today = datetime.now(timezone.utc).date()
-        today_start_ts = int(
-            datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp() * 1000
+        pnl, total, wins = db.load_daily_pnl(symbol)
+        win_rate = (wins / total * 100) if total > 0 else 0.0
+        losses   = total - wins
+
+        daily_summary = db.daily_summary(symbol, days=7)
+        week_pnl = sum(d["pnl"] for d in daily_summary)
+
+        msg = (
+            f"\U0001f4c5 *Daily Report — {symbol}*\n"
+            f"`{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+            f"*Today*\n"
+            f"  PnL: `{pnl:+.4f} USDT`\n"
+            f"  Trades: `{total}` | Wins: `{wins}` | Losses: `{losses}`\n"
+            f"  Win rate: `{win_rate:.1f}%`\n\n"
+            f"*7-Day*\n"
+            f"  Total PnL: `{week_pnl:+.4f} USDT`\n"
+            f"  Sharpe: `{perf.sharpe:.3f}`\n"
+            f"  Max DD: `{perf.max_drawdown:.4f}`\n"
+            f"  Profit Factor: `{perf.profit_factor:.3f}`\n"
         )
-        trades = db.get_trades_since(today_start_ts)
-        n = len(trades)
 
-        if n == 0:
-            await send_message(f"📊 *Daily Report* — {today}\nNo trades today.")
-            return
+        # v0.7.5: append signal breakdown
+        breakdown = analytics.telegram_breakdown(symbol, days=1)
+        if breakdown:
+            msg += breakdown
 
-        wins      = sum(1 for t in trades if t.get("pnl_usdt", 0) > 0)
-        losses    = n - wins
-        gross_pnl = sum(t.get("pnl_usdt", 0) for t in trades)
-        est_fees  = sum(t.get("entry", 0) * t.get("qty", 0) * 0.00040 for t in trades)
-        net_pnl   = gross_pnl - est_fees
-        winrate   = round(wins / n * 100, 1)
-        daily_sharpe = _compute_daily_sharpe(trades)
-
-        try:
-            daily_loss  = risk._daily_loss
-            daily_limit = risk._daily_limit
-        except AttributeError:
-            daily_loss, daily_limit = 0, float("inf")
-
-        dd_pct  = abs(daily_loss / daily_limit * 100) if daily_limit > 0 else 0
-        dd_warn = " ⚠️" if dd_pct >= 80 else ""
-
-        await send_message(
-            f"📊 *Daily Report* — {today} UTC\n"
-            f"\n"
-            f"Trades: `{n}` (✅{wins} / ❌{losses}) WR=`{winrate}%`\n"
-            f"Gross PnL:  `{gross_pnl:+.4f} USDT`\n"
-            f"Fees est.:  `-{est_fees:.4f} USDT`\n"
-            f"Net PnL:    `{net_pnl:+.4f} USDT`\n"
-            f"Daily Sharpe: `{daily_sharpe}`\n"
-            f"DD used: `{dd_pct:.1f}%` of limit{dd_warn}\n"
-            f"\n"
-            f"Symbol: `{config.symbol}` | Leverage: `{config.leverage}x`"
-        )
-        logger.info(f"Daily report sent: {n} trades net={net_pnl:.4f} USDT")
+        await send_message(msg)
+        logger.info(f"[daily_report] sent for {symbol}")
 
     except Exception as e:
-        logger.error(f"daily_report error: {e}")
+        logger.error(f"[daily_report] failed: {e}")
 
 
-async def schedule_daily_report() -> None:
-    logger.info("Daily report scheduler started (fires at 23:59 UTC)")
+async def schedule_daily_report(symbol: str) -> None:
+    """Run forever, sending report at 23:59:05 UTC each day."""
     while True:
-        now    = datetime.now(timezone.utc)
-        target = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        now = datetime.now(timezone.utc)
+        # Next 23:59:05 UTC
+        target = now.replace(hour=23, minute=59, second=5, microsecond=0)
         if now >= target:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        await send_daily_report()
-
-
-# Alias expected by main.py  — symbol arg accepted but not used (global config)
-async def run_daily_report_loop(symbol: str = "") -> None:
-    await schedule_daily_report()
+            target = target.replace(day=target.day + 1)
+        wait_s = (target - now).total_seconds()
+        logger.debug(f"[daily_report] next report in {wait_s/3600:.2f}h")
+        await asyncio.sleep(wait_s)
+        await send_daily_report(symbol)
