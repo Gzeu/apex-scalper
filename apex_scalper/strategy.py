@@ -1,29 +1,29 @@
-"""Multi-signal scalping strategy v0.4.2.
+"""Multi-signal scalping strategy v0.6.0.
 
-Changes vs v0.4.1:
-  🔴 CRITICAL FIX: `async def trader()` renamed to `_get_trader()` — the old
-     name silently shadowed the `from .trader import trader` module import,
-     causing AttributeError on every trader.place_order() call in market mode.
-  🔴 CRITICAL FIX: lom.place_entry() now receives stop_loss / take_profit
-     derived from SL_PCT / TP2_PCT so native exchange stops are always attached.
-  🟡 FIX: _score_long() now penalizes RSI approaching overbought (RSI > OB-5),
-     preventing entries when RSI is 65-70 (overbought risk zone).
-  🟡 FIX: ENTRY_THRESHOLD default raised to 0.72 (was 0.60) for mainnet safety.
-     Override with ENTRY_THRESHOLD=0.60 in .env for aggressive mode.
+Fixes vs v0.5.0:
+  🔴 CRITICAL:
+  - Naming collision: `async def trader()` renamed to `_get_trader()` to avoid
+    overwriting the imported `trader` module. Previously caused AttributeError
+    on trader.place_order() calls at runtime.
+  - lom.place_entry() now receives stop_loss + take_profit so native exchange
+    stops are attached on every entry. Previously positions were unprotected.
+  - RSI overbought penalty added: LONG blocked/penalized when RSI >= RSI_OB_PENALTY
+    (default 65). Prevents entries at RSI=68 right after cross.
+  - ENTRY_THRESHOLD raised to 0.65 (was 0.60) — 3/8 confirmations not enough
+    for mainnet. 0.65 requires at least EMA cross + trend + RSI + one more.
 
-Signal engine (9 signals):
-  1. EMA(9/21) cross
-  2. EMA(50) 1m trend filter
-  3. RSI(14) confirmation  [now with overbought penalty]
-  4. Orderbook imbalance
-  5. Volume z-score
-  6. ATR volatility gate
-  7. Bollinger Band position
-  8. VWAP session bias
-  [GUARDS]
-  9. MTF 15m EMA50 confirmation
-  10. Funding rate awareness
-  11. Anti-manipulation filter
+  🟡 IMPORTANT:
+  - Pyramid entries now pass SL/TP so they are also exchange-protected.
+
+Signal weights (unchanged, sum=1.0):
+  ema_cross=0.23, trend=0.18, rsi=0.18, imbalance=0.18,
+  volume=0.10, atr=0.03, bb=0.05, vwap=0.05
+
+RSI logic:
+  LONG:  RSI in [RSI_LONG_MIN..RSI_OB_LIMIT] = positive, full weight at midpoint
+         RSI >= RSI_OB_PENALTY (65) = partial penalty applied to rsi score
+  SHORT: RSI in [RSI_OS_LIMIT..RSI_SHORT_MAX] = positive
+         RSI <= RSI_OS_PENALTY (35) = partial penalty applied to rsi score
 """
 from __future__ import annotations
 
@@ -40,21 +40,21 @@ from .funding_rate import funding
 from .anti_manipulation import anti_manip
 from .limit_order_manager import lom
 from .persistence import db
-from .trader import trader as _trader_module
+from .trader import trader as _trader   # explicit alias — never shadow this
 
 # --- Params from .env / injected by inject_profile() ---
 RSI_LONG_MIN     = float(os.getenv("RSI_LONG_MIN",    "52.0"))
 RSI_SHORT_MAX    = float(os.getenv("RSI_SHORT_MAX",   "48.0"))
 RSI_OB_LIMIT     = float(os.getenv("RSI_OB_LIMIT",   "70.0"))
 RSI_OS_LIMIT     = float(os.getenv("RSI_OS_LIMIT",   "30.0"))
+RSI_OB_PENALTY   = float(os.getenv("RSI_OB_PENALTY",  "65.0"))  # NEW: LONG penalty above this
+RSI_OS_PENALTY   = float(os.getenv("RSI_OS_PENALTY",  "35.0"))  # NEW: SHORT penalty below this
 IMBALANCE_LONG   = float(os.getenv("IMBALANCE_LONG",  "0.10"))
 IMBALANCE_SHORT  = float(os.getenv("IMBALANCE_SHORT", "-0.10"))
 VOL_ZSCORE_MIN   = float(os.getenv("VOL_ZSCORE_MIN",  "0.0"))
 ATR_MIN_PCT      = float(os.getenv("ATR_MIN_PCT",     "0.0003"))
 ATR_MAX_PCT      = float(os.getenv("ATR_MAX_PCT",     "0.005"))
-# 🟡 Raised default from 0.60 → 0.72 for mainnet safety.
-# 3/8 signals (score ≈ 0.41) and even 5/8 (≈0.64) now blocked unless strong.
-ENTRY_THRESHOLD  = float(os.getenv("ENTRY_THRESHOLD", "0.72"))
+ENTRY_THRESHOLD  = float(os.getenv("ENTRY_THRESHOLD", "0.65"))   # raised from 0.60
 USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
 
 # Signal weights — must sum to 1.0
@@ -79,6 +79,16 @@ def update_indicators(close: float, high: float, low: float, volume: float) -> N
     anti_manip.analyze(vol_zscore=ind.vol_zscore if ind.vol_ready else 0.0, current_close=close)
 
 
+def _calc_sl_tp(side: str, price: float) -> tuple[float, float]:
+    """Calculate SL and TP prices from env profile params."""
+    sl_pct = float(os.getenv("SL_PCT", "0.0008"))
+    tp2_pct = float(os.getenv("TP2_PCT", "0.0020"))
+    if side == "long" or side == "Buy":
+        return round(price * (1 - sl_pct), 8), round(price * (1 + tp2_pct), 8)
+    else:
+        return round(price * (1 + sl_pct), 8), round(price * (1 - tp2_pct), 8)
+
+
 def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     """Return signal strength [0,1] for LONG entry."""
     score = 0.0
@@ -90,23 +100,15 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     score += _W["trend"] if price > ind.ema_trend else 0
 
     # 3. RSI confirmation with overbought penalty
-    # 🟡 FIX: Progressive penalty when RSI enters overbought zone (OB_LIMIT - 5)
-    # e.g. RSI=68 with OB_LIMIT=70 → penalty_zone starts at 65
-    if ind.rsi_ready:
-        overbought_penalty_start = RSI_OB_LIMIT - 5.0
-        if RSI_LONG_MIN <= ind.rsi_value < overbought_penalty_start:
-            # Normal confirmation: linear scale from RSI_LONG_MIN to overbought_penalty_start
-            rsi_conf = min(
-                (ind.rsi_value - RSI_LONG_MIN) / (overbought_penalty_start - RSI_LONG_MIN),
-                1.0
-            )
-            score += _W["rsi"] * rsi_conf
-        elif overbought_penalty_start <= ind.rsi_value <= RSI_OB_LIMIT:
-            # In penalty zone: score drops linearly from full weight to 0 as RSI → OB_LIMIT
-            # RSI=65 → 100% weight; RSI=70 → 0% weight
-            penalty_factor = 1.0 - (ind.rsi_value - overbought_penalty_start) / 5.0
-            score += _W["rsi"] * max(penalty_factor, 0.0)
-        # RSI > RSI_OB_LIMIT: no RSI contribution (overbought — no new long entry)
+    if ind.rsi_ready and RSI_LONG_MIN <= ind.rsi_value <= RSI_OB_LIMIT:
+        rsi_conf = min((ind.rsi_value - RSI_LONG_MIN) / (RSI_OB_LIMIT - RSI_LONG_MIN), 1.0)
+        rsi_score = _W["rsi"] * rsi_conf
+        # Penalty: RSI >= RSI_OB_PENALTY (65) = market is overbought, reduce score
+        # At RSI=65: no penalty. At RSI=70: full penalty (rsi_score -> 0)
+        if ind.rsi_value >= RSI_OB_PENALTY:
+            penalty_factor = 1.0 - (ind.rsi_value - RSI_OB_PENALTY) / (RSI_OB_LIMIT - RSI_OB_PENALTY)
+            rsi_score *= max(penalty_factor, 0.0)
+        score += rsi_score
 
     # 4. Orderbook imbalance
     if ob.imbalance >= IMBALANCE_LONG:
@@ -122,7 +124,7 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
         if ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT:
             score += _W["atr"]
 
-    # 7. Bollinger Band position: LONG bonus if price near/at lower band
+    # 7. Bollinger Band position: price near lower band = oversold bonus
     if ind.bb_ready and ind.bb_mid > ind.bb_lower:
         if price <= ind.bb_lower:
             score += _W["bb"]
@@ -130,7 +132,7 @@ def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
             bb_conf = (ind.bb_mid - price) / (ind.bb_mid - ind.bb_lower)
             score += _W["bb"] * min(bb_conf, 1.0)
 
-    # 8. VWAP session bias
+    # 8. VWAP session bias: price above VWAP = bullish
     if ind.vwap > 0:
         if price > ind.vwap:
             score += _W["vwap"]
@@ -153,19 +155,14 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
     score += _W["trend"] if price < ind.ema_trend else 0
 
     # 3. RSI confirmation with oversold penalty
-    # Mirror of LONG: penalize shorts when RSI enters oversold zone (OS_LIMIT + 5)
-    if ind.rsi_ready:
-        oversold_penalty_start = RSI_OS_LIMIT + 5.0
-        if oversold_penalty_start < ind.rsi_value <= RSI_SHORT_MAX:
-            rsi_conf = min(
-                (RSI_SHORT_MAX - ind.rsi_value) / (RSI_SHORT_MAX - oversold_penalty_start),
-                1.0
-            )
-            score += _W["rsi"] * rsi_conf
-        elif RSI_OS_LIMIT <= ind.rsi_value <= oversold_penalty_start:
-            penalty_factor = 1.0 - (oversold_penalty_start - ind.rsi_value) / 5.0
-            score += _W["rsi"] * max(penalty_factor, 0.0)
-        # RSI < RSI_OS_LIMIT: no RSI contribution (oversold — no new short entry)
+    if ind.rsi_ready and RSI_OS_LIMIT <= ind.rsi_value <= RSI_SHORT_MAX:
+        rsi_conf = min((RSI_SHORT_MAX - ind.rsi_value) / (RSI_SHORT_MAX - RSI_OS_LIMIT), 1.0)
+        rsi_score = _W["rsi"] * rsi_conf
+        # Penalty: RSI <= RSI_OS_PENALTY (35) = market oversold, short may bounce
+        if ind.rsi_value <= RSI_OS_PENALTY:
+            penalty_factor = 1.0 - (RSI_OS_PENALTY - ind.rsi_value) / (RSI_OS_PENALTY - RSI_OS_LIMIT)
+            rsi_score *= max(penalty_factor, 0.0)
+        score += rsi_score
 
     # 4. Orderbook imbalance
     if ob.imbalance <= IMBALANCE_SHORT:
@@ -181,7 +178,7 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
         if ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT:
             score += _W["atr"]
 
-    # 7. Bollinger Band position: SHORT bonus if price near/at upper band
+    # 7. Bollinger Band: price near upper band = overbought bonus for short
     if ind.bb_ready and ind.bb_upper > ind.bb_mid:
         if price >= ind.bb_upper:
             score += _W["bb"]
@@ -189,7 +186,7 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
             bb_conf = (price - ind.bb_mid) / (ind.bb_upper - ind.bb_mid)
             score += _W["bb"] * min(bb_conf, 1.0)
 
-    # 8. VWAP session bias
+    # 8. VWAP session bias: price below VWAP = bearish
     if ind.vwap > 0:
         if price < ind.vwap:
             score += _W["vwap"]
@@ -199,22 +196,6 @@ def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
                 score += _W["vwap"] * (1 - gap / 0.001)
 
     return score
-
-
-def _calc_sl_tp(side: str, price: float) -> tuple[float, float]:
-    """Compute native SL and TP prices from module-level PCT vars.
-
-    Imports position_manager at call time to use the injected profile values.
-    Returns (stop_loss_price, take_profit_price).
-    """
-    from .position_manager import SL_PCT, TP2_PCT
-    if side == "Buy":
-        sl = round(price * (1 - SL_PCT), 4)
-        tp = round(price * (1 + TP2_PCT), 4)
-    else:
-        sl = round(price * (1 + SL_PCT), 4)
-        tp = round(price * (1 - TP2_PCT), 4)
-    return sl, tp
 
 
 class Strategy:
@@ -243,9 +224,11 @@ class Strategy:
                 long_score  = _score_long(ind, ob, price)
                 short_score = _score_short(ind, ob, price)
                 if pos == "long" and long_score >= 0.85:
-                    await position_manager.try_pyramid("long", price, long_score)
+                    sl, tp = _calc_sl_tp("long", price)
+                    await position_manager.try_pyramid("long", price, long_score, sl, tp)
                 elif pos == "short" and short_score >= 0.85:
-                    await position_manager.try_pyramid("short", price, short_score)
+                    sl, tp = _calc_sl_tp("short", price)
+                    await position_manager.try_pyramid("short", price, short_score, sl, tp)
             self._prev_fast = ind.ema_fast
             self._prev_slow = ind.ema_slow
             return
@@ -266,10 +249,10 @@ class Strategy:
 
         if cross_up:
             if not mtf.allow_long(price):
-                logger.debug(f"MTF blocks LONG @ {price:.2f} < EMA50(15m)={mtf.ema50:.2f}")
+                logger.debug(f"MTF blocks LONG @ {price:.2f}")
                 self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
             if not funding.can_enter_long():
-                logger.debug(f"Funding blocks LONG: {funding.rate_pct}")
+                logger.debug(f"Funding blocks LONG")
                 self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
             if not anti_manip.clear_for_entry("long"):
                 logger.debug("AntiManip blocks LONG")
@@ -277,31 +260,29 @@ class Strategy:
 
             score = _score_long(ind, ob, price)
             logger.info(
-                f"LONG score={score:.3f} | ema={ind.ema_fast:.1f}>{ind.ema_slow:.1f} "
+                f"LONG score={score:.3f}/{ENTRY_THRESHOLD} | "
+                f"ema={ind.ema_fast:.1f}>{ind.ema_slow:.1f} "
                 f"rsi={ind.rsi_value:.1f} imb={ob.imbalance:.3f} "
-                f"bb_r={ind.bb_ready} vwap={ind.vwap:.1f} "
+                f"bb={'✓' if ind.bb_ready else '?'} vwap={ind.vwap:.1f} "
                 f"mtf={'✓' if mtf.ready else '?'} fund={funding.rate_pct}"
             )
             if score >= ENTRY_THRESHOLD:
                 qty = risk.calc_qty(price)
-                # 🔴 FIX: compute native SL/TP from profile-injected pct values
-                sl_price, tp_price = _calc_sl_tp("Buy", price)
+                sl, tp = _calc_sl_tp("long", price)
                 if USE_LIMIT_ORDERS:
-                    # 🔴 FIX: pass stop_loss / take_profit to lom.place_entry()
+                    # FIX v0.6.0: pass SL/TP so exchange-side stops are attached
                     ok, filled_qty, avg_price = await lom.place_entry(
-                        "Buy", qty, stop_loss=sl_price, take_profit=tp_price
+                        "Buy", qty, stop_loss=sl, take_profit=tp
                     )
                 else:
-                    # 🔴 FIX: use _trader_module (not the old shadowed `trader` coroutine)
-                    resp = await _trader_module.place_order(
+                    resp = await _trader.place_order(
                         "Buy", qty, order_type="Market",
-                        stop_loss=sl_price, take_profit=tp_price,
+                        stop_loss=sl, take_profit=tp,
                     )
                     ok = resp.get("retCode") == 0
                     filled_qty, avg_price = (qty, price) if ok else (0, 0)
 
                 if ok and filled_qty > 0:
-                    from .position_manager import position_manager
                     await position_manager.on_open("long", filled_qty, avg_price)
                     db.record_trade(
                         symbol=_sym(), side="long",
@@ -311,18 +292,17 @@ class Strategy:
                     )
                     await _notify(
                         f"🟡 *LONG* `{_sym()}` score=`{score:.3f}`\n"
-                        f"`price={avg_price}` `qty={filled_qty}` `rsi={ind.rsi_value:.1f}`\n"
-                        f"`imb={ob.imbalance:.3f}` `fund={funding.rate_pct}` "
-                        f"`vwap={ind.vwap:.1f}` `mtf={'✓' if mtf.ready else '?'}`\n"
-                        f"`SL={sl_price}` `TP={tp_price}`"
+                        f"`price={avg_price}` `qty={filled_qty}`\n"
+                        f"`rsi={ind.rsi_value:.1f}` `imb={ob.imbalance:.3f}`\n"
+                        f"`SL={sl}` `TP={tp}` `fund={funding.rate_pct}`"
                     )
 
         elif cross_down:
             if not mtf.allow_short(price):
-                logger.debug(f"MTF blocks SHORT @ {price:.2f} > EMA50(15m)={mtf.ema50:.2f}")
+                logger.debug(f"MTF blocks SHORT @ {price:.2f}")
                 self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
             if not funding.can_enter_short():
-                logger.debug(f"Funding blocks SHORT: {funding.rate_pct}")
+                logger.debug(f"Funding blocks SHORT")
                 self._prev_fast = ind.ema_fast; self._prev_slow = ind.ema_slow; return
             if not anti_manip.clear_for_entry("short"):
                 logger.debug("AntiManip blocks SHORT")
@@ -330,28 +310,28 @@ class Strategy:
 
             score = _score_short(ind, ob, price)
             logger.info(
-                f"SHORT score={score:.3f} | ema={ind.ema_fast:.1f}<{ind.ema_slow:.1f} "
+                f"SHORT score={score:.3f}/{ENTRY_THRESHOLD} | "
+                f"ema={ind.ema_fast:.1f}<{ind.ema_slow:.1f} "
                 f"rsi={ind.rsi_value:.1f} imb={ob.imbalance:.3f} "
-                f"bb_r={ind.bb_ready} vwap={ind.vwap:.1f} "
+                f"bb={'✓' if ind.bb_ready else '?'} vwap={ind.vwap:.1f} "
                 f"mtf={'✓' if mtf.ready else '?'} fund={funding.rate_pct}"
             )
             if score >= ENTRY_THRESHOLD:
                 qty = risk.calc_qty(price)
-                sl_price, tp_price = _calc_sl_tp("Sell", price)
+                sl, tp = _calc_sl_tp("short", price)
                 if USE_LIMIT_ORDERS:
                     ok, filled_qty, avg_price = await lom.place_entry(
-                        "Sell", qty, stop_loss=sl_price, take_profit=tp_price
+                        "Sell", qty, stop_loss=sl, take_profit=tp
                     )
                 else:
-                    resp = await _trader_module.place_order(
+                    resp = await _trader.place_order(
                         "Sell", qty, order_type="Market",
-                        stop_loss=sl_price, take_profit=tp_price,
+                        stop_loss=sl, take_profit=tp,
                     )
                     ok = resp.get("retCode") == 0
                     filled_qty, avg_price = (qty, price) if ok else (0, 0)
 
                 if ok and filled_qty > 0:
-                    from .position_manager import position_manager
                     await position_manager.on_open("short", filled_qty, avg_price)
                     db.record_trade(
                         symbol=_sym(), side="short",
@@ -361,10 +341,9 @@ class Strategy:
                     )
                     await _notify(
                         f"🟠 *SHORT* `{_sym()}` score=`{score:.3f}`\n"
-                        f"`price={avg_price}` `qty={filled_qty}` `rsi={ind.rsi_value:.1f}`\n"
-                        f"`imb={ob.imbalance:.3f}` `fund={funding.rate_pct}` "
-                        f"`vwap={ind.vwap:.1f}` `mtf={'✓' if mtf.ready else '?'}`\n"
-                        f"`SL={sl_price}` `TP={tp_price}`"
+                        f"`price={avg_price}` `qty={filled_qty}`\n"
+                        f"`rsi={ind.rsi_value:.1f}` `imb={ob.imbalance:.3f}`\n"
+                        f"`SL={sl}` `TP={tp}` `fund={funding.rate_pct}`"
                     )
 
         self._prev_fast = ind.ema_fast

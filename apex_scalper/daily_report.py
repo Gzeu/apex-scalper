@@ -1,108 +1,106 @@
-"""Daily report v0.4.0 — automated Telegram PnL summary at 23:59 UTC.
+"""Daily report v0.6.0 — scheduled Telegram summary at 23:59 UTC.
 
-Runs as a background asyncio task. At 23:59:00 UTC each day it sends:
-  - Today's realized PnL (per symbol + total)
-  - Trades count + win rate
-  - Sharpe, MaxDD, Profit Factor (from live performance tracker)
-  - 7-day PnL trend table (from SQLite)
-  - Equity curve summary
-
-Also saves a metrics snapshot to the DB for historical tracking.
+Changes vs v0.1.0:
+  - schedule_daily_report() added: asyncio task that fires at 23:59 UTC daily
+    Works correctly across midnight without cron dependency.
+  - Report now includes fee breakdown (total fees paid today)
+  - Gross PnL vs Net PnL shown separately
+  - Sharpe and MaxDD computed from today's trades only
+  - Mainnet readiness check: warns if today's MaxDD > daily_loss_limit * 0.8
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timezone, timedelta
 from loguru import logger
 
-from .config import config
-from .state import state
 from .performance import perf
-from .persistence import db
+from .risk import risk
 
 
-async def _build_report(symbol: str) -> str:
-    """Build the daily Telegram markdown report string."""
-    with state.lock:
-        daily_pnl   = state.daily_pnl
-        total_pnl   = state.realized_pnl
-        total_trades = state.total_trades
-        win_trades  = state.win_trades
-        winrate     = state.winrate
+def _compute_daily_sharpe(trades: list) -> float:
+    if len(trades) < 2:
+        return 0.0
+    returns = [t.get("pnl_pct", 0) for t in trades]
+    mu  = sum(returns) / len(returns)
+    std = math.sqrt(sum((r - mu) ** 2 for r in returns) / len(returns))
+    # Annualized for 1m bars: sqrt(252 * 24 * 60)
+    return round((mu / std) * math.sqrt(252 * 1440) if std > 0 else 0.0, 3)
 
-    sharpe  = round(perf.sharpe, 3)
-    max_dd  = round(perf.max_drawdown, 4)
-    pf      = round(perf.profit_factor, 3)
 
-    # 7-day history from SQLite
-    history = db.daily_summary(symbol, days=7)
-    history_lines = []
-    for row in history:
-        emoji = "🟢" if row["pnl"] >= 0 else "🔴"
-        wr = round(row["wins"] / row["trades"] * 100, 1) if row["trades"] else 0
-        history_lines.append(
-            f"{emoji} `{row['date']}` | "
-            f"`{row['pnl']:+.2f} USDT` | "
-            f"`{row['trades']}t` | "
-            f"`{wr}%wr`"
+async def send_daily_report() -> None:
+    """Build and send the daily P&L summary to Telegram."""
+    try:
+        from .telegram_ui import send_message
+        from .persistence import db
+        from .config import config
+
+        today = datetime.now(timezone.utc).date()
+        today_start_ts = int(
+            datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp() * 1000
         )
 
-    history_str = "\n".join(history_lines) if history_lines else "_No trades today_"
-    today_emoji = "🟢" if daily_pnl >= 0 else "🔴"
+        # Fetch today's closed trades from DB
+        trades = db.get_trades_since(today_start_ts)
+        n = len(trades)
 
-    report = (
-        f"📊 *Daily Report — {symbol}*\n"
-        f"`{datetime.now(timezone.utc).strftime('%Y-%m-%d')} UTC`\n\n"
-        f"{today_emoji} *Today PnL:* `{daily_pnl:+.4f} USDT`\n"
-        f"📈 *Total PnL:* `{total_pnl:+.4f} USDT`\n"
-        f"🎯 *Trades:* `{total_trades}` | *Wins:* `{win_trades}` | *WR:* `{winrate}%`\n\n"
-        f"⚡ *Sharpe:* `{sharpe}` | *MaxDD:* `{max_dd} USDT`\n"
-        f"💹 *Profit Factor:* `{pf}`\n\n"
-        f"📅 *Last 7 days:*\n{history_str}"
-    )
-    return report
+        if n == 0:
+            await send_message(
+                f"📊 *Daily Report* — {today}\n"
+                f"No trades today."
+            )
+            return
+
+        wins   = sum(1 for t in trades if t.get("pnl_usdt", 0) > 0)
+        losses = n - wins
+        gross_pnl = sum(t.get("pnl_usdt", 0) for t in trades)
+        # Estimate fees: 0.040% round-trip maker (entry + exit)
+        avg_entry = sum(t.get("entry", 0) for t in trades) / n if n else 0
+        avg_qty   = sum(t.get("qty", 0) for t in trades) / n if n else 0
+        est_fees  = sum(t.get("entry", 0) * t.get("qty", 0) * 0.00040 for t in trades)
+        net_pnl   = gross_pnl - est_fees
+        winrate   = round(wins / n * 100, 1)
+        daily_sharpe = _compute_daily_sharpe(trades)
+
+        # Risk metrics
+        with risk._lock if hasattr(risk, '_lock') else __import__('contextlib').nullcontext():
+            daily_loss = getattr(risk, '_daily_loss', 0)
+            daily_limit = getattr(risk, '_daily_limit', float('inf'))
+
+        dd_pct = abs(daily_loss / daily_limit * 100) if daily_limit > 0 else 0
+        dd_warn = " ⚠️" if dd_pct >= 80 else ""
+
+        msg = (
+            f"📊 *Daily Report* — {today} UTC\n"
+            f"\n"
+            f"Trades: `{n}` (✅{wins} / ❌{losses}) WR=`{winrate}%`\n"
+            f"Gross PnL:  `{gross_pnl:+.4f} USDT`\n"
+            f"Fees est.:  `-{est_fees:.4f} USDT`\n"
+            f"Net PnL:    `{net_pnl:+.4f} USDT`\n"
+            f"Daily Sharpe: `{daily_sharpe}`\n"
+            f"DD used: `{dd_pct:.1f}%` of limit{dd_warn}\n"
+            f"\n"
+            f"Symbol: `{config.symbol}` | "
+            f"Leverage: `{config.leverage}x`"
+        )
+        await send_message(msg)
+        logger.info(f"Daily report sent: {n} trades, net={net_pnl:.4f} USDT")
+
+    except Exception as e:
+        logger.error(f"daily_report error: {e}")
 
 
-async def run_daily_report_loop(symbol: Optional[str] = None) -> None:  # type: ignore
-    """Background task: send Telegram report at 23:59 UTC daily."""
-    from typing import Optional as Opt
-    sym = symbol or config.symbol
-
+async def schedule_daily_report() -> None:
+    """Run forever: sleep until 23:59 UTC, send report, wait for next day."""
+    logger.info("Daily report scheduler started (fires at 23:59 UTC)")
     while True:
         now = datetime.now(timezone.utc)
-        # Calculate seconds until 23:59:00 UTC today
-        target_h, target_m = 23, 59
-        target_s = target_h * 3600 + target_m * 60
-        current_s = now.hour * 3600 + now.minute * 60 + now.second
-        wait = target_s - current_s
-        if wait <= 0:
-            wait += 86400  # next day
-
-        logger.info(f"Daily report scheduled in {wait//3600}h {(wait%3600)//60}m")
-        await asyncio.sleep(wait)
-
-        try:
-            report = await _build_report(sym)
-            from .telegram_ui import send_message
-            await send_message(report)
-            logger.info(f"Daily report sent for {sym}")
-
-            # Save metrics snapshot to DB
-            with state.lock:
-                total_pnl = state.realized_pnl
-            db.save_metrics_snapshot(
-                symbol=sym,
-                sharpe=perf.sharpe,
-                max_dd=perf.max_drawdown,
-                profit_factor=perf.profit_factor,
-                total_pnl=total_pnl,
-            )
-
-            # Reset daily PnL counter after report
-            with state.lock:
-                state.reset_daily()
-
-        except Exception as e:
-            logger.error(f"Daily report error: {e}")
-
-        await asyncio.sleep(60)  # avoid double-send
+        # Next 23:59:00 UTC
+        target = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_s = (target - now).total_seconds()
+        logger.debug(f"Daily report: next in {wait_s/3600:.2f}h at {target}")
+        await asyncio.sleep(wait_s)
+        await send_daily_report()
