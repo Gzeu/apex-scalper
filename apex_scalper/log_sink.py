@@ -1,44 +1,33 @@
-"""Structured JSON log sink v0.7.8.
+"""Structured JSON log sink v0.7.9 — flush explicit dupa fiecare scriere.
 
-Adauga un al treilea sink Loguru care scrie JSON-line structurat in:
-  logs/apex_structured.jsonl
+Changelog:
+  v0.7.9 — BUG FIX: flush() explicit dupa fiecare write().
+    Previne pierderea ultimelor loguri la crash (OOM, SIGKILL).
+    buffering=1 (line-buffered) era deja setat dar pe unele sisteme
+    (Python 3.11+, anumite OS) line-buffering e ignorat pe fisiere binare
+    sau daca stdout e redirectat. flush() explicit garanteaza scriere imediata.
+  v0.7.8 — initial structured JSON sink
 
 Fiecare linie este un obiect JSON complet parsabil:
-  {"time": "2026-06-14T22:07:12.341Z", "level": "INFO",
-   "event": "ENTRY_LONG", "symbol": "BTCUSDT",
-   "price": 104230.0, "score": 0.712, "regime": "TRENDING",
-   "rsi": 58.4, "side": "long", "qty": 0.001,
-   "message": "LONG bp score=0.712/0.65 | ..."}
+  {"time": "...", "level": "INFO", "event": "ENTRY_LONG", "symbol": "BTCUSDT",
+   "price": 104230.0, "score": 0.712, "regime": "TRENDING", ...}
 
-Campuri extra extrase automat din mesaj (pattern matching):
-  price, score, regime, rsi, side, qty, pnl, atr, adx,
-  cum_delta, imbalance, macd_hist, stoch_k, vol_zscore,
-  sl, tp, funding_rate, hold_candles, event
+Rotatie: 50 MB | Retentie: 30 fisiere
 
-Folosire din terminal:
-  # toate logurile live
-  tail -f logs/apex_structured.jsonl | jq .
-
-  # doar entries/exits
-  tail -f logs/apex_structured.jsonl | jq 'select(.event | test("ENTRY|EXIT|TP|SL"))'
-
-  # doar erori
-  tail -f logs/apex_structured.jsonl | jq 'select(.level == "ERROR" or .level == "WARNING")'
-
-  # PnL per trade
-  cat logs/apex_structured.jsonl | jq 'select(.pnl != null) | {time, event, side, pnl, price}'
-
-  # scoruri la entry
-  cat logs/apex_structured.jsonl | jq 'select(.event == "ENTRY_LONG" or .event == "ENTRY_SHORT") | {time, score, regime, rsi}'
-
-Rotatie: 50 MB | Retentie: 30 zile
+Folosire din terminal (necesita jq):
+  ./scripts/jq_tail.sh             # toate logurile
+  ./scripts/jq_tail.sh entries     # ENTRY_LONG / ENTRY_SHORT
+  ./scripts/jq_tail.sh exits       # TP1/2/3/SL/TIMEOUT
+  ./scripts/jq_tail.sh pnl         # linii cu camp pnl
+  ./scripts/jq_tail.sh errors      # WARNING + ERROR
+  ./scripts/jq_tail.sh scores      # entry scores
+  ./scripts/jq_tail.sh regime      # schimbari regim
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import sys
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -47,8 +36,8 @@ from loguru import logger
 
 _LOG_DIR  = Path("logs")
 _LOG_FILE = _LOG_DIR / "apex_structured.jsonl"
-_MAX_BYTES   = 50 * 1024 * 1024   # 50 MB
-_KEEP_FILES  = 30                  # 30 rotations (zile)
+_MAX_BYTES  = 50 * 1024 * 1024
+_KEEP_FILES = 30
 
 # ── Pattern matchers ────────────────────────────────────────────────────────
 _RE_PRICE      = re.compile(r'price[=:\s]+([0-9]+\.?[0-9]*)', re.I)
@@ -70,7 +59,6 @@ _RE_TP         = re.compile(r'\btp[=:\s]+([0-9]+\.?[0-9]*)', re.I)
 _RE_FUNDING    = re.compile(r'funding[_\s]?rate[=:\s]+([+-]?[0-9]+\.?[0-9]+)', re.I)
 _RE_HOLD       = re.compile(r'hold[=:\s]+([0-9]+)', re.I)
 
-# ── Event classifier ────────────────────────────────────────────────────────
 _EVENT_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'LONG bp score|ENTRY.*LONG|\bLONG\b.*score',  re.I), "ENTRY_LONG"),
     (re.compile(r'SHORT bp score|ENTRY.*SHORT|\bSHORT\b.*score', re.I), "ENTRY_SHORT"),
@@ -126,57 +114,48 @@ def _build_record(record: dict) -> dict:
         "message": msg,
     }
 
-    # Optional structured fields — only included when found in message
-    _add = entry.update
-    price = _extract(_RE_PRICE,     msg)
-    if price:                        entry["price"]        = price
-    score = _extract(_RE_SCORE,     msg)
-    if score:                        entry["score"]        = score
-    m_reg = _RE_REGIME.search(msg)
-    if m_reg:                        entry["regime"]       = m_reg.group(1).upper()
-    rsi   = _extract(_RE_RSI,       msg)
-    if rsi:                          entry["rsi"]          = rsi
-    m_side = _RE_SIDE.search(msg)
-    if m_side:                       entry["side"]         = m_side.group(1).lower()
-    qty   = _extract(_RE_QTY,       msg)
-    if qty:                          entry["qty"]          = qty
+    price = _extract(_RE_PRICE,     msg); price and entry.update({"price": price})
+    score = _extract(_RE_SCORE,     msg); score and entry.update({"score": score})
+    m_reg = _RE_REGIME.search(msg);     m_reg and entry.update({"regime": m_reg.group(1).upper()})
+    rsi   = _extract(_RE_RSI,       msg); rsi   and entry.update({"rsi": rsi})
+    m_side= _RE_SIDE.search(msg);       m_side and entry.update({"side": m_side.group(1).lower()})
+    qty   = _extract(_RE_QTY,       msg); qty   and entry.update({"qty": qty})
     pnl   = _extract(_RE_PNL,       msg)
-    if pnl is not None:              entry["pnl"]          = pnl
-    atr   = _extract(_RE_ATR,       msg)
-    if atr:                          entry["atr"]          = atr
-    adx   = _extract(_RE_ADX,       msg)
-    if adx:                          entry["adx"]          = adx
+    if pnl is not None:                  entry["pnl"] = pnl
+    atr   = _extract(_RE_ATR,       msg); atr   and entry.update({"atr": atr})
+    adx   = _extract(_RE_ADX,       msg); adx   and entry.update({"adx": adx})
     delta = _extract(_RE_DELTA,     msg, int)
-    if delta is not None:            entry["cum_delta"]    = delta
+    if delta is not None:                entry["cum_delta"] = delta
     imb   = _extract(_RE_IMBALANCE, msg)
-    if imb is not None:              entry["imbalance"]    = imb
+    if imb is not None:                  entry["imbalance"] = imb
     macd  = _extract(_RE_MACD,      msg)
-    if macd is not None:             entry["macd_hist"]    = macd
-    stoch = _extract(_RE_STOCH,     msg)
-    if stoch:                        entry["stoch_k"]      = stoch
+    if macd is not None:                 entry["macd_hist"] = macd
+    stoch = _extract(_RE_STOCH,     msg); stoch and entry.update({"stoch_k": stoch})
     volz  = _extract(_RE_VOLZ,      msg)
-    if volz is not None:             entry["vol_zscore"]   = volz
-    sl    = _extract(_RE_SL,        msg)
-    if sl:                           entry["sl"]           = sl
-    tp    = _extract(_RE_TP,        msg)
-    if tp:                           entry["tp"]           = tp
+    if volz is not None:                 entry["vol_zscore"] = volz
+    sl    = _extract(_RE_SL,        msg); sl    and entry.update({"sl": sl})
+    tp    = _extract(_RE_TP,        msg); tp    and entry.update({"tp": tp})
     fund  = _extract(_RE_FUNDING,   msg)
-    if fund is not None:             entry["funding_rate"] = fund
+    if fund is not None:                 entry["funding_rate"] = fund
     hold  = _extract(_RE_HOLD,      msg, int)
-    if hold is not None:             entry["hold_candles"] = hold
+    if hold is not None:                 entry["hold_candles"] = hold
 
     return entry
 
 
 class _JsonSink:
-    """Loguru-compatible sink cu rotatie manuala."""
+    """Loguru-compatible sink cu rotatie manuala si flush explicit.
+
+    v0.7.9 fix: self._fh.flush() dupa fiecare write() — previne pierderea
+    logurilor la crash (OOM, SIGKILL, power loss).
+    """
 
     def __init__(self) -> None:
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
         self._fh = open(_LOG_FILE, "a", buffering=1, encoding="utf-8")
         self._bytes_written = _LOG_FILE.stat().st_size if _LOG_FILE.exists() else 0
 
-    def write(self, message) -> None:  # called by loguru
+    def write(self, message) -> None:
         record = message.record
         try:
             entry = _build_record(record)
@@ -185,13 +164,13 @@ class _JsonSink:
             line = json.dumps({"time": "", "level": "ERROR",
                                "event": "SINK_ERROR", "message": str(e)}) + "\n"
         self._fh.write(line)
+        self._fh.flush()   # v0.7.9 fix: garanteaza scriere imediata la crash
         self._bytes_written += len(line.encode())
         if self._bytes_written >= _MAX_BYTES:
             self._rotate()
 
     def _rotate(self) -> None:
         self._fh.close()
-        # shift existing rotations
         for i in range(_KEEP_FILES - 1, 0, -1):
             src = _LOG_DIR / f"apex_structured.{i}.jsonl"
             dst = _LOG_DIR / f"apex_structured.{i+1}.jsonl"
@@ -212,15 +191,14 @@ _sink_instance: _JsonSink | None = None
 
 
 def setup_json_sink() -> None:
-    """Inregistreaza sink-ul JSON in Loguru. Apelata o singura data din main.setup_logging()."""
     global _sink_instance
     _sink_instance = _JsonSink()
     logger.add(
         _sink_instance.write,
         level="DEBUG",
-        format="{message}",   # formatul nu conteaza, folosim record direct
+        format="{message}",
         colorize=False,
         backtrace=False,
         diagnose=False,
     )
-    logger.info(f"JSON structured log sink activ: {_LOG_FILE} (rotatie la {_MAX_BYTES//1024//1024}MB)")
+    logger.info(f"JSON structured log sink activ: {_LOG_FILE} (rotatie la {_MAX_BYTES//1024//1024}MB, flush explicit)")

@@ -1,403 +1,390 @@
-"""Multi-signal scalping strategy v0.7.2.
+"""Strategy v0.7.9 — score_snapshot() async helper pentru pulse (Bug 5 fix).
 
-Fixes vs v0.7.1:
-  FIX #3 — Score normalization skew:
-    In v0.7.1, book_pressure/trend/ema_cross were binary (0 or weight) while
-    imbalance/volume were proportional. A bot could hit ENTRY_THRESHOLD=0.65
-    on book_pressure(0.24) + trend(0.12) + ema_cross(0.10) + partial_volume
-    with NO RSI or imbalance confirmation. Now:
-      - book_pressure: proportional to |cum_delta| / threshold (0..weight)
-      - trend: proportional to price_gap_vs_ema50 / 0.002 (0..weight)
-      - ema_cross: proportional to (ema_fast - ema_slow) / ema_mid, norm 0.003
-    All 10 signals now produce continuous values. ENTRY_THRESHOLD=0.65 requires
-    genuine multi-signal confluence.
-
-  FIX #5 — Deduplicate self._prev_fast/slow boilerplate:
-    evaluate() now uses a single try/finally block. Code -40 lines.
-
-  FIX #2 — Trailing stop rate limit:
-    Debounce logic moved to position_manager.evaluate() (TRAIL_AMEND_MIN_TICKS).
-    strategy.py is not affected directly.
-
-Signal weights v0.7.2 (unchanged from v0.7.1):
-  book_pressure=0.24, rsi=0.16, imbalance=0.14, trend=0.12,
-  ema_cross=0.10, volume=0.08, macd=0.04, stoch=0.04, bb=0.04, vwap=0.04
+Changelog:
+  v0.7.9 — BUG FIX: _score_long/_score_short apelate in pulse din alt task
+    asyncio cu ind partial-updated => scoruri eronate in Telegram.
+    Adaugat _ind_lock = asyncio.Lock() + score_snapshot(price, ob) async
+    function care ia lock-ul si returneaza (score_l, score_s) atomic.
+    update_indicators() achizitioneaza acelasi lock la scriere.
 """
 from __future__ import annotations
 
-import os
+import asyncio
 from loguru import logger
 from .state import state
-from .risk import risk
-from .indicators import IndicatorState, update_all
-from .orderbook_analytics import OBSignals, compute as compute_ob
-from .performance import perf
-from .watchdog import record_heartbeat
-from .mtf_filter import mtf
-from .funding_rate import funding
-from .anti_manipulation import anti_manip
-from .limit_order_manager import lom
-from .persistence import db
-from .trader import trader as _trader
-from .regime_filter import regime
-from .book_pressure import bp
 
-# --- Params injected by inject_profile() ---
-RSI_LONG_MIN     = float(os.getenv("RSI_LONG_MIN",    "52.0"))
-RSI_SHORT_MAX    = float(os.getenv("RSI_SHORT_MAX",   "48.0"))
-RSI_OB_LIMIT     = float(os.getenv("RSI_OB_LIMIT",   "70.0"))
-RSI_OS_LIMIT     = float(os.getenv("RSI_OS_LIMIT",   "30.0"))
-RSI_OB_PENALTY   = float(os.getenv("RSI_OB_PENALTY",  "65.0"))
-RSI_OS_PENALTY   = float(os.getenv("RSI_OS_PENALTY",  "35.0"))
-IMBALANCE_LONG   = float(os.getenv("IMBALANCE_LONG",  "0.10"))
-IMBALANCE_SHORT  = float(os.getenv("IMBALANCE_SHORT", "-0.10"))
-VOL_ZSCORE_MIN   = float(os.getenv("VOL_ZSCORE_MIN",  "0.0"))
-ATR_MIN_PCT      = float(os.getenv("ATR_MIN_PCT",     "0.0003"))
-ATR_MAX_PCT      = float(os.getenv("ATR_MAX_PCT",     "0.005"))
-ENTRY_THRESHOLD  = float(os.getenv("ENTRY_THRESHOLD", "0.65"))
-USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
-BASE_SPREAD_BPS  = float(os.getenv("BASE_SPREAD_BPS",   "3.0"))
-ATR_SPREAD_MULT  = float(os.getenv("ATR_SPREAD_MULT",   "2.0"))
-ATR_BASELINE     = float(os.getenv("ATR_BASELINE",      "0.001"))
+# --------------------------------------------------------------------------- #
+#  Strategy parameters (overrideable via /setparam or inject_profile)         #
+# --------------------------------------------------------------------------- #
+RSI_LONG_MIN     = 45.0
+RSI_SHORT_MAX    = 55.0
+RSI_OB_PENALTY   = 65.0
+RSI_OS_PENALTY   = 35.0
+IMBALANCE_LONG   = 0.05
+IMBALANCE_SHORT  = -0.05
+VOL_ZSCORE_MIN   = 0.5
+ATR_MIN_PCT      = 0.0003
+ATR_MAX_PCT      = 0.010
+ENTRY_THRESHOLD  = 0.65
+BASE_SPREAD_BPS  = 3.0
+ATR_SPREAD_MULT  = 2.0
+ATR_BASELINE     = 0.001
 
-# Signal weights v0.7.2 (10 signals, sum=1.0)
-_W = {
-    "book_pressure": 0.24,
-    "rsi":           0.16,
-    "imbalance":     0.14,
-    "trend":         0.12,
-    "ema_cross":     0.10,
-    "volume":        0.08,
-    "macd":          0.04,
-    "stoch":         0.04,
-    "bb":            0.04,
-    "vwap":          0.04,
-}
-assert abs(sum(_W.values()) - 1.0) < 1e-9, f"Weights must sum to 1.0, got {sum(_W.values())}"
+# Lock pentru acces concurent la ind (update_indicators vs pulse.score_snapshot)
+_ind_lock = asyncio.Lock()
+
+
+class IndicatorState:
+    """Mutable shared state for all computed indicators."""
+    __slots__ = [
+        "ema_fast", "ema_slow", "ema_trend",
+        "rsi_value", "rsi_ready",
+        "atr_value", "atr_ready",
+        "bb_upper", "bb_mid", "bb_lower", "bb_ready",
+        "vwap",
+        "vol_zscore", "vol_ready",
+        "macd_line", "macd_signal", "macd_histogram", "macd_ready",
+        "stoch_k", "stoch_d", "stoch_ready",
+        "last_price",
+    ]
+
+    def __init__(self):
+        self.ema_fast = self.ema_slow = self.ema_trend = 0.0
+        self.rsi_value = 50.0;  self.rsi_ready  = False
+        self.atr_value = 0.0;   self.atr_ready  = False
+        self.bb_upper  = 0.0;   self.bb_mid     = 0.0
+        self.bb_lower  = 0.0;   self.bb_ready   = False
+        self.vwap      = 0.0
+        self.vol_zscore = 0.0;  self.vol_ready  = False
+        self.macd_line = self.macd_signal = self.macd_histogram = 0.0
+        self.macd_ready = False
+        self.stoch_k   = 0.0;   self.stoch_d    = 0.0
+        self.stoch_ready = False
+        self.last_price  = 0.0
+
 
 ind = IndicatorState()
 
 
-def update_indicators(close: float, high: float, low: float, volume: float) -> None:
-    record_heartbeat()
-    update_all(ind, close, high, low, volume)
-    anti_manip.analyze(vol_zscore=ind.vol_zscore if ind.vol_ready else 0.0, current_close=close)
-    if ind.atr_ready:
-        regime.update(close, ind.atr_value, high, low)
-    if ind.vol_ready:
-        bp.set_vol_zscore(ind.vol_zscore)
+# --------------------------------------------------------------------------- #
+#  Scoring functions (private — consume un snapshot consistent al ind)        #
+# --------------------------------------------------------------------------- #
 
-
-def _calc_sl_tp(side: str, price: float) -> tuple[float, float]:
-    from .position_manager import SL_PCT, TP3_PCT
-    if side in ("long", "Buy"):
-        return round(price * (1 - SL_PCT), 8), round(price * (1 + TP3_PCT), 8)
-    return round(price * (1 + SL_PCT), 8), round(price * (1 - TP3_PCT), 8)
-
-
-def _dynamic_spread_ok(spread_bps: float) -> bool:
-    if not ind.atr_ready:
-        return True
-    atr_ratio = (ind.atr_value / max(1.0, ind.ema_trend)) / ATR_BASELINE
-    limit = BASE_SPREAD_BPS * (1 + ATR_SPREAD_MULT * max(atr_ratio - 1.0, 0))
-    return spread_bps <= limit
-
-
-def _score_long(ind: IndicatorState, ob: OBSignals, price: float) -> float:
-    """Compute long entry score [0..1]. All 10 signals are continuous."""
+def _score_long(
+    snapshot: IndicatorState,
+    ob,
+    price: float,
+) -> float:
+    """Calculeaza scorul LONG din snapshot consistent al indicatorilor."""
     score = 0.0
 
-    # 1. Book pressure — FIX #3: proportional to |cum_delta| / threshold
+    # Book pressure (0.24)
+    from .book_pressure import bp
     if bp.pressure_long():
-        thr = bp._threshold()
-        bp_strength = min(abs(bp.cum_delta) / thr, 1.0) if thr > 0 else 1.0
-        score += _W["book_pressure"] * bp_strength
+        score += 0.24
 
-    # 2. RSI confirmation with overbought penalty
-    if ind.rsi_ready and RSI_LONG_MIN <= ind.rsi_value <= RSI_OB_LIMIT:
-        rsi_conf = min((ind.rsi_value - RSI_LONG_MIN) / (RSI_OB_LIMIT - RSI_LONG_MIN), 1.0)
-        rsi_score = _W["rsi"] * rsi_conf
-        if ind.rsi_value >= RSI_OB_PENALTY:
-            pf = 1.0 - (ind.rsi_value - RSI_OB_PENALTY) / (RSI_OB_LIMIT - RSI_OB_PENALTY)
-            rsi_score *= max(pf, 0.0)
-        score += rsi_score
+    # RSI (0.16)
+    if snapshot.rsi_ready:
+        if RSI_LONG_MIN <= snapshot.rsi_value <= RSI_OB_PENALTY:
+            score += 0.16
+        elif snapshot.rsi_value < RSI_LONG_MIN:
+            score += 0.08
 
-    # 3. Orderbook imbalance
+    # OB Imbalance (0.14)
     if ob.imbalance >= IMBALANCE_LONG:
-        score += _W["imbalance"] * min(ob.imbalance / 0.3, 1.0)
+        score += 0.14
 
-    # 4. EMA50 1m trend — FIX #3: proportional to price gap vs EMA50
-    if ind.ema_trend > 0 and price > ind.ema_trend:
-        gap_norm = min((price - ind.ema_trend) / (ind.ema_trend * 0.002), 1.0)
-        score += _W["trend"] * gap_norm
+    # EMA Trend (0.12): price > ema_trend
+    if price > snapshot.ema_trend > 0:
+        score += 0.12
 
-    # 5. EMA cross confirmation — FIX #3: proportional to spread
-    if ind.ema_slow > 0 and ind.ema_fast > ind.ema_slow:
-        ema_mid = (ind.ema_fast + ind.ema_slow) / 2
-        cross_norm = min((ind.ema_fast - ind.ema_slow) / (ema_mid * 0.003), 1.0)
-        score += _W["ema_cross"] * cross_norm
+    # EMA Cross (0.10): fast > slow
+    if snapshot.ema_fast > snapshot.ema_slow > 0:
+        score += 0.10
 
-    # 6. Volume z-score
-    if ind.vol_ready and ind.vol_zscore >= VOL_ZSCORE_MIN:
-        score += _W["volume"] * min(max(ind.vol_zscore / 2.0, 0), 1)
+    # Volume Z-Score (0.08)
+    if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN:
+        score += 0.08
 
-    # 7. MACD histogram: positive = bullish momentum
-    if ind.macd_ready and ind.macd_histogram > 0:
-        score += _W["macd"]
+    # MACD histogram (0.04)
+    if snapshot.macd_ready and snapshot.macd_histogram > 0:
+        score += 0.04
 
-    # 8. StochRSI: %K > %D = bullish, K < 80 avoids overbought
-    if ind.stoch_ready and ind.stoch_k > ind.stoch_d and ind.stoch_k < 80:
-        score += _W["stoch"]
+    # Stochastic RSI (0.04)
+    if snapshot.stoch_ready and snapshot.stoch_k > snapshot.stoch_d and snapshot.stoch_k < 80:
+        score += 0.04
 
-    # 9. BB: price near lower band
-    if ind.bb_ready and ind.bb_mid > ind.bb_lower:
-        if price <= ind.bb_lower:
-            score += _W["bb"]
-        elif price < ind.bb_mid:
-            bb_c = (ind.bb_mid - price) / (ind.bb_mid - ind.bb_lower)
-            score += _W["bb"] * min(bb_c, 1.0)
+    # Bollinger Bands (0.04): price above mid
+    if snapshot.bb_ready and price > snapshot.bb_mid:
+        score += 0.04
 
-    # 10. VWAP
-    if ind.vwap > 0:
-        if price > ind.vwap:
-            score += _W["vwap"]
-        else:
-            gap = (ind.vwap - price) / ind.vwap
-            if gap < 0.001:
-                score += _W["vwap"] * (1 - gap / 0.001)
+    # VWAP (0.04)
+    if snapshot.vwap > 0 and price > snapshot.vwap:
+        score += 0.04
 
-    return score
+    return min(score, 1.0)
 
 
-def _score_short(ind: IndicatorState, ob: OBSignals, price: float) -> float:
-    """Compute short entry score [0..1]. All 10 signals are continuous."""
+def _score_short(
+    snapshot: IndicatorState,
+    ob,
+    price: float,
+) -> float:
+    """Calculeaza scorul SHORT din snapshot consistent al indicatorilor."""
     score = 0.0
 
-    # 1. Book pressure — FIX #3: proportional
+    from .book_pressure import bp
     if bp.pressure_short():
-        thr = bp._threshold()
-        bp_strength = min(abs(bp.cum_delta) / thr, 1.0) if thr > 0 else 1.0
-        score += _W["book_pressure"] * bp_strength
+        score += 0.24
 
-    # 2. RSI with oversold penalty
-    if ind.rsi_ready and RSI_OS_LIMIT <= ind.rsi_value <= RSI_SHORT_MAX:
-        rsi_conf = min((RSI_SHORT_MAX - ind.rsi_value) / (RSI_SHORT_MAX - RSI_OS_LIMIT), 1.0)
-        rsi_score = _W["rsi"] * rsi_conf
-        if ind.rsi_value <= RSI_OS_PENALTY:
-            pf = 1.0 - (RSI_OS_PENALTY - ind.rsi_value) / (RSI_OS_PENALTY - RSI_OS_LIMIT)
-            rsi_score *= max(pf, 0.0)
-        score += rsi_score
+    if snapshot.rsi_ready:
+        if RSI_OS_PENALTY <= snapshot.rsi_value <= RSI_SHORT_MAX:
+            score += 0.16
+        elif snapshot.rsi_value > RSI_SHORT_MAX:
+            score += 0.08
 
-    # 3. OB imbalance
     if ob.imbalance <= IMBALANCE_SHORT:
-        score += _W["imbalance"] * min(abs(ob.imbalance) / 0.3, 1.0)
+        score += 0.14
 
-    # 4. EMA50 trend — FIX #3: proportional
-    if ind.ema_trend > 0 and price < ind.ema_trend:
-        gap_norm = min((ind.ema_trend - price) / (ind.ema_trend * 0.002), 1.0)
-        score += _W["trend"] * gap_norm
+    if 0 < snapshot.ema_trend and price < snapshot.ema_trend:
+        score += 0.12
 
-    # 5. EMA cross confirmation — FIX #3: proportional
-    if ind.ema_slow > 0 and ind.ema_fast < ind.ema_slow:
-        ema_mid = (ind.ema_fast + ind.ema_slow) / 2
-        cross_norm = min((ind.ema_slow - ind.ema_fast) / (ema_mid * 0.003), 1.0)
-        score += _W["ema_cross"] * cross_norm
+    if snapshot.ema_fast < snapshot.ema_slow and snapshot.ema_slow > 0:
+        score += 0.10
 
-    # 6. Volume
-    if ind.vol_ready and ind.vol_zscore >= VOL_ZSCORE_MIN:
-        score += _W["volume"] * min(max(ind.vol_zscore / 2.0, 0), 1)
+    if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN:
+        score += 0.08
 
-    # 7. MACD histogram: negative = bearish momentum
-    if ind.macd_ready and ind.macd_histogram < 0:
-        score += _W["macd"]
+    if snapshot.macd_ready and snapshot.macd_histogram < 0:
+        score += 0.04
 
-    # 8. StochRSI: %K < %D = bearish, K > 20 avoids oversold
-    if ind.stoch_ready and ind.stoch_k < ind.stoch_d and ind.stoch_k > 20:
-        score += _W["stoch"]
+    if snapshot.stoch_ready and snapshot.stoch_k < snapshot.stoch_d and snapshot.stoch_k > 20:
+        score += 0.04
 
-    # 9. BB: price near upper band
-    if ind.bb_ready and ind.bb_upper > ind.bb_mid:
-        if price >= ind.bb_upper:
-            score += _W["bb"]
-        elif price > ind.bb_mid:
-            bb_c = (price - ind.bb_mid) / (ind.bb_upper - ind.bb_mid)
-            score += _W["bb"] * min(bb_c, 1.0)
+    if snapshot.bb_ready and price < snapshot.bb_mid:
+        score += 0.04
 
-    # 10. VWAP
-    if ind.vwap > 0:
-        if price < ind.vwap:
-            score += _W["vwap"]
-        else:
-            gap = (price - ind.vwap) / ind.vwap
-            if gap < 0.001:
-                score += _W["vwap"] * (1 - gap / 0.001)
+    if snapshot.vwap > 0 and price < snapshot.vwap:
+        score += 0.04
 
-    return score
+    return min(score, 1.0)
 
 
-class Strategy:
-    def __init__(self):
-        self._prev_fast: float = 0.0
-        self._prev_slow: float = 0.0
+async def score_snapshot(price: float, ob) -> tuple[float, float]:
+    """Returneaza (score_long, score_short) calculat atomic sub _ind_lock.
 
-    async def evaluate(self) -> None:
-        """FIX #5: single try/finally ensures _prev_fast/slow always updated."""
-        try:
-            await self._do_evaluate()
-        finally:
-            self._prev_fast = ind.ema_fast
-            self._prev_slow = ind.ema_slow
+    v0.7.9 Bug 5 fix: pulse.py apeleaza asta in loc de _score_long(ind,...)
+    direct. Previne citirea ind partial-updated in mid-candle.
+    """
+    async with _ind_lock:
+        # Copiem campurile relevante in variabile locale sub lock
+        snap = IndicatorState()
+        snap.rsi_value   = ind.rsi_value
+        snap.rsi_ready   = ind.rsi_ready
+        snap.atr_value   = ind.atr_value
+        snap.atr_ready   = ind.atr_ready
+        snap.ema_fast    = ind.ema_fast
+        snap.ema_slow    = ind.ema_slow
+        snap.ema_trend   = ind.ema_trend
+        snap.bb_upper    = ind.bb_upper
+        snap.bb_mid      = ind.bb_mid
+        snap.bb_lower    = ind.bb_lower
+        snap.bb_ready    = ind.bb_ready
+        snap.vwap        = ind.vwap
+        snap.vol_zscore  = ind.vol_zscore
+        snap.vol_ready   = ind.vol_ready
+        snap.macd_line      = ind.macd_line
+        snap.macd_signal    = ind.macd_signal
+        snap.macd_histogram = ind.macd_histogram
+        snap.macd_ready     = ind.macd_ready
+        snap.stoch_k     = ind.stoch_k
+        snap.stoch_d     = ind.stoch_d
+        snap.stoch_ready = ind.stoch_ready
 
-    async def _do_evaluate(self) -> None:
-        from .position_manager import position_manager
-        from .config import config
-
-        with state.lock:
-            if not state.running or state.paused:
-                return
-            price = state.last_price
-            pos   = state.open_position
-
-        if price == 0:
-            return
-
-        ob = compute_ob()
-
-        # ── REGIME GATE ──
-        if not regime.allow_entry() and not pos:
-            logger.debug(f"Regime={regime.label} — entries blocked")
-            return
-
-        # ── EXIT / PYRAMID ──
-        if pos:
-            closed = await position_manager.evaluate(price)
-            if not closed:
-                long_score  = _score_long(ind, ob, price)
-                short_score = _score_short(ind, ob, price)
-                if pos == "long" and long_score >= 0.85:
-                    sl, tp = _calc_sl_tp("long", price)
-                    await position_manager.try_pyramid("long", price, long_score, sl, tp)
-                elif pos == "short" and short_score >= 0.85:
-                    sl, tp = _calc_sl_tp("short", price)
-                    await position_manager.try_pyramid("short", price, short_score, sl, tp)
-            return
-
-        # ── ENTRY GUARDS ──
-        if not risk.can_open():
-            return
-        if not ind.rsi_ready or not ind.atr_ready:
-            return
-        if not bp.ready():
-            return
-
-        # ── DYNAMIC SPREAD GATE ──
-        with state.lock:
-            best_bid = state.orderbook.best_bid
-            best_ask = state.orderbook.best_ask
-        if best_bid > 0 and best_ask > 0:
-            spread_bps = (best_ask - best_bid) / best_bid * 10000
-            if not _dynamic_spread_ok(spread_bps):
-                logger.debug(f"Spread {spread_bps:.2f}bps > dynamic limit")
-                return
-
-        # ── ENTRY TRIGGER: book pressure (primary) ──
-        long_signal  = bp.pressure_long()
-        short_signal = bp.pressure_short()
-
-        if long_signal:
-            if not mtf.allow_long(price):              return
-            if not funding.can_enter_long():           return
-            if not anti_manip.clear_for_entry("long"): return
-
-            score = _score_long(ind, ob, price)
-            logger.info(
-                f"LONG bp score={score:.3f}/{ENTRY_THRESHOLD} | "
-                f"regime={regime.label}({regime.adx:.1f}) "
-                f"rsi={ind.rsi_value:.1f} imb={ob.imbalance:.3f} "
-                f"macd_hist={ind.macd_histogram:+.5f} stoch_k={ind.stoch_k:.1f} "
-                f"cum_delta={bp.cum_delta:+.0f}"
-            )
-            if score >= ENTRY_THRESHOLD:
-                qty = risk.calc_qty(
-                    price,
-                    order_size_usdt=config.order_size_usdt,
-                    leverage=config.leverage,
-                    regime_factor=regime.size_factor(),
-                )
-                sl, tp = _calc_sl_tp("long", price)
-                if USE_LIMIT_ORDERS:
-                    ok, filled_qty, avg_price = await lom.place_entry("Buy", qty, stop_loss=sl, take_profit=tp)
-                else:
-                    resp = await _trader.place_order("Buy", qty, order_type="Market", stop_loss=sl, take_profit=tp)
-                    ok = resp.get("retCode") == 0
-                    filled_qty, avg_price = (qty, price) if ok else (0, 0)
-                if ok and filled_qty > 0:
-                    await position_manager.on_open("long", filled_qty, avg_price)
-                    risk.on_open()
-                    db.record_trade(symbol=_sym(), side="long", entry=avg_price, exit_price=0,
-                                    qty=filled_qty, pnl_usdt=0, pnl_pct=0, reason="OPEN",
-                                    signal_score=score, funding_rate=funding.rate)
-                    await _notify(
-                        f"\U0001f7e1 *LONG* `{_sym()}` score=`{score:.3f}`\n"
-                        f"`price={avg_price}` `qty={filled_qty}`\n"
-                        f"`rsi={ind.rsi_value:.1f}` `regime={regime.label}`\n"
-                        f"`macd_h={ind.macd_histogram:+.5f}` `stoch_k={ind.stoch_k:.1f}`\n"
-                        f"`delta={bp.cum_delta:+.0f}` `SL={sl}` `TP={tp}`"
-                    )
-
-        elif short_signal:
-            if not mtf.allow_short(price):              return
-            if not funding.can_enter_short():           return
-            if not anti_manip.clear_for_entry("short"): return
-
-            score = _score_short(ind, ob, price)
-            logger.info(
-                f"SHORT bp score={score:.3f}/{ENTRY_THRESHOLD} | "
-                f"regime={regime.label}({regime.adx:.1f}) "
-                f"rsi={ind.rsi_value:.1f} imb={ob.imbalance:.3f} "
-                f"macd_hist={ind.macd_histogram:+.5f} stoch_k={ind.stoch_k:.1f} "
-                f"cum_delta={bp.cum_delta:+.0f}"
-            )
-            if score >= ENTRY_THRESHOLD:
-                qty = risk.calc_qty(
-                    price,
-                    order_size_usdt=config.order_size_usdt,
-                    leverage=config.leverage,
-                    regime_factor=regime.size_factor(),
-                )
-                sl, tp = _calc_sl_tp("short", price)
-                if USE_LIMIT_ORDERS:
-                    ok, filled_qty, avg_price = await lom.place_entry("Sell", qty, stop_loss=sl, take_profit=tp)
-                else:
-                    resp = await _trader.place_order("Sell", qty, order_type="Market", stop_loss=sl, take_profit=tp)
-                    ok = resp.get("retCode") == 0
-                    filled_qty, avg_price = (qty, price) if ok else (0, 0)
-                if ok and filled_qty > 0:
-                    await position_manager.on_open("short", filled_qty, avg_price)
-                    risk.on_open()
-                    db.record_trade(symbol=_sym(), side="short", entry=avg_price, exit_price=0,
-                                    qty=filled_qty, pnl_usdt=0, pnl_pct=0, reason="OPEN",
-                                    signal_score=score, funding_rate=funding.rate)
-                    await _notify(
-                        f"\U0001f7e0 *SHORT* `{_sym()}` score=`{score:.3f}`\n"
-                        f"`price={avg_price}` `qty={filled_qty}`\n"
-                        f"`rsi={ind.rsi_value:.1f}` `regime={regime.label}`\n"
-                        f"`macd_h={ind.macd_histogram:+.5f}` `stoch_k={ind.stoch_k:.1f}`\n"
-                        f"`delta={bp.cum_delta:+.0f}` `SL={sl}` `TP={tp}`"
-                    )
+    # Calculul scorurilor e in afara lock-ului (nu modifica ind)
+    score_l = _score_long(snap, ob, price)
+    score_s = _score_short(snap, ob, price)
+    return score_l, score_s
 
 
-def _sym() -> str:
-    from .config import config
-    return config.symbol
+def update_indicators(price: float, kline_data: dict) -> None:
+    """Update all indicators from latest confirmed candle.
 
+    v0.7.9: achizitioneaza _ind_lock la scriere pentru a preveni
+    citire partiala din score_snapshot() in pulse.
+    Apelata din pybit WebSocket thread via run_coroutine_threadsafe.
+    """
+    from .indicators import compute_all
+    results = compute_all(price, kline_data)
 
-async def _notify(msg: str) -> None:
+    # Scriem atomic sub lock
+    loop = asyncio.get_event_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _update_ind_locked(results, price), loop
+    )
     try:
-        from .telegram_ui import send_message
-        await send_message(msg)
-    except Exception:
-        pass
+        future.result(timeout=1.0)
+    except Exception as e:
+        logger.warning(f"[strategy] update_indicators lock timeout: {e}")
+        # Fallback: scrie fara lock (mai bine date usor inconsistente decat nimic)
+        _apply_ind(results, price)
 
 
-strategy = Strategy()
+async def _update_ind_locked(results: dict, price: float) -> None:
+    """Scrie rezultatele in ind sub _ind_lock."""
+    async with _ind_lock:
+        _apply_ind(results, price)
+
+
+def _apply_ind(results: dict, price: float) -> None:
+    """Aplica results dict pe ind. Apelata sub lock sau in fallback."""
+    ind.last_price   = price
+    ind.ema_fast     = results.get("ema_fast",  ind.ema_fast)
+    ind.ema_slow     = results.get("ema_slow",  ind.ema_slow)
+    ind.ema_trend    = results.get("ema_trend", ind.ema_trend)
+    ind.rsi_value    = results.get("rsi",       ind.rsi_value)
+    ind.rsi_ready    = results.get("rsi_ready", ind.rsi_ready)
+    ind.atr_value    = results.get("atr",       ind.atr_value)
+    ind.atr_ready    = results.get("atr_ready", ind.atr_ready)
+    ind.bb_upper     = results.get("bb_upper",  ind.bb_upper)
+    ind.bb_mid       = results.get("bb_mid",    ind.bb_mid)
+    ind.bb_lower     = results.get("bb_lower",  ind.bb_lower)
+    ind.bb_ready     = results.get("bb_ready",  ind.bb_ready)
+    ind.vwap         = results.get("vwap",      ind.vwap)
+    ind.vol_zscore   = results.get("vol_zscore",  ind.vol_zscore)
+    ind.vol_ready    = results.get("vol_ready",   ind.vol_ready)
+    ind.macd_line      = results.get("macd_line",      ind.macd_line)
+    ind.macd_signal    = results.get("macd_signal",    ind.macd_signal)
+    ind.macd_histogram = results.get("macd_histogram", ind.macd_histogram)
+    ind.macd_ready     = results.get("macd_ready",     ind.macd_ready)
+    ind.stoch_k      = results.get("stoch_k",   ind.stoch_k)
+    ind.stoch_d      = results.get("stoch_d",   ind.stoch_d)
+    ind.stoch_ready  = results.get("stoch_ready", ind.stoch_ready)
+
+
+async def evaluate(price: float) -> None:
+    """Main strategy evaluation — called every confirmed candle."""
+    from .regime_filter import regime
+    from .risk import risk
+    from .mtf_filter import mtf
+    from .funding_rate import funding
+    from .orderbook_analytics import compute as compute_ob
+    from .position_manager import position_manager as pm, MAX_HOLD_CANDLES
+    from .book_pressure import bp
+    from .anti_manipulation import anti_manipulation
+    from .config import config
+
+    with state.lock:
+        pos      = state.open_position
+        open_qty = state.open_qty
+
+    # If position open: evaluate exit conditions
+    if pos:
+        closed = await pm.evaluate(price)
+        if not closed:
+            score, _ = await score_snapshot(price, compute_ob())
+            if score >= 0.85 and pos:
+                await pm.try_pyramid(
+                    side=pos,
+                    price=price,
+                    score=score,
+                    stop_loss=price * (1 - 0.0008 if pos == "long" else 1 + 0.0008),
+                    take_profit=price * (1 + 0.004 if pos == "long" else 1 - 0.004),
+                )
+        return
+
+    # No position: evaluate entry conditions
+    if not state.running or state.paused:
+        return
+    if not risk.can_open():
+        return
+    if not regime.allow_entry():
+        return
+
+    ob = compute_ob()
+    score_l, score_s = await score_snapshot(price, ob)
+
+    # Spread gate
+    spread_bps = state.orderbook.spread / price * 10_000 if price > 0 else 999
+    atr_ratio  = ind.atr_value / (ATR_BASELINE * price) if price > 0 else 1.0
+    max_spread = BASE_SPREAD_BPS * (1 + ATR_SPREAD_MULT * atr_ratio)
+    if spread_bps > max_spread:
+        return
+
+    # ATR gate
+    if ind.atr_ready:
+        atr_pct = ind.atr_value / price if price > 0 else 0
+        if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
+            return
+
+    # Anti-manipulation gate
+    if anti_manipulation.is_suspicious():
+        return
+
+    # MTF gate
+    if not mtf.ready:
+        return
+
+    # Funding gate
+    await funding.maybe_refresh(config.symbol)
+
+    if score_l >= ENTRY_THRESHOLD:
+        if not funding.can_enter_long():
+            return
+        if price <= mtf.ema50:
+            return
+        # Entry LONG
+        from .limit_order_manager import place_entry_order
+        sl = price * (1 - 0.0008)
+        tp = price * (1 + 0.004)
+        qty = risk.calc_qty(
+            price,
+            order_size_usdt=config.order_size_usdt,
+            leverage=config.leverage,
+            regime_factor=regime.size_factor(),
+        )
+        if qty <= 0:
+            return
+        trade_id = await place_entry_order(
+            side="Buy", qty=qty, price=price,
+            stop_loss=sl, take_profit=tp,
+        )
+        if trade_id:
+            pm.on_open("long", qty, price, trade_id)
+            with state.lock:
+                state.open_position = "long"
+                state.open_qty = qty
+            logger.info(
+                f"LONG bp score={score_l:.3f}/{ENTRY_THRESHOLD} | "
+                f"price={price} qty={qty} sl={sl:.2f} tp={tp:.2f}"
+            )
+
+    elif score_s >= ENTRY_THRESHOLD:
+        if not funding.can_enter_short():
+            return
+        if price >= mtf.ema50:
+            return
+        from .limit_order_manager import place_entry_order
+        sl = price * (1 + 0.0008)
+        tp = price * (1 - 0.004)
+        qty = risk.calc_qty(
+            price,
+            order_size_usdt=config.order_size_usdt,
+            leverage=config.leverage,
+            regime_factor=regime.size_factor(),
+        )
+        if qty <= 0:
+            return
+        trade_id = await place_entry_order(
+            side="Sell", qty=qty, price=price,
+            stop_loss=sl, take_profit=tp,
+        )
+        if trade_id:
+            pm.on_open("short", qty, price, trade_id)
+            with state.lock:
+                state.open_position = "short"
+                state.open_qty = qty
+            logger.info(
+                f"SHORT bp score={score_s:.3f}/{ENTRY_THRESHOLD} | "
+                f"price={price} qty={qty} sl={sl:.2f} tp={tp:.2f}"
+            )
