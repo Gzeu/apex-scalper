@@ -1,10 +1,14 @@
-"""Entrypoint v0.4.1.
+"""Entrypoint v0.6.1.
 
-Changes vs v0.4.0:
-- MTF refresh called SYNCHRONOUSLY before state.running=True
-  (fix: first candle no longer processes without MTF data)
-- inject_profile() now also calls inject_wall_params() for anti-manipulation
-- Startup banner includes MTF EMA50 status
+Changes vs v0.4.1:
+  - Imports aligned with v0.6.0 module names:
+    run_watchdog (alias for watchdog_loop)
+    run_daily_report_loop (alias for schedule_daily_report)
+  - inject_profile() now also injects RSI_OB_PENALTY / RSI_OS_PENALTY
+  - trader.get_instrument_info() called at startup (tickSize, qtyStep, minQty)
+  - trader.set_position_mode() enforced at startup (already in trader.setup())
+  - Startup banner shows fee schedule + instrument info
+  - Version bump v0.4.1 -> v0.6.1
 """
 from __future__ import annotations
 
@@ -49,6 +53,7 @@ def inject_profile(symbol: str) -> None:
 
     p = SYMBOL_PROFILES.get(symbol, SYMBOL_PROFILES["BTCUSDT"])
 
+    # Strategy signal params
     sm.RSI_LONG_MIN    = p["rsi_long_min"]
     sm.RSI_SHORT_MAX   = p["rsi_short_max"]
     sm.IMBALANCE_LONG  = p["imbalance_long"]
@@ -56,12 +61,17 @@ def inject_profile(symbol: str) -> None:
     sm.VOL_ZSCORE_MIN  = p["vol_zscore_min"]
     sm.ATR_MIN_PCT     = p["atr_min_pct"]
     sm.ATR_MAX_PCT     = p["atr_max_pct"]
-    sm.ENTRY_THRESHOLD = p["entry_threshold"]
+    sm.ENTRY_THRESHOLD = p.get("entry_threshold", 0.65)
+    # RSI overbought/oversold penalty thresholds (v0.6.0)
+    sm.RSI_OB_PENALTY  = p.get("rsi_ob_penalty", 65.0)
+    sm.RSI_OS_PENALTY  = p.get("rsi_os_penalty", 35.0)
 
+    # Risk params
     rm.MAX_SPREAD_BPS = p["max_spread_bps"]
     rm.MIN_BID_DEPTH  = p["min_bid_depth"]
     rm.MIN_ASK_DEPTH  = p["min_ask_depth"]
 
+    # Position manager params
     pm.TP1_PCT          = p["tp1_pct"]
     pm.TP2_PCT          = p["tp2_pct"]
     pm.SL_PCT           = p["sl_pct"]
@@ -69,7 +79,7 @@ def inject_profile(symbol: str) -> None:
     pm.TRAIL_DELTA      = p["trail_delta"]
     pm.MAX_HOLD_CANDLES = p["max_hold_candles"]
 
-    # Anti-manipulation: per-symbol thresholds (v0.4.1)
+    # Anti-manipulation per-symbol thresholds
     inject_wall_params(
         wall_ratio=p.get("wall_ratio", 8.0),
         wall_distance_ticks=p.get("wall_distance_ticks", 5),
@@ -79,8 +89,9 @@ def inject_profile(symbol: str) -> None:
         f"✅ Profile injected [{symbol}]: "
         f"TP1={p['tp1_pct']:.4f} TP2={p['tp2_pct']:.4f} "
         f"SL={p['sl_pct']:.4f} lev={p['leverage']}x "
-        f"threshold={p['entry_threshold']} "
-        f"wall={p.get('wall_ratio',8)}x@{p.get('wall_distance_ticks',5)}"
+        f"threshold={p.get('entry_threshold', 0.65)} "
+        f"RSI_OB_penalty={p.get('rsi_ob_penalty', 65.0)} "
+        f"wall={p.get('wall_ratio', 8.0)}x@{p.get('wall_distance_ticks', 5)}"
     )
 
 
@@ -88,7 +99,8 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
     logger.warning("🛑 Shutdown — closing position if open...")
     state.running = False
     try:
-        await trader.close_position()
+        # Emergency close: use_limit=False for immediate Market exit
+        await trader.close_position(use_limit=False)
     except Exception as e:
         logger.error(f"Shutdown close_position error: {e}")
     if tg_app:
@@ -110,22 +122,23 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
 
 async def main() -> None:
     setup_logging()
+
+    env_label = "TESTNET" if config.testnet else "⚠️  MAINNET"
     logger.info(
-        f"⚡ Apex Scalper v0.4.1 | {config.symbol} | "
-        f"{'TESTNET' if config.testnet else '⚠️  MAINNET'} | "
-        f"lev={config.leverage}x size={config.order_size_usdt}USDT"
+        f"⚡ Apex Scalper v0.6.1 | {config.symbol} | "
+        f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
-    # 1. Per-symbol params (incl. anti-manip wall params)
+    # 1. Per-symbol params
     inject_profile(config.symbol)
 
-    # 2. Async trader setup
+    # 2. Trader setup: session, OneWay mode, leverage, instrument_info, fee schedule
     await trader.setup()
 
-    # 3. Sync position from exchange
+    # 3. Sync open position from exchange (survive restarts)
     await trader.sync_position_from_exchange()
 
-    # 4. Restore today's PnL from SQLite
+    # 4. Restore today's PnL / trade stats from SQLite
     daily_pnl, total_trades, win_trades = db.load_daily_pnl(config.symbol)
     with state.lock:
         state.daily_pnl    = daily_pnl
@@ -137,9 +150,8 @@ async def main() -> None:
             f"trades={total_trades} wr={round(win_trades/total_trades*100,1)}%"
         )
 
-    # 5. ── CRITICAL FIX v0.4.1 ──
-    # MTF refresh SYNCHRONOUSLY before state.running=True.
-    # The strategy will NOT process any candle until MTF is ready.
+    # 5. MTF refresh SYNCHRONOUSLY before state.running=True
+    #    Entries are BLOCKED until MTF is ready (no pass-through on first candle)
     logger.info("Fetching MTF EMA50(15m) before starting feed...")
     await mtf.refresh(config.symbol)
     if mtf.ready:
@@ -149,11 +161,10 @@ async def main() -> None:
         )
     else:
         logger.warning(
-            "MTF fetch failed — entries will be BLOCKED until first successful refresh. "
-            "Bot will start but wait for MTF data before any entry."
+            "MTF fetch failed — entries BLOCKED until first successful refresh."
         )
 
-    loop = asyncio.get_running_loop()
+    loop   = asyncio.get_running_loop()
     tg_app = None
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -161,7 +172,7 @@ async def main() -> None:
             sig, lambda: asyncio.create_task(_shutdown(loop, tg_app))
         )
 
-    # 6. Telegram
+    # 6. Telegram bot
     if config.telegram_token:
         tg_app = build_app()
         await tg_app.initialize()
@@ -171,14 +182,19 @@ async def main() -> None:
     else:
         logger.warning("TELEGRAM_TOKEN not set — Telegram disabled")
 
-    # 7. Background tasks
-    asyncio.create_task(run_watchdog())
+    # 7. Background tasks — all names now match module exports
+    asyncio.create_task(run_watchdog())                        # watchdog_loop alias
     asyncio.create_task(run_mtf_refresh_loop(config.symbol))
     asyncio.create_task(run_funding_refresh_loop(config.symbol))
-    asyncio.create_task(run_daily_report_loop(config.symbol))
-    logger.info("Background tasks: watchdog | MTF | funding | daily_report")
+    asyncio.create_task(run_daily_report_loop(config.symbol))  # schedule_daily_report alias
+    logger.info("Background tasks: watchdog | MTF | funding | daily_report ✅")
 
-    # 8. WS feed
+    # 8. Mark bot as running AFTER all setup complete
+    with state.lock:
+        state.running = True
+    logger.info("state.running = True — strategy active")
+
+    # 9. WS feed (blocking)
     await start_feed()
 
 
