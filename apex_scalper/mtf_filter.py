@@ -1,16 +1,12 @@
-"""Multi-TimeFrame (MTF) trend filter v0.7.5.
+"""Multi-TimeFrame (MTF) trend filter v0.8.3.
 
-Fix v0.7.5:
-  trader._session does not exist. Trader exposes _client (pybit HTTP).
-  All references to trader._session replaced with trader._client.
-  Crashed with AttributeError at startup before any candle was processed.
-
-Fix vs v0.4.0:
-  _ready initialized to False, background loop is separate.
-  main.py calls await mtf.refresh() synchronously before state.running=True
-  so the first candle is never processed without MTF confirmation.
-  If refresh fails at startup, MTF stays not ready (_ready=False)
-  and allow_long/allow_short return False (block entries) until ready.
+Changelog:
+  v0.8.3 — BUG 16 FIX: asyncio.Lock() creat in __init__() la import-time.
+    Python 3.10+: DeprecationWarning. Python 3.12+: RuntimeError
+    ('got Future attached to a different loop').
+    Fix: lock creat lazy la primul apel async (if not self._lock).
+  v0.7.5 — trader._session -> trader._client fix.
+  v0.4.0 — _ready=False safe default, block entries until MTF ready.
 """
 from __future__ import annotations
 
@@ -30,13 +26,20 @@ MTF_LOOKBACK    = 100
 class MTFFilter:
     def __init__(self):
         self._ema50: float = 0.0
-        self._ready: bool = False      # False = block entries (safe default)
-        self._lock = asyncio.Lock()
+        self._ready: bool  = False
+        # BUG 16 FIX: nu cream Lock la import-time (inainte de event loop)
+        # Lock-ul e creat lazy la primul apel async
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy lock creation — safe pe orice versiune Python >= 3.10."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def refresh(self, symbol: Optional[str] = None) -> None:
         """Fetch 15m candles and compute EMA50. Sets _ready=True on success."""
         sym = symbol or config.symbol
-        # v0.7.5 fix: trader exposes _client, not _session
         if not trader._client:
             logger.warning("MTF: trader._client not ready (call trader.setup() first)")
             return
@@ -62,8 +65,8 @@ class MTFFilter:
             for c in closes[1:]:
                 ema = c * k + ema * (1 - k)
 
-            self._ema50  = ema
-            self._ready  = True
+            self._ema50 = ema
+            self._ready = True
             logger.info(
                 f"MTF EMA50(15m) [{sym}]: {ema:.4f} | "
                 f"price_ref={closes[-1]:.4f} "
@@ -71,16 +74,13 @@ class MTFFilter:
             )
         except Exception as e:
             logger.warning(f"MTF refresh error: {e}")
-            # _ready stays False — entries blocked until next successful fetch
 
     def allow_long(self, price: float) -> bool:
-        """Block LONG if MTF not ready or price below 15m EMA50."""
         if not self._ready:
             return False
         return price > self._ema50
 
     def allow_short(self, price: float) -> bool:
-        """Block SHORT if MTF not ready or price above 15m EMA50."""
         if not self._ready:
             return False
         return price < self._ema50

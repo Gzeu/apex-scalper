@@ -1,9 +1,10 @@
-"""Funding rate awareness v0.7.6 — fetch + cache + risk filter.
+"""Funding rate awareness v0.8.3.
 
 Changelog:
-  v0.7.6 — BUG FIX: trader._session -> trader._client (same class of bug
-             as mtf_filter.py fixed in v0.7.5). Caused AttributeError
-             on every refresh cycle — funding gate was silently disabled.
+  v0.8.3 — BUG 16 FIX: asyncio.Lock() creat in __init__() la import-time.
+    Acelasi bug ca mtf_filter.py. Python 3.12+: RuntimeError la primul
+    maybe_refresh() apel. Fix: lock creat lazy.
+  v0.7.6 — trader._session -> trader._client fix.
 
 Bybit pays/charges funding every 8h (00:00, 08:00, 16:00 UTC).
 Rules applied:
@@ -21,8 +22,8 @@ from loguru import logger
 from .config import config
 from .trader import trader
 
-FUNDING_RATE_SKIP_PCT = float(0.0001)   # 0.01%
-FUNDING_TIME_BUFFER_S = 300             # 5 min before funding payment
+FUNDING_RATE_SKIP_PCT = float(0.0001)
+FUNDING_TIME_BUFFER_S = 300
 CACHE_TTL_S           = 60
 
 
@@ -31,12 +32,17 @@ class FundingRateMonitor:
         self._rate: float = 0.0
         self._next_funding_ms: int = 0
         self._last_fetch: float = 0.0
-        self._lock = asyncio.Lock()
+        # BUG 16 FIX: lock creat lazy, nu la import-time
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy lock creation — safe pe orice versiune Python >= 3.10."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def refresh(self, symbol: Optional[str] = None) -> None:
-        """Fetch funding rate from Bybit. Called periodically."""
         sym = symbol or config.symbol
-        # v0.7.6 fix: trader exposes _client, not _session
         if not trader._client:
             return
         loop = asyncio.get_running_loop()
@@ -65,7 +71,7 @@ class FundingRateMonitor:
 
     async def maybe_refresh(self, symbol: Optional[str] = None) -> None:
         if time.time() - self._last_fetch > CACHE_TTL_S:
-            async with self._lock:
+            async with self._get_lock():
                 if time.time() - self._last_fetch > CACHE_TTL_S:
                     await self.refresh(symbol)
 
