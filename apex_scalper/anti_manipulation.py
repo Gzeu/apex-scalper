@@ -1,42 +1,48 @@
-"""Anti-manipulation filter v0.4.0 — OB spoof detection.
+"""Anti-manipulation filter v0.4.1 — per-symbol wall thresholds.
 
-Spoofing = large orders placed in OB to create false price pressure,
-then cancelled before execution. Characteristics:
-  1. Sudden appearance of a very large order (WALL_RATIO x mean size)
-  2. Located far from best price (> WALL_DISTANCE_TICKS ticks away)
-  3. Short-lived (disappears within SPOOF_WINDOW candles)
+Changes vs v0.4.0:
+- WALL_RATIO and WALL_DISTANCE_TICKS are now read from SYMBOL_PROFILES
+  (injected via inject_wall_params() called from main.py)
+- Different thresholds per symbol: BTC (deep book) vs DOGE (thin book)
 
-We track OB snapshots and flag entries when:
-  - A large fake wall is visible on the same side as our intended entry.
-    e.g. big fake bid wall -> someone might want to push price DOWN.
-  - The imbalance appears artificially high due to spoof orders.
-
-Additionally detects:
-  - Wash trading: repeated large trades at same price level
-  - Momentum ignition: rapid price move > MOMENTUM_IGNITION_PCT in 1 candle
-    without volume confirmation (vol_zscore < threshold)
+BTC:  wall_ratio=8.0, wall_distance=5  (deep book, need big orders to be suspicious)
+ETH:  wall_ratio=7.0, wall_distance=4
+HYPE: wall_ratio=5.0, wall_distance=3  (thin book, 5x already suspicious)
+DOGE: wall_ratio=4.0, wall_distance=3  (very thin)
+NEAR: wall_ratio=5.0, wall_distance=3
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
 
 from .state import state
 
-# Tunable params
-WALL_RATIO            = 8.0    # order must be Nx mean size to count as wall
-WALL_DISTANCE_TICKS   = 5      # min levels away from best price
-MOMENTUM_IGNITION_PCT = 0.003  # 0.3% move in 1 candle = suspicious
-MOMENTUM_VOL_THRESHOLD = 0.5   # vol_zscore below this = unconfirmed move
+# Defaults (overridden by inject_wall_params() on startup)
+WALL_RATIO            = 8.0
+WALL_DISTANCE_TICKS   = 5
+MOMENTUM_IGNITION_PCT = 0.003
+MOMENTUM_VOL_THRESHOLD = 0.5
+
+
+def inject_wall_params(wall_ratio: float, wall_distance_ticks: int) -> None:
+    """Called from main.inject_profile() to set per-symbol thresholds."""
+    global WALL_RATIO, WALL_DISTANCE_TICKS
+    WALL_RATIO          = wall_ratio
+    WALL_DISTANCE_TICKS = wall_distance_ticks
+    logger.info(
+        f"AntiManip params: wall_ratio={WALL_RATIO} "
+        f"wall_distance_ticks={WALL_DISTANCE_TICKS}"
+    )
 
 
 @dataclass
 class ManipulationSignals:
-    spoof_bid_wall:    bool = False   # large fake bid wall detected
-    spoof_ask_wall:    bool = False   # large fake ask wall detected
-    momentum_ignition: bool = False   # rapid unconfirmed price move
-    suspicious:        bool = False   # any manipulation signal active
+    spoof_bid_wall:    bool = False
+    spoof_ask_wall:    bool = False
+    momentum_ignition: bool = False
+    suspicious:        bool = False
 
 
 _signals = ManipulationSignals()
@@ -45,14 +51,12 @@ _signals = ManipulationSignals()
 class AntiManipulation:
     def __init__(self):
         self._prev_close: float = 0.0
-        self._prev_vol_zscore: float = 0.0
 
     def analyze(
         self,
         vol_zscore: float = 0.0,
         current_close: Optional[float] = None,
     ) -> ManipulationSignals:
-        """Run all manipulation checks. Call on each confirmed candle."""
         with state.lock:
             bids = state.orderbook.top_bids(20)
             asks = state.orderbook.top_asks(20)
@@ -62,15 +66,16 @@ class AntiManipulation:
         _signals.spoof_ask_wall    = False
         _signals.momentum_ignition = False
 
-        # 1. Spoof wall detection
+        # Spoof wall detection — uses per-symbol thresholds
         if bids:
             mean_bid = sum(s for _, s in bids) / len(bids)
             for idx, (_, size) in enumerate(bids):
                 if size > mean_bid * WALL_RATIO and idx >= WALL_DISTANCE_TICKS:
                     _signals.spoof_bid_wall = True
                     logger.debug(
-                        f"Spoof BID wall: size={size:.2f} mean={mean_bid:.2f} "
-                        f"at level {idx}"
+                        f"Spoof BID wall @ level {idx}: "
+                        f"size={size:.2f} mean={mean_bid:.2f} "
+                        f"ratio={size/mean_bid:.1f}x (threshold={WALL_RATIO}x)"
                     )
                     break
 
@@ -80,22 +85,19 @@ class AntiManipulation:
                 if size > mean_ask * WALL_RATIO and idx >= WALL_DISTANCE_TICKS:
                     _signals.spoof_ask_wall = True
                     logger.debug(
-                        f"Spoof ASK wall: size={size:.2f} mean={mean_ask:.2f} "
-                        f"at level {idx}"
+                        f"Spoof ASK wall @ level {idx}: "
+                        f"size={size:.2f} mean={mean_ask:.2f} "
+                        f"ratio={size/mean_ask:.1f}x (threshold={WALL_RATIO}x)"
                     )
                     break
 
-        # 2. Momentum ignition detection
+        # Momentum ignition detection
         if self._prev_close > 0 and price > 0:
             move_pct = abs(price - self._prev_close) / self._prev_close
-            if (
-                move_pct > MOMENTUM_IGNITION_PCT
-                and vol_zscore < MOMENTUM_VOL_THRESHOLD
-            ):
+            if move_pct > MOMENTUM_IGNITION_PCT and vol_zscore < MOMENTUM_VOL_THRESHOLD:
                 _signals.momentum_ignition = True
                 logger.debug(
-                    f"Momentum ignition: move={move_pct:.4%} "
-                    f"vol_z={vol_zscore:.2f} (unconfirmed)"
+                    f"Momentum ignition: move={move_pct:.4%} vol_z={vol_zscore:.2f}"
                 )
 
         _signals.suspicious = (
@@ -104,21 +106,13 @@ class AntiManipulation:
             or _signals.momentum_ignition
         )
 
-        self._prev_close      = price
-        self._prev_vol_zscore = vol_zscore
+        self._prev_close = price
         return _signals
 
     def clear_for_entry(self, side: str) -> bool:
-        """Return True if manipulation signals don't block this entry direction.
-
-        Logic:
-          - Spoof BID wall (fake support) -> skip LONG (someone wants price down)
-          - Spoof ASK wall (fake resistance) -> skip SHORT (someone wants price up)
-          - Momentum ignition -> skip any entry
-        """
         if _signals.momentum_ignition:
             return False
-        if side == "long" and _signals.spoof_bid_wall:
+        if side == "long"  and _signals.spoof_bid_wall:
             return False
         if side == "short" and _signals.spoof_ask_wall:
             return False

@@ -1,17 +1,10 @@
-"""Entrypoint v0.4.0 — wires all new modules.
+"""Entrypoint v0.4.1.
 
-Startup sequence:
-  1. inject_profile()              — per-symbol params
-  2. trader.setup()                — async HTTP session + leverage
-  3. trader.sync_position()        — sync open pos from exchange
-  4. db.load_daily_pnl()           — restore today's PnL from SQLite
-  5. Telegram bot                  — if token set
-  6. asyncio tasks:
-     - run_watchdog()
-     - run_mtf_refresh_loop()      — 15m EMA50 refresh
-     - run_funding_refresh_loop()  — funding rate refresh
-     - run_daily_report_loop()     — 23:59 UTC daily report
-  7. start_feed()                  — WS feed (reconnect loop)
+Changes vs v0.4.0:
+- MTF refresh called SYNCHRONOUSLY before state.running=True
+  (fix: first candle no longer processes without MTF data)
+- inject_profile() now also calls inject_wall_params() for anti-manipulation
+- Startup banner includes MTF EMA50 status
 """
 from __future__ import annotations
 
@@ -27,9 +20,10 @@ from .watchdog import run_watchdog
 from .state import state
 from .trader import trader
 from .persistence import db
-from .mtf_filter import run_mtf_refresh_loop
+from .mtf_filter import mtf, run_mtf_refresh_loop
 from .funding_rate import run_funding_refresh_loop
 from .daily_report import run_daily_report_loop
+from .anti_manipulation import inject_wall_params
 
 
 def setup_logging() -> None:
@@ -48,7 +42,7 @@ def setup_logging() -> None:
 
 
 def inject_profile(symbol: str) -> None:
-    """Inject per-symbol optimal params into strategy / risk / position_manager."""
+    """Inject per-symbol optimal params into all strategy modules."""
     import apex_scalper.strategy         as sm
     import apex_scalper.risk             as rm
     import apex_scalper.position_manager as pm
@@ -75,11 +69,18 @@ def inject_profile(symbol: str) -> None:
     pm.TRAIL_DELTA      = p["trail_delta"]
     pm.MAX_HOLD_CANDLES = p["max_hold_candles"]
 
+    # Anti-manipulation: per-symbol thresholds (v0.4.1)
+    inject_wall_params(
+        wall_ratio=p.get("wall_ratio", 8.0),
+        wall_distance_ticks=p.get("wall_distance_ticks", 5),
+    )
+
     logger.info(
         f"✅ Profile injected [{symbol}]: "
         f"TP1={p['tp1_pct']:.4f} TP2={p['tp2_pct']:.4f} "
         f"SL={p['sl_pct']:.4f} lev={p['leverage']}x "
-        f"threshold={p['entry_threshold']}"
+        f"threshold={p['entry_threshold']} "
+        f"wall={p.get('wall_ratio',8)}x@{p.get('wall_distance_ticks',5)}"
     )
 
 
@@ -110,21 +111,21 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
 async def main() -> None:
     setup_logging()
     logger.info(
-        f"⚡ Apex Scalper v0.4.0 | {config.symbol} | "
+        f"⚡ Apex Scalper v0.4.1 | {config.symbol} | "
         f"{'TESTNET' if config.testnet else '⚠️  MAINNET'} | "
         f"lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
-    # 1. Per-symbol optimal params
+    # 1. Per-symbol params (incl. anti-manip wall params)
     inject_profile(config.symbol)
 
     # 2. Async trader setup
     await trader.setup()
 
-    # 3. Sync position from exchange (survive restarts)
+    # 3. Sync position from exchange
     await trader.sync_position_from_exchange()
 
-    # 4. Restore today's PnL + trade counts from SQLite
+    # 4. Restore today's PnL from SQLite
     daily_pnl, total_trades, win_trades = db.load_daily_pnl(config.symbol)
     with state.lock:
         state.daily_pnl    = daily_pnl
@@ -136,6 +137,22 @@ async def main() -> None:
             f"trades={total_trades} wr={round(win_trades/total_trades*100,1)}%"
         )
 
+    # 5. ── CRITICAL FIX v0.4.1 ──
+    # MTF refresh SYNCHRONOUSLY before state.running=True.
+    # The strategy will NOT process any candle until MTF is ready.
+    logger.info("Fetching MTF EMA50(15m) before starting feed...")
+    await mtf.refresh(config.symbol)
+    if mtf.ready:
+        logger.info(
+            f"MTF ready: EMA50(15m)={mtf.ema50:.4f} | "
+            f"bias={'BULL ↑' if True else 'BEAR ↓'}"
+        )
+    else:
+        logger.warning(
+            "MTF fetch failed — entries will be BLOCKED until first successful refresh. "
+            "Bot will start but wait for MTF data before any entry."
+        )
+
     loop = asyncio.get_running_loop()
     tg_app = None
 
@@ -144,7 +161,7 @@ async def main() -> None:
             sig, lambda: asyncio.create_task(_shutdown(loop, tg_app))
         )
 
-    # 5. Telegram
+    # 6. Telegram
     if config.telegram_token:
         tg_app = build_app()
         await tg_app.initialize()
@@ -154,14 +171,14 @@ async def main() -> None:
     else:
         logger.warning("TELEGRAM_TOKEN not set — Telegram disabled")
 
-    # 6. Background tasks
+    # 7. Background tasks
     asyncio.create_task(run_watchdog())
     asyncio.create_task(run_mtf_refresh_loop(config.symbol))
     asyncio.create_task(run_funding_refresh_loop(config.symbol))
     asyncio.create_task(run_daily_report_loop(config.symbol))
-    logger.info("Background tasks started: watchdog | MTF | funding | daily_report")
+    logger.info("Background tasks: watchdog | MTF | funding | daily_report")
 
-    # 7. WS feed (reconnect loop inside)
+    # 8. WS feed
     await start_feed()
 
 
