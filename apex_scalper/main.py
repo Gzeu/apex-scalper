@@ -1,10 +1,8 @@
-"""Entrypoint v0.7.7.
+"""Entrypoint v0.7.8.
 
-New in v0.7.7 vs v0.7.1:
-  - pulse.py: loop 1 minut cu snapshot complet pe Telegram
-  - health.py: HTTP /health /metrics /metrics/prometheus (port 8080)
-  - analytics.py: breakdown per semnal/ora/streak in daily_report
-  - telegram_ui.py: /analytics /tp /funding /pulse on|off + fix /pause
+New in v0.7.8 vs v0.7.7:
+  - log_sink.py: structured JSON logs in logs/apex_structured.jsonl
+    Zero dependente noi. Parsabil cu jq din terminal sau Grafana Loki.
 """
 from __future__ import annotations
 
@@ -28,21 +26,26 @@ from .regime_filter import regime
 from .book_pressure import bp
 from .pulse import run_pulse_loop
 from .health import start_health_server
+from .log_sink import setup_json_sink
 
 
 def setup_logging() -> None:
     logger.remove()
+    # Sink 1: stderr (color, human readable)
     logger.add(
         sys.stderr,
         level=config.log_level,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
     )
+    # Sink 2: text file rotativ
     logger.add(
         "logs/apex_scalper.log",
         rotation="10 MB",
         retention="14 days",
         level=config.log_level,
     )
+    # Sink 3: JSON structurat (parsabil jq / Grafana Loki)
+    setup_json_sink()
 
 
 def inject_profile(symbol: str) -> None:
@@ -101,7 +104,7 @@ def inject_profile(symbol: str) -> None:
     )
 
     logger.info(
-        f"✅ Profile injected [{symbol}]: "
+        f"\u2705 Profile injected [{symbol}]: "
         f"TP1={p['tp1_pct']:.4f}({p.get('tp1_fraction',0.25):.0%}) "
         f"TP2={p['tp2_pct']:.4f}({p.get('tp2_fraction',0.25):.0%}) "
         f"TP3={p.get('tp3_pct',0.0035):.4f}({p.get('tp3_fraction',0.50):.0%}) "
@@ -151,7 +154,7 @@ async def main() -> None:
     setup_logging()
     env_label = "TESTNET" if config.testnet else "⚠️  MAINNET"
     logger.info(
-        f"⚡ Apex Scalper v0.7.7 | {config.symbol} | "
+        f"⚡ Apex Scalper v0.7.8 | {config.symbol} | "
         f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
@@ -177,7 +180,6 @@ async def main() -> None:
     else:
         logger.warning("MTF fetch failed — entries BLOCKED until first successful refresh.")
 
-    # Health server HTTP (port 8080) — background thread, non-blocking
     start_health_server()
 
     loop   = asyncio.get_running_loop()
@@ -209,7 +211,8 @@ async def main() -> None:
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.7.7 active\n"
+        f"state.running = True — strategy v0.7.8 active\n"
+        f"  JSON logs:   logs/apex_structured.jsonl (jq parsabil)\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"
         f"  Scale-out:   TP1={pm_info()} | Kelly active after 20 trades"
