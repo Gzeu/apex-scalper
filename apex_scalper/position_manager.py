@@ -1,14 +1,18 @@
-"""Position Manager v1.1.0 — TP/SL/Trail citite din profil per symbol.
+"""Position Manager v1.2.0 — Breakeven SL dupa TP1 + timeout smart exit.
 
 Changelog:
-  v1.1.0 — BUG CRITIC FIX:
-    TP1/TP2/TP3/SL/TRAIL_PCT/TRAIL_DELTA/MAX_HOLD_CANDLES/MAX_PYRAMID_ADDS
-    erau hardcodate cu valorile BTCUSDT. Acum sunt citite din
-    config.profile(config.symbol) la fiecare evaluate() si on_open().
-    Fara acest fix, DOGEUSDT iesea pe SL la 0.08% (BTC) in loc de 0.20%
-    si lua TP1 la 0.12% in loc de 0.30% -> trade-uri pierdute pe comision.
+  v1.2.0 — WIN RATE FIX:
+    BREAKEVEN SL: imediat dupa TP1 hit, SL-ul e mutat la
+      entry_price + ROUND_TRIP_FEE (long) sau entry_price - fee (short).
+      Efectul: restul de 60% din pozitie NU POATE iesi pe minus.
+      Cel mai rau caz dupa TP1 = breakeven (0 USDT pierdut).
+    TIMEOUT SMART EXIT: daca pozitia expira pe timeout si pnl > 0
+      inchide cu profit (chiar mic). Daca pnl < 0 si tp1 deja hit
+      (breakeven activ) inchide oricum (e garantat aproape de 0).
+      Daca pnl < 0 si tp1 nu e hit -> mai asteapta 2 candle-uri extra
+      inainte de close fortat (max_hold + 2).
+  v1.1.0 — TP/SL/Trail citite din profil per symbol.
   v1.0.2 — Telegram notificari complete.
-  v0.9.4 — pyramid margin check.
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ from .risk import risk
 from .persistence import db
 
 # --------------------------------------------------------------------------- #
-#  Parametri fallback (folositi daca profilul lipseste)
+#  Parametri fallback
 # --------------------------------------------------------------------------- #
 _DEFAULT_TP1_PCT       = 0.0030
 _DEFAULT_TP2_PCT       = 0.0060
@@ -36,18 +40,21 @@ _DEFAULT_TRAIL_DELTA   = 0.0010
 _DEFAULT_MAX_HOLD      = 4
 _DEFAULT_MAX_PYRAMID   = 0
 
+# Comision Bybit taker dus-intors = 0.055% x 2
+ROUND_TRIP_FEE         = 0.00055 * 2   # 0.0011
+# Extra candle-uri de gratie daca pozitia e pe minus si TP1 nu e hit
+_TIMEOUT_GRACE         = 2
+
 PYRAMID_SCORE_MIN      = 0.70
 PYRAMID_PNL_MIN        = 0.0010
 PYRAMID_MARGIN_BUFFER  = 1.5
 CONFIRM_POLL_INTERVAL  = 0.5
 CONFIRM_POLL_MAX       = 8
 
-# Expus pentru import in strategy.py
 MAX_HOLD_CANDLES = _DEFAULT_MAX_HOLD
 
 
 def _get_profile() -> dict:
-    """Returneaza profilul activ pentru symbolul curent."""
     try:
         from .config import config
         return config.profile(config.symbol)
@@ -56,7 +63,6 @@ def _get_profile() -> dict:
 
 
 def _p(key: str, default):
-    """Citeste o valoare din profilul activ cu fallback la default."""
     return _get_profile().get(key, default)
 
 
@@ -80,6 +86,7 @@ class PositionSnapshot:
     hold_candles: int
     pyramid_adds: int
     trade_id:     int | None
+    breakeven_set: bool
 
     def unrealised_pnl_pct(self, current_price: float) -> float:
         if self.entry_price <= 0:
@@ -121,6 +128,7 @@ class PositionManager:
         self._entry_qty      = 0.0
         self._entry_side     = ""
         self._trade_id: int | None = None
+        self._breakeven_set  = False
         self._snapshot_lock  = asyncio.Lock()
 
     def _reset_fields(self) -> None:
@@ -135,6 +143,7 @@ class PositionManager:
         self._entry_qty      = 0.0
         self._entry_side     = ""
         self._trade_id       = None
+        self._breakeven_set  = False
 
     def reset(self) -> None:
         self._reset_fields()
@@ -142,17 +151,18 @@ class PositionManager:
     async def snapshot(self) -> PositionSnapshot:
         async with self._snapshot_lock:
             return PositionSnapshot(
-                entry_price  = self._entry_price,
-                entry_side   = self._entry_side,
-                entry_qty    = self._entry_qty,
-                tp1_hit      = self._tp1_hit,
-                tp2_hit      = self._tp2_hit,
-                tp3_hit      = self._tp3_hit,
-                trail_active = self._trail_active,
-                trail_peak   = self._trail_peak_pnl,
-                hold_candles = self._hold_candles,
-                pyramid_adds = self._pyramid_adds,
-                trade_id     = self._trade_id,
+                entry_price   = self._entry_price,
+                entry_side    = self._entry_side,
+                entry_qty     = self._entry_qty,
+                tp1_hit       = self._tp1_hit,
+                tp2_hit       = self._tp2_hit,
+                tp3_hit       = self._tp3_hit,
+                trail_active  = self._trail_active,
+                trail_peak    = self._trail_peak_pnl,
+                hold_candles  = self._hold_candles,
+                pyramid_adds  = self._pyramid_adds,
+                trade_id      = self._trade_id,
+                breakeven_set = self._breakeven_set,
             )
 
     async def on_open(
@@ -195,6 +205,31 @@ class PositionManager:
     def _sym(self) -> str:
         from .config import config
         return config.symbol
+
+    async def _set_breakeven_sl(self) -> None:
+        """Muta SL la breakeven (entry + comision) dupa TP1.
+        Long:  SL = entry * (1 + ROUND_TRIP_FEE)  -> cel mai rau: iesim la 0
+        Short: SL = entry * (1 - ROUND_TRIP_FEE)
+        """
+        if self._breakeven_set or self._entry_price <= 0:
+            return
+        if self._entry_side == "long":
+            be_price = self._entry_price * (1 + ROUND_TRIP_FEE)
+        else:
+            be_price = self._entry_price * (1 - ROUND_TRIP_FEE)
+        try:
+            resp = await trader.amend_sl_tp(stop_loss=be_price)
+            if resp and resp.get("retCode") == 0:
+                async with self._snapshot_lock:
+                    self._breakeven_set = True
+                logger.info(
+                    f"[PM] Breakeven SL setat: {be_price:.6f} "
+                    f"(entry={self._entry_price:.6f} fee={ROUND_TRIP_FEE:.4%})"
+                )
+            else:
+                logger.warning(f"[PM] Breakeven SL amend esuat: {resp}")
+        except Exception as e:
+            logger.warning(f"[PM] Breakeven SL exceptie: {e}")
 
     async def _close_partial(self, fraction: float, label: str) -> tuple[bool, float]:
         sym = self._sym()
@@ -278,29 +313,30 @@ class PositionManager:
         if not state.open_position:
             return True
 
-        # Citeste parametri DIN PROFIL la fiecare evaluate
-        tp1_pct      = _p("tp1_pct",      _DEFAULT_TP1_PCT)
-        tp2_pct      = _p("tp2_pct",      _DEFAULT_TP2_PCT)
-        tp3_pct      = _p("tp3_pct",      _DEFAULT_TP3_PCT)
-        tp1_fraction = _p("tp1_fraction",  _DEFAULT_TP1_FRACTION)
-        tp2_fraction = _p("tp2_fraction",  _DEFAULT_TP2_FRACTION)
-        tp3_fraction = _p("tp3_fraction",  _DEFAULT_TP3_FRACTION)
-        sl_pct       = _p("sl_pct",        _DEFAULT_SL_PCT)
-        trail_pct    = _p("trail_pct",     _DEFAULT_TRAIL_PCT)
-        trail_delta  = _p("trail_delta",   _DEFAULT_TRAIL_DELTA)
+        tp1_pct      = _p("tp1_pct",         _DEFAULT_TP1_PCT)
+        tp2_pct      = _p("tp2_pct",         _DEFAULT_TP2_PCT)
+        tp3_pct      = _p("tp3_pct",         _DEFAULT_TP3_PCT)
+        tp1_fraction = _p("tp1_fraction",     _DEFAULT_TP1_FRACTION)
+        tp2_fraction = _p("tp2_fraction",     _DEFAULT_TP2_FRACTION)
+        tp3_fraction = _p("tp3_fraction",     _DEFAULT_TP3_FRACTION)
+        sl_pct       = _p("sl_pct",           _DEFAULT_SL_PCT)
+        trail_pct    = _p("trail_pct",        _DEFAULT_TRAIL_PCT)
+        trail_delta  = _p("trail_delta",      _DEFAULT_TRAIL_DELTA)
         max_hold     = _p("max_hold_candles", _DEFAULT_MAX_HOLD)
 
         async with self._snapshot_lock:
             self._hold_candles += 1
-            hold = self._hold_candles
+            hold            = self._hold_candles
             entry_price_now = self._entry_price
+            tp1_already_hit = self._tp1_hit
+            be_already_set  = self._breakeven_set
 
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
-        # --- Software SL ---
-        if pnl_pct <= -sl_pct:
+        # --- Software SL (activ doar daca breakeven inca nu e setat) ---
+        if not be_already_set and pnl_pct <= -sl_pct:
             logger.warning(
-                f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{sl_pct:.4%}"
+                f"[PM] Software SL: pnl={pnl_pct:.4%} <= -{sl_pct:.4%}"
             )
             await self._close_full("SL_SOFTWARE", pnl_pct)
             return True
@@ -314,6 +350,8 @@ class PositionManager:
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, entry_price_now)
                 risk.on_close(partial_pnl, pnl_pct)
                 logger.info(f"[PM] TP1 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f}")
+                # --- BREAKEVEN SL: muta SL imediat dupa TP1 ---
+                await self._set_breakeven_sl()
                 try:
                     from .telegram_ui import notify_tp
                     _tg_notify(notify_tp(self._entry_side, 1, qty_closed, partial_pnl))
@@ -374,20 +412,41 @@ class PositionManager:
                     else (1 + trail_delta)
                 )
                 await trader.amend_sl_tp(stop_loss=trail_sl)
-                logger.debug(f"[PM] Trail SL amended to {trail_sl:.4f}")
+                logger.debug(f"[PM] Trail SL amended to {trail_sl:.6f}")
             elif pnl_pct <= self._trail_peak_pnl - trail_delta:
                 logger.info(
-                    f"[PM] Trail triggered: pnl={pnl_pct:.4%} "
-                    f"peak={self._trail_peak_pnl:.4%}"
+                    f"[PM] Trail triggered: pnl={pnl_pct:.4%} peak={self._trail_peak_pnl:.4%}"
                 )
                 await self._close_full("TRAIL", pnl_pct)
                 return True
 
-        # --- Timeout ---
+        # --- Timeout smart ---
+        # Daca TP1 deja hit (breakeven setat) -> inchide oricand la timeout
+        # Daca TP1 NU e hit si suntem pe minus -> 2 candle-uri extra gratie
+        # Daca TP1 NU e hit si suntem pe plus -> inchide normal la timeout
         if hold >= max_hold:
-            logger.info(f"[PM] Timeout ({max_hold} candles) — closing")
-            await self._close_full("TIMEOUT", pnl_pct)
-            return True
+            if not tp1_already_hit and pnl_pct < 0:
+                if hold < max_hold + _TIMEOUT_GRACE:
+                    logger.debug(
+                        f"[PM] Timeout grace: hold={hold}/{max_hold + _TIMEOUT_GRACE} "
+                        f"pnl={pnl_pct:.4%} (astept revenire)"
+                    )
+                    return False  # mai asteapta
+                else:
+                    logger.info(
+                        f"[PM] Timeout FORTAT dupa gratie ({hold} candle-uri) "
+                        f"pnl={pnl_pct:.4%}"
+                    )
+                    await self._close_full("TIMEOUT_FORCED", pnl_pct)
+                    return True
+            else:
+                label = "TIMEOUT_PROFIT" if pnl_pct >= 0 else "TIMEOUT_BE"
+                logger.info(
+                    f"[PM] {label}: hold={hold} pnl={pnl_pct:.4%} "
+                    f"breakeven={'DA' if be_already_set else 'NU'}"
+                )
+                await self._close_full(label, pnl_pct)
+                return True
 
         return False
 
