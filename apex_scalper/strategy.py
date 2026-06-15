@@ -1,16 +1,27 @@
-"""Strategy v1.0.0 — debug logging la fiecare gate blocat.
+"""Strategy v1.1.0 — 5 features noi pentru DOGEUSDT scalping 2026.
 
 Changelog:
-  v1.0.0 — Fiecare gate din evaluate() logheaza motivul blocarii cu
-    logger.debug(). La scor aproape de prag (>= ENTRY_THRESHOLD * 0.85)
-    dar blocat de alt filtru, trimite notificare Telegram.
-    Ajuta diagnosticarea: de ce nu intra bot-ul cand scorul pare bun.
-  v0.9.9 — notify_open() apelata la deschidere.
-  v0.8.7 — BUG 30+31 fix.
+  v1.1.0 — Features noi:
+    GATE 0 — Min Net Profit: blocheaza entry daca TP1 nu acopera comisionul
+      taker Bybit (0.055% x2 = 0.11% dus-intors). Previne trade-uri care
+      castiga directia dar pierd pe comision.
+    GATE 9 — Session Filter: evita sesiunile cu lichiditate scazuta
+      (00:00-02:00 UTC = noapte Asia, 12:00-13:00 UTC = pauza pranz Europa).
+      DOGE e mai volatil si mai manipulat in aceste ferestre.
+    GATE 10 — News/Event Blocker: blocheaza 5 minute inainte si dupa
+      ora rotunda (xx:00 UTC) cand vin frecvent date macro (CPI, FOMC etc.).
+    SCORE BONUS — RSI Divergence: +0.08 la scor daca RSI face divergenta
+      cu pretul (bullish div pentru long, bearish div pentru short).
+      Detectie simpla pe ultimele 3 candle-uri.
+    SCORE BONUS — S/R Breakout: +0.06 la scor daca pretul sparge un nivel
+      pivot calculat dinamic din ultimele 20 candle-uri (high/low pivot).
+  v1.0.0 — debug logging la fiecare gate blocat.
 """
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import deque
 from loguru import logger
 from .state import state
 
@@ -31,8 +42,33 @@ BASE_SPREAD_BPS  = 3.0
 ATR_SPREAD_MULT  = 2.0
 ATR_BASELINE     = 0.001
 
+# Comision Bybit taker: 0.055% per leg, dus-intors = 0.11%
+TAKER_FEE_PCT    = 0.00055
+ROUND_TRIP_FEE   = TAKER_FEE_PCT * 2   # 0.0011
+
+# Session filter — ore UTC blocate (tuples de (start_h, end_h))
+_BLOCKED_SESSIONS = [
+    (0, 2),    # 00:00-02:00 UTC — noapte Asia, volum mic, manipulare
+    (12, 13),  # 12:00-13:00 UTC — pauza pranz Europa
+]
+
+# News blocker — minute inainte/dupa ora rotunda (xx:00)
+_NEWS_BLOCK_MINUTES = 4   # blocheaza xx:57-xx:04
+
+# Divergence detection — cate candle-uri istorice pastram
+_DIV_WINDOW = 5
+
+# S/R Breakout — cate candle-uri pentru pivot
+_SR_WINDOW = 20
+
 _ind_lock: asyncio.Lock | None = None
 _main_loop: asyncio.AbstractEventLoop | None = None
+
+# Buffer pentru divergence + S/R
+_price_highs: deque = deque(maxlen=_SR_WINDOW)
+_price_lows:  deque = deque(maxlen=_SR_WINDOW)
+_rsi_buf:     deque = deque(maxlen=_DIV_WINDOW)
+_close_buf:   deque = deque(maxlen=_DIV_WINDOW)
 
 
 def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -46,6 +82,85 @@ def _get_ind_lock() -> asyncio.Lock:
         _ind_lock = asyncio.Lock()
     return _ind_lock
 
+
+# --------------------------------------------------------------------------- #
+#  Session + News filters
+# --------------------------------------------------------------------------- #
+
+def _session_allowed() -> bool:
+    """Returneaza False in sesiunile cu lichiditate scazuta."""
+    import datetime
+    now_utc = datetime.datetime.utcnow()
+    h = now_utc.hour
+    for (start, end) in _BLOCKED_SESSIONS:
+        if start <= h < end:
+            return False
+    return True
+
+
+def _news_window_clear() -> bool:
+    """Returneaza False in fereastra de 4 minute in jurul orei rotunde."""
+    import datetime
+    now_utc = datetime.datetime.utcnow()
+    m = now_utc.minute
+    # Blocheaza minutele 57,58,59,0,1,2,3
+    if m >= 60 - _NEWS_BLOCK_MINUTES or m < _NEWS_BLOCK_MINUTES:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+#  Divergence detection
+# --------------------------------------------------------------------------- #
+
+def _has_bullish_divergence() -> bool:
+    """Price face lower low dar RSI face higher low -> bullish divergence."""
+    if len(_close_buf) < _DIV_WINDOW or len(_rsi_buf) < _DIV_WINDOW:
+        return False
+    closes = list(_close_buf)
+    rsis   = list(_rsi_buf)
+    # Compara ultimele 2 vs precedentele 2
+    price_ll = closes[-1] < closes[-3]   # price lower low
+    rsi_hl   = rsis[-1]   > rsis[-3]     # RSI higher low
+    return price_ll and rsi_hl
+
+
+def _has_bearish_divergence() -> bool:
+    """Price face higher high dar RSI face lower high -> bearish divergence."""
+    if len(_close_buf) < _DIV_WINDOW or len(_rsi_buf) < _DIV_WINDOW:
+        return False
+    closes = list(_close_buf)
+    rsis   = list(_rsi_buf)
+    price_hh = closes[-1] > closes[-3]   # price higher high
+    rsi_lh   = rsis[-1]   < rsis[-3]     # RSI lower high
+    return price_hh and rsi_lh
+
+
+# --------------------------------------------------------------------------- #
+#  S/R Breakout detection
+# --------------------------------------------------------------------------- #
+
+def _breakout_long(price: float) -> bool:
+    """Price sparge recent pivot high -> breakout bullish."""
+    if len(_price_highs) < 10:
+        return False
+    highs = list(_price_highs)
+    pivot_high = max(highs[:-3])   # max din toate mai putin ultimele 3
+    return price > pivot_high * 1.0005   # 0.05% buffer anti-fakeout
+
+
+def _breakout_short(price: float) -> bool:
+    """Price sparge recent pivot low -> breakout bearish."""
+    if len(_price_lows) < 10:
+        return False
+    lows = list(_price_lows)
+    pivot_low = min(lows[:-3])   # min din toate mai putin ultimele 3
+    return price < pivot_low * 0.9995   # 0.05% buffer anti-fakeout
+
+
+# --------------------------------------------------------------------------- #
+#  IndicatorState
+# --------------------------------------------------------------------------- #
 
 class IndicatorState:
     __slots__ = [
@@ -87,6 +202,10 @@ def _get_ind_state():
     return _ind_state
 
 
+# --------------------------------------------------------------------------- #
+#  Scoring — cu divergence + breakout bonus
+# --------------------------------------------------------------------------- #
+
 def _score_long(snapshot: IndicatorState, ob, price: float) -> float:
     score = 0.0
     from .book_pressure import bp
@@ -103,6 +222,10 @@ def _score_long(snapshot: IndicatorState, ob, price: float) -> float:
         score += 0.04
     if snapshot.bb_ready and price > snapshot.bb_mid:                score += 0.04
     if snapshot.vwap > 0 and price > snapshot.vwap:                  score += 0.04
+    # BONUS: divergence bullish
+    if _has_bullish_divergence():                                     score += 0.08
+    # BONUS: breakout bullish
+    if _breakout_long(price):                                         score += 0.06
     return min(score, 1.0)
 
 
@@ -123,6 +246,10 @@ def _score_short(snapshot: IndicatorState, ob, price: float) -> float:
         score += 0.04
     if snapshot.bb_ready and price < snapshot.bb_mid:                score += 0.04
     if snapshot.vwap > 0 and price < snapshot.vwap:                  score += 0.04
+    # BONUS: divergence bearish
+    if _has_bearish_divergence():                                     score += 0.08
+    # BONUS: breakout bearish
+    if _breakout_short(price):                                        score += 0.06
     return min(score, 1.0)
 
 
@@ -151,6 +278,14 @@ def update_indicators(price: float, kline_data: dict) -> None:
     low    = float(kline_data.get("low",    price))
     volume = float(kline_data.get("volume", 0.0))
     update_all(s, price, high, low, volume)
+
+    # Actualizeaza bufferele pentru divergence + S/R
+    _price_highs.append(high)
+    _price_lows.append(low)
+    _close_buf.append(price)
+    if s.rsi_ready:
+        _rsi_buf.append(s.rsi_value)
+
     loop = _main_loop
     if loop is not None and loop.is_running():
         future = asyncio.run_coroutine_threadsafe(
@@ -187,7 +322,7 @@ def _apply_ind_from_state(s, price: float) -> None:
 
 
 # --------------------------------------------------------------------------- #
-#  Evaluate — cu debug logging la FIECARE gate blocat
+#  Evaluate — toate gate-urile + features noi
 # --------------------------------------------------------------------------- #
 
 async def evaluate(price: float) -> None:
@@ -220,7 +355,22 @@ async def evaluate(price: float) -> None:
 
     # --- fara pozitie deschisa: verifica toate gate-urile
     if not state.running or state.paused:
-        logger.debug(f"[evaluate] SKIP: running={state.running} paused={state.paused}")
+        return
+
+    # GATE 0: Min Net Profit — TP1 trebuie sa acopere comisionul
+    prof = config.profile(config.symbol)
+    tp1_pct      = prof.get("tp1_pct", 0.003)
+    order_usdt   = prof.get("order_size_usdt", 5.0)
+    leverage     = prof.get("leverage", 10)
+    notional     = order_usdt * leverage
+    gross_profit = notional * tp1_pct
+    commission   = notional * ROUND_TRIP_FEE
+    if gross_profit <= commission:
+        logger.debug(
+            f"[evaluate] GATE0 MIN_PROFIT blocat: "
+            f"tp1={gross_profit:.4f} USDT <= comision={commission:.4f} USDT "
+            f"(notional={notional:.1f} tp1_pct={tp1_pct:.4%})"
+        )
         return
 
     # GATE 1: Risk
@@ -238,11 +388,25 @@ async def evaluate(price: float) -> None:
         )
         return
 
-    # Calculeaza score inainte de filtrele de price action
+    # GATE 9: Session filter
+    if not _session_allowed():
+        import datetime
+        h = datetime.datetime.utcnow().hour
+        logger.debug(f"[evaluate] GATE9 SESSION blocat: ora UTC={h}:xx")
+        return
+
+    # GATE 10: News/Event blocker
+    if not _news_window_clear():
+        import datetime
+        m = datetime.datetime.utcnow().minute
+        logger.debug(f"[evaluate] GATE10 NEWS blocat: minut={m} (fereastra ora rotunda)")
+        return
+
+    # Calculeaza score
     ob = compute_ob()
     score_l, score_s = await score_snapshot(price, ob)
     best_score = max(score_l, score_s)
-    near_threshold = best_score >= ENTRY_THRESHOLD * 0.85  # 85% din prag
+    near_threshold = best_score >= ENTRY_THRESHOLD * 0.85
 
     # GATE 3: Spread
     spread_bps = state.orderbook.spread / price * 10_000 if price > 0 else 999
@@ -251,8 +415,7 @@ async def evaluate(price: float) -> None:
     if spread_bps > max_spread:
         logger.debug(
             f"[evaluate] GATE3 SPREAD blocat: "
-            f"spread={spread_bps:.2f}bps > max={max_spread:.2f}bps "
-            f"(score_l={score_l:.3f} score_s={score_s:.3f})"
+            f"spread={spread_bps:.2f}bps > max={max_spread:.2f}bps"
         )
         return
 
@@ -262,70 +425,44 @@ async def evaluate(price: float) -> None:
         if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
             logger.debug(
                 f"[evaluate] GATE4 ATR blocat: atr_pct={atr_pct:.6f} "
-                f"window=[{ATR_MIN_PCT},{ATR_MAX_PCT}] "
-                f"(score_l={score_l:.3f} score_s={score_s:.3f})"
+                f"window=[{ATR_MIN_PCT},{ATR_MAX_PCT}]"
             )
             return
 
     # GATE 5: Anti-manipulation
     if anti_manipulation.is_suspicious():
-        logger.debug(
-            f"[evaluate] GATE5 ANTI-MANIP blocat "
-            f"(score_l={score_l:.3f} score_s={score_s:.3f})"
-        )
+        logger.debug("[evaluate] GATE5 ANTI-MANIP blocat")
         return
 
     # GATE 6: MTF ready
     if not mtf.ready:
-        logger.debug(
-            f"[evaluate] GATE6 MTF not ready: ema50={mtf.ema50:.2f} "
-            f"(score_l={score_l:.3f} score_s={score_s:.3f})"
-        )
+        logger.debug(f"[evaluate] GATE6 MTF not ready: ema50={mtf.ema50:.4f}")
         return
 
-    # Refresh funding (async, non-blocking)
+    # Refresh funding
     await funding.maybe_refresh(config.symbol)
 
     # --- LONG path ---
     if score_l >= ENTRY_THRESHOLD:
-        # GATE 7L: funding
         if not funding.can_enter_long():
-            logger.warning(
-                f"[evaluate] GATE7 FUNDING blocheaza LONG: rate={funding.rate_pct} "
-                f"score_l={score_l:.3f}"
-            )
+            logger.warning(f"[evaluate] GATE7 FUNDING blocheaza LONG: rate={funding.rate_pct}")
             return
-        # GATE 8L: MTF direction
         if price <= mtf.ema50:
-            logger.debug(
-                f"[evaluate] GATE8 MTF dir blocheaza LONG: "
-                f"price={price} <= ema50={mtf.ema50:.2f} score_l={score_l:.3f}"
-            )
+            logger.debug(f"[evaluate] GATE8 MTF dir blocheaza LONG: price={price} <= ema50={mtf.ema50:.4f}")
             return
-        # INTRA LONG
         await _enter("long", "Buy", price, score_l, config)
 
     # --- SHORT path ---
     elif score_s >= ENTRY_THRESHOLD:
-        # GATE 7S: funding
         if not funding.can_enter_short():
-            logger.warning(
-                f"[evaluate] GATE7 FUNDING blocheaza SHORT: rate={funding.rate_pct} "
-                f"score_s={score_s:.3f}"
-            )
+            logger.warning(f"[evaluate] GATE7 FUNDING blocheaza SHORT: rate={funding.rate_pct}")
             return
-        # GATE 8S: MTF direction
         if price >= mtf.ema50:
-            logger.debug(
-                f"[evaluate] GATE8 MTF dir blocheaza SHORT: "
-                f"price={price} >= ema50={mtf.ema50:.2f} score_s={score_s:.3f}"
-            )
+            logger.debug(f"[evaluate] GATE8 MTF dir blocheaza SHORT: price={price} >= ema50={mtf.ema50:.4f}")
             return
-        # INTRA SHORT
         await _enter("short", "Sell", price, score_s, config)
 
     else:
-        # Scor sub prag — log doar daca e aproape
         if near_threshold:
             logger.debug(
                 f"[evaluate] SCORE sub prag: L={score_l:.4f} S={score_s:.4f} "
@@ -340,7 +477,6 @@ async def _enter(
     score: float,
     config,
 ) -> None:
-    """Plasare ordin + actualizare state + notificare Telegram."""
     from .risk import risk
     from .regime_filter import regime
     from .position_manager import position_manager as pm
@@ -363,7 +499,7 @@ async def _enter(
 
     logger.info(
         f"[{side.upper()}] ENTRY score={score:.4f} price={price} "
-        f"qty={qty} sl={sl:.2f} tp={tp:.2f}"
+        f"qty={qty} sl={sl:.4f} tp={tp:.4f}"
     )
 
     trade_id = await place_entry_order(
