@@ -1,10 +1,12 @@
-"""Main entry point v1.4.3 — indicator_warmup la startup (fix #4).
+"""Main entry point v1.4.4 — semnature corecte watchdog + daily_report.
 
 Changelog:
-  v1.4.3 — FIX #4: indicator_warmup.run() apelat inainte de pornirea
-    task-urilor asyncio. Inainte indicatorii nu erau warm la startup
-    -> primele candle-uri aveau rsi_ready=False, atr_ready=False
-    -> GATE4 (ATR) si scoring partial puteau genera semnale false.
+  v1.4.4 — FIX: run_watchdog(trader, state) -> watchdog_loop() (fara argumente,
+    cf. watchdog.py v0.9.1 unde run_watchdog = watchdog_loop alias).
+    FIX: run_daily_report_loop() -> run_daily_report_loop(config.symbol)
+    (cf. daily_report.py v0.8.4 care primeste symbol: str).
+    Sync cu ce ruleaza local (confirmat functional).
+  v1.4.3 — indicator_warmup la startup (fix #4).
   v1.4.2 — inlocuit get_open_position() cu sync_position_from_exchange().
   v1.4.1 — inject_wall_params via config.wall_ratio + trader.setup().
   v1.4.0 — dashboard GUI integrat.
@@ -46,10 +48,10 @@ async def main() -> None:
     from .state import state
     from .telegram_ui import start_telegram_bot
     from .health import run_health_server
-    from .watchdog import run_watchdog
+    from .watchdog import watchdog_loop          # fara argumente (run_watchdog alias)
     from .pulse import run_pulse_loop
     from .dashboard import run_dashboard
-    from .indicator_warmup import run_warmup  # FIX #4
+    from .indicator_warmup import run_warmup
 
     _setup_logging()
     config.validate()
@@ -60,7 +62,7 @@ async def main() -> None:
 
     await trader.setup()
 
-    # FIX #4: warm up indicatori cu date istorice inainte de pornirea loop-ului
+    # Warm up indicatori cu date istorice inainte de pornirea loop-ului
     logger.info("[warmup] Pornire indicator warmup...")
     try:
         await run_warmup(config.symbol)
@@ -71,7 +73,7 @@ async def main() -> None:
     # Sincronizeaza pozitia existenta la restart
     await trader.sync_position_from_exchange()
 
-    logger.info("Watchdog started (timeout=120s, max_restarts=5)")
+    logger.info("Watchdog started (timeout=120s, max_restarts=3/h)")
 
     await funding.maybe_refresh(config.symbol)
 
@@ -85,10 +87,10 @@ async def main() -> None:
     tasks = [
         asyncio.ensure_future(run_health_server()),
         asyncio.ensure_future(run_pulse_loop()),
-        asyncio.ensure_future(run_watchdog(trader, state)),
+        asyncio.ensure_future(watchdog_loop()),                        # fara argumente
         asyncio.ensure_future(run_mtf_refresh_loop(config.symbol)),
         asyncio.ensure_future(run_funding_refresh_loop(config.symbol)),
-        asyncio.ensure_future(run_daily_report_loop()),
+        asyncio.ensure_future(run_daily_report_loop(config.symbol)),   # cu symbol
         asyncio.ensure_future(start_telegram_bot()),
         asyncio.ensure_future(_run_ws_feed(config, trader, state, loop)),
     ]
