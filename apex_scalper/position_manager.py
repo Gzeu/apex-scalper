@@ -1,15 +1,13 @@
-"""Position Manager v1.3.0 — SL + Trailing dinamic pe ATR (50x safe).
+"""Position Manager v1.3.1 — pyramid qty_step fix + close_partial floor.
 
 Changelog:
-  v1.3.0 — SL si trailing stop dinamice bazate pe ATR:
-    PROBLEMA: La 50x leverage, SL fix de 0.20% e atins de orice wick minor
-    pe DOGE. ATR real poate fi 0.05% sau 0.40% - un SL fix ignora contextul.
-    FIX: sl_distance = max(ATR * 1.5, sl_pct_min) - SL respira cu volatilitatea
-    FIX: trail_delta = max(ATR * 1.0, trail_delta_min) - trailing respira similar
-    PROTECTIE: sl_pct_min=0.0015, sl_pct_max=0.0040 (nu iese din limite sane)
-    PROTECTIE: trail_delta_min=0.0008, trail_delta_max=0.0050
-    Rezultat: la ATR=0.05% -> SL=0.075% (mai strans); la ATR=0.30% -> SL=0.45%
-    Lichidare la 50x e la 2.0% - SL dinamic ramane departe cu marja reala.
+  v1.3.1 — BUG FIX: doua locuri cu qty invalid:
+    1. try_pyramid() apela risk.calc_qty() fara qty_step -> zecimale la DOGE.
+       Fix: pasam trader._qty_step ca la _enter() din strategy.py.
+    2. _close_partial() facea round(open_qty * fraction, 6) -> zecimale.
+       Fix: math.floor(qty_raw / qty_step) * qty_step (acelasi pattern ca calc_qty).
+       Protectie: qty >= trader._qty_step (nu trimitem qty=0).
+  v1.3.0 — SL + Trailing dinamic pe ATR (50x safe).
   v1.2.1 — BUG CRITIC: _close_full() verifica retur + state guard.
   v1.2.0 — Breakeven SL dupa TP1, timeout smart exit.
   v1.1.0 — TP/SL/Trail citite din profil per symbol.
@@ -17,6 +15,7 @@ Changelog:
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from loguru import logger
 
@@ -41,14 +40,14 @@ _DEFAULT_MAX_HOLD      = 4
 _DEFAULT_MAX_PYRAMID   = 0
 
 # SL dinamic ATR - limite de siguranta
-_SL_ATR_MULT       = 1.5     # SL = ATR * 1.5
-_SL_PCT_MIN        = 0.0015  # minim 0.15% (nu mai strans de atat la 50x)
-_SL_PCT_MAX        = 0.0040  # maxim 0.40% (nu risca mai mult de 1 USDT la 250 notional)
+_SL_ATR_MULT       = 1.5
+_SL_PCT_MIN        = 0.0015
+_SL_PCT_MAX        = 0.0040
 
 # Trailing dinamic ATR - limite de siguranta
-_TRAIL_ATR_MULT    = 1.0     # trail_delta = ATR * 1.0
-_TRAIL_DELTA_MIN   = 0.0008  # minim 0.08%
-_TRAIL_DELTA_MAX   = 0.0050  # maxim 0.50%
+_TRAIL_ATR_MULT    = 1.0
+_TRAIL_DELTA_MIN   = 0.0008
+_TRAIL_DELTA_MAX   = 0.0050
 
 # Comision Bybit taker dus-intors
 ROUND_TRIP_FEE  = 0.00055 * 2   # 0.0011
@@ -76,11 +75,6 @@ def _p(key: str, default):
 
 
 def _get_current_atr_pct() -> float:
-    """Returneaza ATR ca procent din pret curent din strategy.ind.
-
-    Folosit pentru SL si trailing dinamic. Daca nu e ready, returneaza 0
-    si se va folosi valoarea minima de siguranta.
-    """
     try:
         from .strategy import ind
         if ind.atr_ready and ind.atr_value > 0 and ind.last_price > 0:
@@ -91,31 +85,32 @@ def _get_current_atr_pct() -> float:
 
 
 def _dynamic_sl_pct() -> float:
-    """Calculeaza SL% dinamic bazat pe ATR curent.
-
-    Formula: sl = ATR% * 1.5
-    Clamped la [_SL_PCT_MIN, _SL_PCT_MAX] pentru siguranta la 50x.
-    """
     atr_pct = _get_current_atr_pct()
     if atr_pct <= 0:
         return _DEFAULT_SL_PCT
     sl = atr_pct * _SL_ATR_MULT
-    sl = max(_SL_PCT_MIN, min(_SL_PCT_MAX, sl))
-    return sl
+    return max(_SL_PCT_MIN, min(_SL_PCT_MAX, sl))
 
 
 def _dynamic_trail_delta() -> float:
-    """Calculeaza trail_delta dinamic bazat pe ATR curent.
-
-    Formula: delta = ATR% * 1.0
-    Clamped la [_TRAIL_DELTA_MIN, _TRAIL_DELTA_MAX].
-    """
     atr_pct = _get_current_atr_pct()
     if atr_pct <= 0:
         return _DEFAULT_TRAIL_DELTA
     delta = atr_pct * _TRAIL_ATR_MULT
-    delta = max(_TRAIL_DELTA_MIN, min(_TRAIL_DELTA_MAX, delta))
-    return delta
+    return max(_TRAIL_DELTA_MIN, min(_TRAIL_DELTA_MAX, delta))
+
+
+def _floor_to_qty_step(raw_qty: float) -> float:
+    """Rotunjeste qty la floor de qty_step al instrumentului.
+
+    FIX v1.3.1: folosit atat in _close_partial cat si in try_pyramid.
+    Previne ErrCode 10001 'Qty invalid' de la Bybit.
+    """
+    qty_step = trader._qty_step
+    if qty_step <= 0:
+        return raw_qty
+    qty = math.floor(raw_qty / qty_step) * qty_step
+    return max(qty, qty_step)
 
 
 def _tg_notify(coro) -> None:
@@ -225,8 +220,8 @@ class PositionManager:
         trade_id: int | None = None,
     ) -> None:
         prof = _get_profile()
-        sl_used   = _dynamic_sl_pct()
-        atr_pct   = _get_current_atr_pct()
+        sl_used = _dynamic_sl_pct()
+        atr_pct = _get_current_atr_pct()
         async with self._snapshot_lock:
             self._reset_fields()
             self._entry_side  = side
@@ -260,7 +255,6 @@ class PositionManager:
         return config.symbol
 
     async def _set_breakeven_sl(self) -> None:
-        """Muta SL la breakeven (entry + comision) dupa TP1."""
         if self._breakeven_set or self._entry_price <= 0:
             return
         if self._entry_side == "long":
@@ -285,12 +279,20 @@ class PositionManager:
             logger.warning(f"[PM] Breakeven SL exceptie: {e}")
 
     async def _close_partial(self, fraction: float, label: str) -> tuple[bool, float]:
+        """Inchide partial pozitia.
+
+        FIX v1.3.1: qty rotunjit cu floor la qty_step (nu round 6 decimale).
+        Ex DOGE: open_qty=2808, fraction=0.40 -> raw=1123.2 -> floor(1123.2/1)*1 = 1123
+        Previne ErrCode 10001 la close partial.
+        """
         sym = self._sym()
         with state.lock:
             open_qty   = state.open_qty
             last_price = state.last_price
 
-        qty = round(open_qty * fraction, 6)
+        raw_qty = open_qty * fraction
+        qty     = _floor_to_qty_step(raw_qty)  # FIX: floor la qty_step
+
         if qty <= 0:
             logger.warning(f"[PM] {label}: qty=0, skipping")
             return False, 0.0
@@ -335,10 +337,6 @@ class PositionManager:
         return filled, qty if filled else 0.0
 
     async def _close_full(self, reason: str, pnl_pct: float) -> bool:
-        """Inchide pozitia completa.
-
-        FIX BUG CRITIC v1.2.1: verifica returul close_position().
-        """
         with state.lock:
             remaining_qty = state.open_qty
         side     = self._entry_side
@@ -365,10 +363,7 @@ class PositionManager:
             return False
 
         risk.on_close(pnl_usdt, pnl_pct)
-        logger.info(
-            f"[PM] Full close ({reason}): "
-            f"pnl={pnl_pct:.4%} ({pnl_usdt:+.4f} USDT)"
-        )
+        logger.info(f"[PM] Full close ({reason}): pnl={pnl_pct:.4%} ({pnl_usdt:+.4f} USDT)")
         with state.lock:
             state.open_position = None
             state.open_qty      = 0.0
@@ -401,7 +396,6 @@ class PositionManager:
         trail_pct    = _p("trail_pct",        _DEFAULT_TRAIL_PCT)
         max_hold     = _p("max_hold_candles", _DEFAULT_MAX_HOLD)
 
-        # SL si trail_delta dinamice pe ATR - recalculate la fiecare candle
         sl_pct      = _dynamic_sl_pct()
         trail_delta = _dynamic_trail_delta()
 
@@ -420,8 +414,7 @@ class PositionManager:
                 f"[PM] Software SL dinamic: pnl={pnl_pct:.4%} <= -{sl_pct:.4%} "
                 f"(ATR={atr_pct:.4%} x{_SL_ATR_MULT})"
             )
-            closed = await self._close_full("SL_SOFTWARE", pnl_pct)
-            return closed
+            return await self._close_full("SL_SOFTWARE", pnl_pct)
 
         # --- TP1 ---
         if not self._tp1_hit and pnl_pct >= tp1_pct:
@@ -478,7 +471,6 @@ class PositionManager:
                     logger.debug(f"[PM] tg notify_tp3 error: {e}")
                 return True
 
-        # FIX BUG LOGIC v1.2.1: reciteste tp1_hit DUPA blocul TP1
         tp1_now = self._tp1_hit
         be_now  = self._breakeven_set
 
@@ -500,17 +492,13 @@ class PositionManager:
                     else (1.0 + trail_delta)
                 )
                 await trader.amend_sl_tp(stop_loss=trail_sl)
-                logger.debug(
-                    f"[PM] Trail SL -> {trail_sl:.6f} "
-                    f"(delta={trail_delta:.4%} ATR-based)"
-                )
+                logger.debug(f"[PM] Trail SL -> {trail_sl:.6f} (delta={trail_delta:.4%})")
             elif pnl_pct <= self._trail_peak_pnl - trail_delta:
                 logger.info(
                     f"[PM] Trail triggered: pnl={pnl_pct:.4%} "
                     f"peak={self._trail_peak_pnl:.4%} delta={trail_delta:.4%}"
                 )
-                closed = await self._close_full("TRAIL", pnl_pct)
-                return closed
+                return await self._close_full("TRAIL", pnl_pct)
 
         # --- Timeout smart ---
         if hold >= max_hold:
@@ -518,24 +506,16 @@ class PositionManager:
                 if hold < max_hold + _TIMEOUT_GRACE:
                     logger.debug(
                         f"[PM] Timeout grace: hold={hold}/{max_hold + _TIMEOUT_GRACE} "
-                        f"pnl={pnl_pct:.4%} (astept revenire)"
+                        f"pnl={pnl_pct:.4%}"
                     )
                     return False
                 else:
-                    logger.info(
-                        f"[PM] Timeout FORTAT dupa gratie ({hold} candle-uri) "
-                        f"pnl={pnl_pct:.4%}"
-                    )
-                    closed = await self._close_full("TIMEOUT_FORCED", pnl_pct)
-                    return closed
+                    logger.info(f"[PM] Timeout FORTAT ({hold} candle-uri) pnl={pnl_pct:.4%}")
+                    return await self._close_full("TIMEOUT_FORCED", pnl_pct)
             else:
                 label = "TIMEOUT_PROFIT" if pnl_pct >= 0 else "TIMEOUT_BE"
-                logger.info(
-                    f"[PM] {label}: hold={hold} pnl={pnl_pct:.4%} "
-                    f"breakeven={'DA' if be_now else 'NU'}"
-                )
-                closed = await self._close_full(label, pnl_pct)
-                return closed
+                logger.info(f"[PM] {label}: hold={hold} pnl={pnl_pct:.4%}")
+                return await self._close_full(label, pnl_pct)
 
         return False
 
@@ -547,6 +527,11 @@ class PositionManager:
         stop_loss: float,
         take_profit: float,
     ) -> None:
+        """Adauga la pozitie existenta (pyramid).
+
+        FIX v1.3.1: paseaza qty_step=trader._qty_step la risk.calc_qty().
+        Inainte: qty_step implicit 0.001 -> zecimale pe DOGE -> ErrCode 10001.
+        """
         max_pyramid = _p("max_pyramid_adds", _DEFAULT_MAX_PYRAMID)
         async with self._snapshot_lock:
             if self._pyramid_adds >= max_pyramid:
@@ -560,9 +545,10 @@ class PositionManager:
         from .config import config
         add_qty = risk.calc_qty(
             price,
-            order_size_usdt=config.order_size_usdt,
-            leverage=config.leverage,
-            regime_factor=0.5,
+            order_size_usdt = config.order_size_usdt,
+            leverage        = config.leverage,
+            qty_step        = trader._qty_step,   # FIX: qty_step corect
+            regime_factor   = 0.5,
         )
         if add_qty <= 0:
             return
@@ -590,7 +576,8 @@ class PositionManager:
                 state.open_qty += add_qty
             logger.info(
                 f"[PM] Pyramid add #{self._pyramid_adds}: "
-                f"qty={add_qty} pnl={pnl_pct:.4%} score={score:.3f}"
+                f"qty={add_qty} qty_step={trader._qty_step} "
+                f"pnl={pnl_pct:.4%} score={score:.3f}"
             )
 
 
