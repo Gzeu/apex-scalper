@@ -1,26 +1,31 @@
-"""SQLite persistence v0.8.2 — Bug 14+15 fix: fallback complet in close_trade_record().
+"""SQLite persistence v0.9.5 — Improvement #6: vacuum + trades cleanup.
 
 Changelog:
-  v0.8.2 — BUG 14 FIX: close_trade_record() fallback scria symbol='', side='', entry=0
-    -> rand corupt in DB -> analytics/daily_report primeau date murdare.
-    Fix: close_trade_record() accepta symbol, side, entry, qty optionali
-    si le foloseste in fallback-ul record_trade() cu valorile corecte.
-
-    BUG 15 FIX: fallback nu actualiza daily_pnl pentru simbolul corect
-    (symbol='' -> load_daily_pnl(symbol) nu gasea randul).
-    Fix: symbol corect transmis in record_trade() din fallback.
-
-  v0.4.1 — WAL connection + correlated trade records (FIX #3 + #9).
+  v0.9.5 — Improvement #6: auto-cleanup + VACUUM programat.
+    Vechi: tabelele trades si metrics_snapshot cresteau nelimitat.
+    Dupa saptamani de trading: DB de sute MB, queries lente, disk plin.
+    Nou:
+      - _cleanup_old_records(): sterge trades mai vechi de TRADES_RETENTION_DAYS (90)
+        si metrics_snapshot mai vechi de METRICS_RETENTION_DAYS (30).
+      - _run_vacuum(): VACUUM incremental o data pe zi pentru a elibera
+        spatiul de pe disk dupa stergeri.
+      - run_maintenance(): apelat automat la startup si o data pe zi
+        (programat in main.py prin _midnight_reset_loop logic).
+      - Nicio schimbare la interfata publica (record_trade, load_daily_pnl etc.).
+  v0.8.2 — BUG 14+15 FIX: close_trade_record() fallback complet.
+  v0.4.1 — WAL + correlated trade records.
 """
 from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timezone, date
-from typing import Optional
+from datetime import datetime, timezone, date, timedelta
 from loguru import logger
 
 DB_PATH = "data/apex_scalper.db"
+
+TRADES_RETENTION_DAYS  = 90   # sterge trades mai vechi de N zile
+METRICS_RETENTION_DAYS = 30   # sterge metrics_snapshot mai vechi de N zile
 
 
 class Database:
@@ -37,6 +42,8 @@ class Database:
         self._conn_obj.execute("PRAGMA synchronous=NORMAL")
         self._conn_obj.commit()
         self._init_schema()
+        # Maintenance la fiecare startup
+        self.run_maintenance(startup=True)
 
     def _conn(self) -> sqlite3.Connection:
         return self._conn_obj
@@ -74,9 +81,95 @@ class Database:
                     profit_factor REAL,
                     total_pnl    REAL
                 );
+                CREATE TABLE IF NOT EXISTS db_maintenance_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts           INTEGER NOT NULL,
+                    trades_deleted   INTEGER NOT NULL DEFAULT 0,
+                    metrics_deleted  INTEGER NOT NULL DEFAULT 0,
+                    vacuum_run       INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_trades_ts     ON trades (ts);
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
+                CREATE INDEX IF NOT EXISTS idx_metrics_ts    ON metrics_snapshot (ts);
             """)
             self._conn_obj.commit()
         logger.info(f"SQLite DB initialised (WAL) at {self._path}")
+
+    # ------------------------------------------------------------------ #
+    #  Maintenance                                                         #
+    # ------------------------------------------------------------------ #
+
+    def run_maintenance(self, startup: bool = False) -> None:
+        """Sterge inregistrari vechi si ruleaza VACUUM.
+
+        Improvement #6: apelat la startup si o data pe zi din midnight_reset.
+        Logheaza cate randuri au fost sterse si daca VACUUM a rulat.
+        La startup: VACUUM incremental (10.000 pagini max) pentru a nu bloca.
+        La midnight: VACUUM complet pentru curatare maxima.
+        """
+        trades_deleted  = self._cleanup_old_records()
+        vacuum_run      = self._run_vacuum(incremental=startup)
+        ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        with self._lock:
+            self._conn_obj.execute(
+                "INSERT INTO db_maintenance_log "
+                "(ts, trades_deleted, metrics_deleted, vacuum_run) VALUES (?,?,?,?)",
+                (ts, trades_deleted[0], trades_deleted[1], int(vacuum_run)),
+            )
+            self._conn_obj.commit()
+        label = "startup" if startup else "midnight"
+        logger.info(
+            f"DB maintenance ({label}): "
+            f"trades_deleted={trades_deleted[0]} "
+            f"metrics_deleted={trades_deleted[1]} "
+            f"vacuum={'yes' if vacuum_run else 'no'}"
+        )
+
+    def _cleanup_old_records(self) -> tuple[int, int]:
+        cutoff_trades  = int(
+            (datetime.now(timezone.utc) - timedelta(days=TRADES_RETENTION_DAYS))
+            .timestamp() * 1000
+        )
+        cutoff_metrics = int(
+            (datetime.now(timezone.utc) - timedelta(days=METRICS_RETENTION_DAYS))
+            .timestamp() * 1000
+        )
+        with self._lock:
+            trades_del = self._conn_obj.execute(
+                "DELETE FROM trades WHERE ts < ? AND reason != 'OPEN'",
+                (cutoff_trades,)
+            ).rowcount
+            metrics_del = self._conn_obj.execute(
+                "DELETE FROM metrics_snapshot WHERE ts < ?",
+                (cutoff_metrics,)
+            ).rowcount
+            self._conn_obj.commit()
+        return trades_del, metrics_del
+
+    def _run_vacuum(self, incremental: bool = False) -> bool:
+        """Ruleaza VACUUM pentru a elibera spatiu dupa stergeri.
+
+        incremental=True: VACUUM INCREMENTAL (10k pagini) — rapid, sigur la startup.
+        incremental=False: VACUUM complet — mai lent, rulat noaptea la midnight.
+        VACUUM nu poate rula in interiorul unei tranzactii active -> fara lock.
+        """
+        try:
+            if incremental:
+                self._conn_obj.execute("PRAGMA incremental_vacuum(10000)")
+            else:
+                # VACUUM complet necesita autocommit (nu in tranzactie)
+                old_isolation = self._conn_obj.isolation_level
+                self._conn_obj.isolation_level = None
+                self._conn_obj.execute("VACUUM")
+                self._conn_obj.isolation_level = old_isolation
+            return True
+        except Exception as e:
+            logger.warning(f"DB vacuum failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------ #
+    #  Public interface (neschimbata)                                      #
+    # ------------------------------------------------------------------ #
 
     def record_open_trade(
         self,
@@ -87,7 +180,6 @@ class Database:
         signal_score: float = 0.0,
         funding_rate: float = 0.0,
     ) -> int:
-        """Insert an OPEN trade row. Returns the row id for later update."""
         ts = int(datetime.now(timezone.utc).timestamp() * 1000)
         with self._lock:
             cur = self._conn_obj.execute(
@@ -109,19 +201,11 @@ class Database:
         pnl_usdt: float,
         pnl_pct: float,
         reason: str,
-        # BUG 14+15 FIX: parametri optionali pentru fallback complet
         symbol: str = "",
         side: str = "",
         entry: float = 0.0,
         qty: float = 0.0,
     ) -> None:
-        """Update the OPEN row with exit data.
-
-        v0.8.2 BUG 14+15 FIX:
-          Fallback foloseste acum symbol/side/entry/qty corecte in loc de
-          valori goale, astfel incat daily_pnl e actualizat corect pentru
-          simbolul tranzactionat si randul din DB e complet.
-        """
         if trade_id and trade_id > 0:
             with self._lock:
                 rows_affected = self._conn_obj.execute(
@@ -134,29 +218,16 @@ class Database:
                 ).rowcount
                 self._conn_obj.commit()
             if rows_affected:
-                # Actualizeaza si daily_pnl (UPDATE nu o face automat)
                 self._update_daily_pnl(symbol, pnl_usdt)
                 return
 
-        # Fallback: insert complet (bot restartat mid-trade sau trade_id invalid)
-        # BUG 14+15 FIX: transmitem simbolul si datele corecte
         self.record_trade(
-            symbol=symbol,
-            side=side,
-            entry=entry,
-            exit_price=exit_price,
-            qty=qty,
-            pnl_usdt=pnl_usdt,
-            pnl_pct=pnl_pct,
-            reason=reason,
+            symbol=symbol, side=side, entry=entry,
+            exit_price=exit_price, qty=qty,
+            pnl_usdt=pnl_usdt, pnl_pct=pnl_pct, reason=reason,
         )
 
     def _update_daily_pnl(self, symbol: str, pnl_usdt: float) -> None:
-        """Actualizeaza daily_pnl table dupa un UPDATE pe trades (nu INSERT).
-
-        record_trade() face asta automat la INSERT, dar close_trade_record()
-        face UPDATE pe randul existent -> daily_pnl nu era actualizat.
-        """
         if not symbol:
             return
         today = date.today().isoformat()
