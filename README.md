@@ -31,6 +31,7 @@ ORDER_SIZE_USDT=20
 DAILY_LOSS_LIMIT_USDT=50
 LOG_LEVEL=INFO
 PULSE_INTERVAL_S=60
+FEED_STALE_S=30
 ```
 
 ### 2. Pornire cu Python direct
@@ -64,12 +65,16 @@ curl http://localhost:8080/health
 
 | Comanda | Descriere |
 |---|---|
+| `/start` | Status complet la pornire + avertizare feed stale |
 | `/status` | Status curent: pozitie, PnL, balance |
 | `/balance` | Balanta USDT disponibila |
 | `/tp` | Niveluri TP/SL curente |
 | `/stop` | Opreste bot-ul graceful |
 | `/daily` | Raport zilnic |
 | `/watchdog` | Status watchdog + circuit breaker |
+| `/risk` | Daily loss, consecutive losses, Kelly factor, open count |
+| `/history [N]` | Ultimele N trade-uri inchise cu entry/PnL/motiv (max 30) |
+| `/menu` | Meniu inline cu toate comenzile |
 
 ## Simboluri suportate
 
@@ -83,35 +88,51 @@ curl http://localhost:8080/health
 
 Pentru multi-symbol: `SYMBOLS=BTCUSDT,ETHUSDT` in `.env`
 
+## Arhitectura feed
+
+> **v1.0.4**: Feed-ul WebSocket foloseste `websockets` nativ async in loc de
+> `pybit.unified_trading.WebSocket`. Toata comunicarea ruleaza pe acelasi
+> event loop asyncio — fara thread-switching, fara race conditions la startup.
+>
+> O singura conexiune multiplexata pentru `orderbook.50` + `kline.1`.
+> Reconnect automat la 3s dupa orice eroare. Ping Bybit la 20s.
+
 ## Structura proiect
 
 ```
 apex_scalper/
-├── main.py              # Entrypoint
+├── main.py              # Entrypoint + startup banner + midnight reset
 ├── config.py            # Configuratie + profiles per symbol
-├── strategy.py          # Logica de semnal (RSI, EMA, book pressure)
+├── strategy.py          # Logica semnal (RSI, EMA, book pressure, 8 gate-uri)
 ├── position_manager.py  # TP scale-out, trailing SL, pyramid
 ├── trader.py            # Bybit REST API wrapper
 ├── circuit_breaker.py   # Protectie erori exchange
 ├── risk.py              # Sizing Kelly + daily loss limit
-├── feed.py              # WebSocket feed
+├── feed.py              # WebSocket nativ async (orderbook + kline)
 ├── mtf_filter.py        # Multi-timeframe EMA50(15m) bias
 ├── regime_filter.py     # ADX + Hurst regime detection
 ├── book_pressure.py     # Bid/ask imbalance
 ├── anti_manipulation.py # Wall detection
-├── persistence.py       # SQLite (trades, daily PnL, metrics)
-├── telegram_ui.py       # Telegram bot comenzi
+├── persistence.py       # SQLite (trades, daily PnL, metrics, get_last_trades)
+├── telegram_ui.py       # Telegram bot comenzi + notify_open/tp/sl/close
 ├── watchdog.py          # Auto-restart la blocaj
 ├── pulse.py             # Raport periodic Telegram
 ├── health.py            # HTTP health endpoint
+├── indicator_warmup.py  # 60 candle-uri historice la startup
 └── state.py             # State global shared
 ```
 
-## Versiuni
+## Changelog
 
 | Versiune | Descriere |
 |---|---|
-| v0.9.5 | SQLite auto-cleanup + vacuum, docker-compose, README |
+| **v1.0.4** | Feed rescris cu `websockets` nativ async — fix candle silentios |
+| **v1.0.3** | Startup banner, midnight reset cu stats, `/risk`, `/history`, shutdown alert |
+| **v1.0.2** | notify_tp/sl/close in position_manager |
+| **v1.0.1** | FEED_STALE_S race condition fix, evaluate pe tick live |
+| **v1.0.0** | Debug logging la fiecare gate blocat |
+| v0.9.6 | `get_last_trades()` in persistence pentru `/history` |
+| v0.9.5 | SQLite auto-cleanup + vacuum, docker-compose |
 | v0.9.4 | Pyramid margin check, graceful shutdown |
 | v0.9.3 | Config fail-fast validate() |
 | v0.9.2 | Circuit breaker, close_position retry |
