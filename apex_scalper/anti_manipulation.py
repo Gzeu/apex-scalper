@@ -1,4 +1,9 @@
-"""Anti-manipulation filter v0.4.2 — thread-safe signals singleton.
+"""Anti-manipulation filter v0.4.3 — redenumit instanta la anti_manipulation.
+
+Fixes vs v0.4.2:
+  FIX — strategy.py importa `from .anti_manipulation import anti_manipulation`
+    dar instanta singleton se numea `anti_manip`. Redenumit la `anti_manipulation`
+    pentru consistenta cu toate import-urile existente.
 
 Fixes vs v0.4.1:
   FIX #6 — Race condition on _signals singleton:
@@ -113,6 +118,11 @@ class AntiManipulation:
 
         return _signals
 
+    def is_suspicious(self) -> bool:
+        """Getter direct folosit de strategy.evaluate() la GATE 5."""
+        with _signals_lock:
+            return _signals.suspicious
+
     def clear_for_entry(self, side: str) -> bool:
         """FIX #6: read a snapshot under lock — no TOCTOU with analyze()."""
         with _signals_lock:
@@ -129,4 +139,8 @@ class AntiManipulation:
         return True
 
 
-anti_manip = AntiManipulation()
+# Instanta singleton — accesata ca `from .anti_manipulation import anti_manipulation`
+anti_manipulation = AntiManipulation()
+
+# Alias backward-compat daca exista alte referinte la anti_manip
+anti_manip = anti_manipulation
