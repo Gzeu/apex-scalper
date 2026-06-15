@@ -1,12 +1,13 @@
-"""Position Manager v1.3.1 — pyramid qty_step fix + close_partial floor.
+"""Position Manager v1.3.2 — SL pe exchange setat la entry.
 
 Changelog:
-  v1.3.1 — BUG FIX: doua locuri cu qty invalid:
-    1. try_pyramid() apela risk.calc_qty() fara qty_step -> zecimale la DOGE.
-       Fix: pasam trader._qty_step ca la _enter() din strategy.py.
-    2. _close_partial() facea round(open_qty * fraction, 6) -> zecimale.
-       Fix: math.floor(qty_raw / qty_step) * qty_step (acelasi pattern ca calc_qty).
-       Protectie: qty >= trader._qty_step (nu trimitem qty=0).
+  v1.3.2 — on_open() seteaza acum SL pe exchange (Bybit) imediat la entry.
+    Inainte: SL exista doar software (evaluate() per candle).
+    Riscul: daca botul crapa intre candle-uri, pozitia ramanea fara SL activ
+    pe exchange -> la 50x leverage -> lichidare totala posibila.
+    Fix: trader.amend_sl_tp(stop_loss=sl_price) in on_open(), imediat dupa
+    setarea entry_price. SL calculat dinamic pe ATR (acelasi _dynamic_sl_pct).
+  v1.3.1 — pyramid qty_step fix + close_partial floor.
   v1.3.0 — SL + Trailing dinamic pe ATR (50x safe).
   v1.2.1 — BUG CRITIC: _close_full() verifica retur + state guard.
   v1.2.0 — Breakeven SL dupa TP1, timeout smart exit.
@@ -219,20 +220,43 @@ class PositionManager:
         entry_price: float,
         trade_id: int | None = None,
     ) -> None:
-        prof = _get_profile()
-        sl_used = _dynamic_sl_pct()
+        prof    = _get_profile()
+        sl_pct  = _dynamic_sl_pct()
         atr_pct = _get_current_atr_pct()
+
         async with self._snapshot_lock:
             self._reset_fields()
             self._entry_side  = side
             self._entry_qty   = qty
             self._entry_price = entry_price
             self._trade_id    = trade_id
+
         logger.info(
             f"[PM] Entry: side={side} qty={qty} price={entry_price} "
-            f"| sl_dynamic={sl_used:.4%} (ATR={atr_pct:.4%} x{_SL_ATR_MULT}) "
+            f"| sl_dynamic={sl_pct:.4%} (ATR={atr_pct:.4%} x{_SL_ATR_MULT}) "
             f"| lev={prof.get('leverage', '?')}x"
         )
+
+        # --- SL pe exchange la entry (protectie crash bot) ---
+        if side == "long":
+            sl_price = entry_price * (1.0 - sl_pct)
+        else:
+            sl_price = entry_price * (1.0 + sl_pct)
+
+        try:
+            resp = await trader.amend_sl_tp(stop_loss=sl_price)
+            if resp and resp.get("retCode") == 0:
+                logger.info(
+                    f"[PM] SL exchange setat: {sl_price:.6f} "
+                    f"({sl_pct:.4%} de la entry={entry_price:.6f})"
+                )
+            else:
+                logger.warning(
+                    f"[PM] SL exchange ESUAT la entry: {resp} "
+                    f"| sl_price={sl_price:.6f} — only software SL active!"
+                )
+        except Exception as e:
+            logger.warning(f"[PM] SL exchange exceptie la entry: {e} — only software SL active!")
 
     def _unrealised_pnl_pct(self, current_price: float) -> float:
         if self._entry_price <= 0:
@@ -291,7 +315,7 @@ class PositionManager:
             last_price = state.last_price
 
         raw_qty = open_qty * fraction
-        qty     = _floor_to_qty_step(raw_qty)  # FIX: floor la qty_step
+        qty     = _floor_to_qty_step(raw_qty)
 
         if qty <= 0:
             logger.warning(f"[PM] {label}: qty=0, skipping")
@@ -547,7 +571,7 @@ class PositionManager:
             price,
             order_size_usdt = config.order_size_usdt,
             leverage        = config.leverage,
-            qty_step        = trader._qty_step,   # FIX: qty_step corect
+            qty_step        = trader._qty_step,
             regime_factor   = 0.5,
         )
         if add_qty <= 0:
