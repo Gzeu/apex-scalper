@@ -1,10 +1,11 @@
-"""Health & metrics HTTP endpoint v0.8.4.
+"""Health & metrics HTTP endpoint v0.8.5.
 
 Changelog:
-  v0.8.4 — BUG 20 FIX: last_tick_ts exista acum explicit in BotState (state.py).
-    Inainte: getattr(state, 'last_tick_ts', 0.0) returna mereu 0.0
-    -> tick_age=inf -> feed_stale=True permanent -> Docker HEALTHCHECK 503.
-    Acum: state.last_tick_ts citit direct, fara getattr fallback.
+  v0.8.5 — FIX: `type method doesn't define __round__ method`.
+    perf.win_rate / sharpe / profit_factor / max_drawdown pot returna None
+    sau un tip non-numeric cand nu exista trades inca. round() pe None crapa.
+    Fix: float(x or 0.0) inainte de round() pe toate campurile din /metrics.
+  v0.8.4 — BUG 20 FIX: last_tick_ts exista acum explicit in BotState.
   v0.7.4 — /health, /metrics, /metrics/prometheus endpoints.
 
 Endpoints:
@@ -25,6 +26,14 @@ HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
 FEED_STALE_S = float(os.getenv("FEED_STALE_S", "2.0"))
 
 _start_time = time.time()
+
+
+def _f(val, fallback: float = 0.0) -> float:
+    """Conversie sigura la float — evita __round__ errors pe None/property."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return fallback
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -66,7 +75,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from .state import state
         uptime = time.time() - _start_time
         with state.lock:
-            # BUG 20 FIX: acces direct la state.last_tick_ts (exista acum in BotState)
             last_tick_ts  = state.last_tick_ts
             open_position = state.open_position
             running       = state.running
@@ -78,8 +86,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
         self._send_json({
             "status":          status,
-            "uptime_s":        round(uptime, 1),
-            "last_tick_age_s": round(tick_age, 3),
+            "uptime_s":        round(_f(uptime), 1),
+            "last_tick_age_s": round(_f(tick_age), 3),
             "feed_stale":      feed_stale,
             "open_position":   open_position or "none",
             "trading_active":  running and not paused,
@@ -89,13 +97,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from .performance import perf
         from .risk import risk
         self._send_json({
-            "daily_pnl_usdt":      round(getattr(risk, "_daily_loss", 0.0), 4),
-            "win_rate":            round(perf.win_rate, 4),
-            "sharpe":              round(perf.sharpe, 4),
-            "profit_factor":       round(perf.profit_factor, 4),
-            "max_drawdown":        round(perf.max_drawdown, 4),
-            "kelly_factor":        round(getattr(risk, "_kelly_factor", 0.0), 4),
-            "consecutive_losses":  getattr(risk, "_consecutive_losses", 0),
+            "daily_pnl_usdt":      round(_f(getattr(risk,  "_daily_loss",       0.0)), 4),
+            "win_rate":            round(_f(getattr(perf,  "win_rate",          0.0)), 4),
+            "sharpe":              round(_f(getattr(perf,  "sharpe",            0.0)), 4),
+            "profit_factor":       round(_f(getattr(perf,  "profit_factor",     0.0)), 4),
+            "max_drawdown":        round(_f(getattr(perf,  "max_drawdown",      0.0)), 4),
+            "kelly_factor":        round(_f(getattr(risk,  "_kelly_factor",     0.0)), 4),
+            "consecutive_losses":  int(getattr(risk, "_consecutive_losses", 0) or 0),
         })
 
     def _handle_metrics_prometheus(self) -> None:
@@ -108,19 +116,19 @@ class _HealthHandler(BaseHTTPRequestHandler):
         lines = [
             "# HELP apex_win_rate Trading win rate",
             "# TYPE apex_win_rate gauge",
-            f"apex_win_rate {perf.win_rate:.6f}",
+            f"apex_win_rate {_f(getattr(perf, 'win_rate', 0.0)):.6f}",
             "# HELP apex_sharpe Sharpe ratio (Welford streaming)",
             "# TYPE apex_sharpe gauge",
-            f"apex_sharpe {perf.sharpe:.6f}",
+            f"apex_sharpe {_f(getattr(perf, 'sharpe', 0.0)):.6f}",
             "# HELP apex_feed_tick_age_seconds Age of last OB tick",
             "# TYPE apex_feed_tick_age_seconds gauge",
-            f"apex_feed_tick_age_seconds {tick_age:.3f}",
+            f"apex_feed_tick_age_seconds {_f(tick_age):.3f}",
             "# HELP apex_kelly_factor Current Kelly sizing factor",
             "# TYPE apex_kelly_factor gauge",
-            f"apex_kelly_factor {getattr(risk, '_kelly_factor', 0.0):.6f}",
+            f"apex_kelly_factor {_f(getattr(risk, '_kelly_factor', 0.0)):.6f}",
             "# HELP apex_consecutive_losses Consecutive losing trades",
             "# TYPE apex_consecutive_losses gauge",
-            f"apex_consecutive_losses {getattr(risk, '_consecutive_losses', 0)}",
+            f"apex_consecutive_losses {int(getattr(risk, '_consecutive_losses', 0) or 0)}",
             "",
         ]
         self._send_text("\n".join(lines))
