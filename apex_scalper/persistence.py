@@ -1,17 +1,10 @@
-"""SQLite persistence v0.9.5 — Improvement #6: vacuum + trades cleanup.
+"""SQLite persistence v0.9.6 — adaugat get_last_trades() pentru /history.
 
 Changelog:
+  v0.9.6 — adaugat get_last_trades(symbol, limit) pentru comanda /history
+    din telegram_ui. Returneaza ultimele N trade-uri inchise (reason!='OPEN'),
+    ordonate descrescator dupa timestamp, cu camp closed_at derivat din ts.
   v0.9.5 — Improvement #6: auto-cleanup + VACUUM programat.
-    Vechi: tabelele trades si metrics_snapshot cresteau nelimitat.
-    Dupa saptamani de trading: DB de sute MB, queries lente, disk plin.
-    Nou:
-      - _cleanup_old_records(): sterge trades mai vechi de TRADES_RETENTION_DAYS (90)
-        si metrics_snapshot mai vechi de METRICS_RETENTION_DAYS (30).
-      - _run_vacuum(): VACUUM incremental o data pe zi pentru a elibera
-        spatiul de pe disk dupa stergeri.
-      - run_maintenance(): apelat automat la startup si o data pe zi
-        (programat in main.py prin _midnight_reset_loop logic).
-      - Nicio schimbare la interfata publica (record_trade, load_daily_pnl etc.).
   v0.8.2 — BUG 14+15 FIX: close_trade_record() fallback complet.
   v0.4.1 — WAL + correlated trade records.
 """
@@ -168,7 +161,7 @@ class Database:
             return False
 
     # ------------------------------------------------------------------ #
-    #  Public interface (neschimbata)                                      #
+    #  Public interface                                                    #
     # ------------------------------------------------------------------ #
 
     def record_open_trade(
@@ -332,6 +325,36 @@ class Database:
                 (symbol, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_last_trades(self, symbol: str, limit: int = 10) -> list[dict]:
+        """Returneaza ultimele N trade-uri inchise pentru comanda /history.
+
+        Exclude inregistrarile cu reason='OPEN' (pozitii inca deschise).
+        Adauga campul 'closed_at' derivat din timestamp-ul UTC al inregistrarii.
+        """
+        limit = min(limit, 30)
+        with self._lock:
+            rows = self._conn_obj.execute(
+                """
+                SELECT * FROM trades
+                WHERE symbol=? AND reason != 'OPEN'
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                (symbol, limit),
+            ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            # Derivam closed_at din ts (milliseconds UTC)
+            try:
+                d["closed_at"] = datetime.fromtimestamp(
+                    d["ts"] / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                d["closed_at"] = "—"
+            result.append(d)
+        return result
 
 
 db = Database()
