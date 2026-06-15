@@ -1,19 +1,15 @@
-"""Position Manager v0.9.4 — Improvement #2: pyramid margin check.
+"""Position Manager v1.0.2 — notify_tp/notify_sl/notify_close integrate.
 
 Changelog:
-  v0.9.4 — Improvement #2: try_pyramid() verifica margin disponibil inainte
-    de a plasa al doilea ordin.
-    Vechi: MAX_PYRAMID_ADDS limita numarul de adaugiri dar nu verifica daca
-    exista margin suficient. La 100x leverage, un al doilea ordin de 20 USDT
-    necesita cel putin 20 USDT margin liber; daca nu exista, exchange-ul
-    respinge ordinul cu 'insufficient balance' sau mai rau: margin call instant.
-    Nou: inainte de place_order(), get_balance() e apelat.
-    Daca balance < order_size_usdt * PYRAMID_MARGIN_BUFFER (1.5x safety),
-    pyramid-ul e sarit cu log WARNING si mesaj Telegram.
-  v0.8.6 — BUG 27 FIX: Software SL in evaluate().
-  v0.8.6 — BUG 28 FIX: _close_full() reseteaza explicit state.open_qty.
+  v1.0.2 — Telegram notificari complete:
+    - notify_sl()    apelata la Software SL si Trail triggered
+    - notify_tp(1/2) apelata la TP1/TP2 partial close
+    - notify_close() apelata la TP3 (trade complet), TRAIL, TIMEOUT
+    Toate apelurile sunt fire-and-forget (asyncio.ensure_future) ca sa nu
+    blocheze logica critica de close in caz ca Telegram e lent.
+  v0.9.4 — Improvement #2: pyramid margin check.
+  v0.8.6 — BUG 27+28 FIX.
   v0.8.0 — BUG 1/2/5 FIX.
-  v0.7.9 — race-condition fix (PositionSnapshot + lock).
 """
 from __future__ import annotations
 
@@ -27,7 +23,7 @@ from .risk import risk
 from .persistence import db
 
 # --------------------------------------------------------------------------- #
-#  Parameters                                                                  #
+#  Parameters
 # --------------------------------------------------------------------------- #
 TP1_PCT          = 0.0012
 TP2_PCT          = 0.0025
@@ -43,9 +39,17 @@ MAX_PYRAMID_ADDS = 2
 
 PYRAMID_SCORE_MIN      = 0.70
 PYRAMID_PNL_MIN        = 0.0010
-PYRAMID_MARGIN_BUFFER  = 1.5   # safety factor: balance trebuie sa fie >= cost * 1.5
+PYRAMID_MARGIN_BUFFER  = 1.5
 CONFIRM_POLL_INTERVAL  = 0.5
 CONFIRM_POLL_MAX       = 8
+
+
+def _tg_notify(coro) -> None:
+    """Fire-and-forget Telegram notify — nu blocheaza logica critica."""
+    try:
+        asyncio.ensure_future(coro)
+    except Exception as e:
+        logger.debug(f"[PM] tg_notify schedule error: {e}")
 
 
 @dataclass
@@ -185,20 +189,15 @@ class PositionManager:
         close_side = self._bybit_side(self._entry_side, closing=True)
 
         resp = await trader.place_order(
-            side=close_side,
-            qty=qty,
-            order_type="Limit",
-            post_only=False,
-            price=last_price,
-            reduce_only=True,
+            side=close_side, qty=qty,
+            order_type="Limit", post_only=False,
+            price=last_price, reduce_only=True,
         )
         if resp.get("retCode") != 0:
             logger.error(f"[PM] {label} limit rejected: {resp.get('retMsg')}")
             fb = await trader.place_order(
-                side=close_side,
-                qty=qty,
-                order_type="Market",
-                post_only=False,
+                side=close_side, qty=qty,
+                order_type="Market", post_only=False,
                 reduce_only=True,
             )
             filled = fb.get("retCode") == 0
@@ -213,10 +212,8 @@ class PositionManager:
         if not filled:
             logger.warning(f"[PM] {label} limit not filled — market fallback")
             fb = await trader.place_order(
-                side=close_side,
-                qty=qty,
-                order_type="Market",
-                post_only=False,
+                side=close_side, qty=qty,
+                order_type="Market", post_only=False,
                 reduce_only=True,
             )
             filled = fb.get("retCode") == 0
@@ -231,6 +228,7 @@ class PositionManager:
     async def _close_full(self, reason: str, pnl_pct: float) -> None:
         with state.lock:
             remaining_qty = state.open_qty
+        side = self._entry_side
         pnl_usdt = self._pnl_usdt(pnl_pct, remaining_qty)
         await trader.close_position()
         risk.on_close(pnl_usdt, pnl_pct)
@@ -246,6 +244,16 @@ class PositionManager:
         async with self._snapshot_lock:
             self._reset_fields()
 
+        # Notificari Telegram fire-and-forget
+        try:
+            from .telegram_ui import notify_sl, notify_close
+            if reason in ("SL_SOFTWARE", "SL_EXCHANGE"):
+                _tg_notify(notify_sl(side, remaining_qty, pnl_usdt))
+            else:
+                _tg_notify(notify_close(side, remaining_qty, pnl_usdt, reason))
+        except Exception as e:
+            logger.debug(f"[PM] tg import error: {e}")
+
     async def evaluate(self, current_price: float) -> bool:
         if not state.open_position:
             return True
@@ -257,7 +265,7 @@ class PositionManager:
 
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
-        # Software SL
+        # --- Software SL ---
         if pnl_pct <= -SL_PCT:
             logger.warning(
                 f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{SL_PCT:.4%}"
@@ -265,7 +273,7 @@ class PositionManager:
             await self._close_full("SL_SOFTWARE", pnl_pct)
             return True
 
-        # TP1
+        # --- TP1 ---
         if not self._tp1_hit and pnl_pct >= TP1_PCT:
             filled, qty_closed = await self._close_partial(TP1_FRACTION, "TP1")
             if filled:
@@ -274,7 +282,13 @@ class PositionManager:
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, entry_price_now)
                 risk.on_close(partial_pnl, pnl_pct)
                 logger.info(f"[PM] TP1 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f}")
+                try:
+                    from .telegram_ui import notify_tp
+                    _tg_notify(notify_tp(self._entry_side, 1, qty_closed, partial_pnl))
+                except Exception as e:
+                    logger.debug(f"[PM] tg notify_tp1 error: {e}")
 
+        # --- TP2 ---
         elif self._tp1_hit and not self._tp2_hit and pnl_pct >= TP2_PCT:
             filled, qty_closed = await self._close_partial(TP2_FRACTION, "TP2")
             if filled:
@@ -283,11 +297,18 @@ class PositionManager:
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, entry_price_now)
                 risk.on_close(partial_pnl, pnl_pct)
                 logger.info(f"[PM] TP2 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f}")
+                try:
+                    from .telegram_ui import notify_tp
+                    _tg_notify(notify_tp(self._entry_side, 2, qty_closed, partial_pnl))
+                except Exception as e:
+                    logger.debug(f"[PM] tg notify_tp2 error: {e}")
 
+        # --- TP3 (trade complet) ---
         elif self._tp2_hit and not self._tp3_hit and pnl_pct >= TP3_PCT:
             filled, qty_closed = await self._close_partial(TP3_FRACTION, "TP3")
             if filled:
                 saved_entry = self._entry_price
+                saved_side  = self._entry_side
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, saved_entry)
                 async with self._snapshot_lock:
                     self._tp3_hit = True
@@ -299,9 +320,14 @@ class PositionManager:
                     state.open_qty      = 0.0
                     state.open_entry    = 0.0
                     state.trailing_stop = 0.0
+                try:
+                    from .telegram_ui import notify_tp
+                    _tg_notify(notify_tp(saved_side, 3, qty_closed, partial_pnl))
+                except Exception as e:
+                    logger.debug(f"[PM] tg notify_tp3 error: {e}")
                 return True
 
-        # Trailing stop
+        # --- Trailing stop ---
         if pnl_pct >= TRAIL_PCT:
             if not self._trail_active:
                 async with self._snapshot_lock:
@@ -325,7 +351,7 @@ class PositionManager:
                 await self._close_full("TRAIL", pnl_pct)
                 return True
 
-        # Timeout
+        # --- Timeout ---
         if hold >= MAX_HOLD_CANDLES:
             logger.info(f"[PM] Timeout ({MAX_HOLD_CANDLES} candles) — closing")
             await self._close_full("TIMEOUT", pnl_pct)
@@ -341,16 +367,6 @@ class PositionManager:
         stop_loss: float,
         take_profit: float,
     ) -> None:
-        """Adauga la pozitia curenta (pyramid) cu verificare margin.
-
-        Improvement #2: inainte de place_order(), verifica ca balance disponibil
-        este suficient pentru costul ordinului de pyramid (cu safety buffer 1.5x).
-        La 100x leverage, fiecare ordin de 20 USDT necesita 0.2 USDT margin +
-        fees, dar in practica exchange-ul poate face margin call instant daca
-        contul e aproape de limita. Buffer-ul de 1.5x acoperit si volatilitatea.
-
-        Daca balance insuficient: log WARNING + alert Telegram + pyramid sarit.
-        """
         async with self._snapshot_lock:
             if self._pyramid_adds >= MAX_PYRAMID_ADDS:
                 return
@@ -370,37 +386,31 @@ class PositionManager:
         if add_qty <= 0:
             return
 
-        # --- Improvement #2: margin check ---
-        required_margin = config.order_size_usdt * PYRAMID_MARGIN_BUFFER
+        required_margin   = config.order_size_usdt * PYRAMID_MARGIN_BUFFER
         available_balance = await trader.get_balance()
 
         if available_balance < required_margin:
             msg = (
                 f"\u26a0\ufe0f *Pyramid sarit — margin insuficient*\n"
                 f"Disponibil: `{available_balance:.2f} USDT`\n"
-                f"Necesar (cu buffer 1.5x): `{required_margin:.2f} USDT`\n"
-                f"Order size: `{config.order_size_usdt} USDT` @ {config.leverage}x"
+                f"Necesar (1.5x): `{required_margin:.2f} USDT`"
             )
             logger.warning(
-                f"[PM] Pyramid skipped — insufficient margin: "
-                f"balance={available_balance:.2f} USDT < required={required_margin:.2f} USDT"
+                f"[PM] Pyramid skipped — balance={available_balance:.2f} "
+                f"< required={required_margin:.2f} USDT"
             )
             try:
                 from .telegram_ui import send_message
-                await send_message(msg)
+                _tg_notify(send_message(msg))
             except Exception:
                 pass
             return
-        # --- end margin check ---
 
         bybit_side = self._bybit_side(side, closing=False)
         resp = await trader.place_order(
-            side=bybit_side,
-            qty=add_qty,
-            order_type="Market",
-            post_only=False,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
+            side=bybit_side, qty=add_qty,
+            order_type="Market", post_only=False,
+            stop_loss=stop_loss, take_profit=take_profit,
         )
         if resp.get("retCode") == 0:
             async with self._snapshot_lock:
@@ -409,8 +419,7 @@ class PositionManager:
                 state.open_qty += add_qty
             logger.info(
                 f"[PM] Pyramid add #{self._pyramid_adds}: "
-                f"qty={add_qty} pnl={pnl_pct:.4%} score={score:.3f} "
-                f"balance_before={available_balance:.2f} USDT"
+                f"qty={add_qty} pnl={pnl_pct:.4%} score={score:.3f}"
             )
 
 
