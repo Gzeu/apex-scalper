@@ -1,18 +1,14 @@
-"""Settings loader v0.9.3 — DOGEUSDT recalibrat pentru cont mic.
+"""Settings loader v0.9.4 — DOGEUSDT leverage 50x.
 
 Changelog:
-  v0.9.3 — DOGEUSDT profil recalibrat:
-    - leverage: 5→10 (safe pentru cont 5-10$, lichidare la ~10% move)
-    - order_size_usdt: 10→5 (50 USDT notional, ~560 DOGE qty, peste minim Bybit)
-    - daily_loss_limit_usdt: 25→2 (max 40% din cont/zi)
-    - tp1_pct: 0.0018→0.0030 (0.30% - acoperit comision 0.11% + profit net)
-    - tp2_pct: 0.0040→0.0060
-    - tp3_pct: 0.0065→0.0100
-    - sl_pct: 0.0012→0.0020 (mai putin sens, DOGE face 0.5% intr-un minut)
-    - entry_threshold: 0.68→0.62 (realist cu indicatori in warmup)
-    - vol_zscore_min: 0.5→0.0 (nu bloca pe volum scazut)
-    - bp_base_threshold: 5000→3000 (mai usor de atins pe DOGE)
-    - max_pyramid_adds: 0 (nu adauga la pozitie cu cont mic)
+  v0.9.4 — DOGEUSDT leverage 10→50x la cererea utilizatorului.
+    - leverage: 10→50
+    - order_size_usdt: 5 (notional = 5 × 50 = 250 USDT)
+    - daily_loss_limit_usdt: 2→5 (mai relevant cu notional mare)
+    - tp1_pct: 0.0030 (TP1 net = 250 * 0.0030 - fee = ~0.475 USDT)
+    - sl_pct: 0.0020 (SL = 250 * 0.0020 = 0.50 USDT risc/trade)
+    - Lichidare estimata la ~2% miscare adversa (implicit 50x)
+  v0.9.3 — DOGEUSDT recalibrat pentru cont mic.
   v0.9.2 — Config.validate() adaugat.
 """
 from __future__ import annotations
@@ -154,15 +150,16 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "wall_distance_ticks":  3,
     },
     "DOGEUSDT": {
-        # --- Calibrat pentru cont mic (5-10 USDT disponibil) ---
-        # 5 USDT x 10x = 50 USDT notional / 0.089 = ~560 DOGE (peste minim Bybit)
-        # Comision dus-intors: 0.11% = 0.055 USDT
-        # TP1 la 0.30% = 0.15 USDT brut -> 0.095 USDT net dupa comision
-        # SL la 0.20% = 0.10 USDT risc per trade = 2% din cont
-        # daily_loss_limit = 2 USDT = max 2 SL consecutive
-        "leverage":             10,
+        # --- 50x leverage, order_size_usdt=5 ---
+        # Notional: 5 USDT × 50x = 250 USDT
+        # Qty: 250 / ~0.089 ≈ 2808 DOGE (floor la qty_step=1)
+        # Comision dus-intors: 0.11% = 0.275 USDT
+        # TP1 la 0.30%: 250 * 0.0030 = 0.75 USDT brut → ~0.475 USDT net
+        # SL la 0.20%:  250 * 0.0020 = 0.50 USDT risc/trade
+        # Lichidare estimata: ~2% miscare adversa (50x)
+        "leverage":             50,
         "order_size_usdt":      5,
-        "daily_loss_limit_usdt": 2.0,
+        "daily_loss_limit_usdt": 5.0,
         "tp1_pct":              0.0030,
         "tp2_pct":              0.0060,
         "tp3_pct":              0.0100,
@@ -306,7 +303,7 @@ class Config:
         sym = symbol or self.symbol
         return SYMBOL_PROFILES.get(sym, SYMBOL_PROFILES[DEFAULT_SYMBOL])
 
-    def active_symbols(self) -> list[str]:
+    def active_symbols(self) -> list[str] :
         return self.symbols if self.symbols else [self.symbol]
 
     @property
