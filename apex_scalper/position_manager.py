@@ -1,18 +1,22 @@
-"""Position Manager v1.2.0 — Breakeven SL dupa TP1 + timeout smart exit.
+"""Position Manager v1.2.1 — 4 buguri fixate.
 
 Changelog:
-  v1.2.0 — WIN RATE FIX:
-    BREAKEVEN SL: imediat dupa TP1 hit, SL-ul e mutat la
-      entry_price + ROUND_TRIP_FEE (long) sau entry_price - fee (short).
-      Efectul: restul de 60% din pozitie NU POATE iesi pe minus.
-      Cel mai rau caz dupa TP1 = breakeven (0 USDT pierdut).
-    TIMEOUT SMART EXIT: daca pozitia expira pe timeout si pnl > 0
-      inchide cu profit (chiar mic). Daca pnl < 0 si tp1 deja hit
-      (breakeven activ) inchide oricum (e garantat aproape de 0).
-      Daca pnl < 0 si tp1 nu e hit -> mai asteapta 2 candle-uri extra
-      inainte de close fortat (max_hold + 2).
+  v1.2.1 — BUG FIXES:
+    BUG CRITIC: _close_full() nu verifica daca close_position() a reusit.
+      Daca ordinul esua, state-ul local era curatata (open_position=None)
+      dar pozitia ramanea deschisa pe exchange -> posibil trade dublu.
+      Fix: verifica returul bool al close_position(); daca False, NU
+      curata state-ul si trimite alert Telegram explicit.
+    BUG LOGIC: tp1_already_hit citit la inceputul evaluate() - daca TP1
+      era atins in acelasi apel, timeout-ul vedea valoarea veche (False)
+      si intra pe grace in loc de TIMEOUT_BE.
+      Fix: reciteste self._tp1_hit DUPA blocul TP1.
+    BUG INCONSISTENTA: leverage pentru net_profit_check in strategy
+      folosea prof.get('leverage') dar qty folosea config.leverage global.
+      Rezolvat prin expunerea leverage-ului efectiv din profil via
+      _get_effective_leverage() - position_manager ramane consistent.
+  v1.2.0 — Breakeven SL dupa TP1, timeout smart exit.
   v1.1.0 — TP/SL/Trail citite din profil per symbol.
-  v1.0.2 — Telegram notificari complete.
 """
 from __future__ import annotations
 
@@ -40,16 +44,15 @@ _DEFAULT_TRAIL_DELTA   = 0.0010
 _DEFAULT_MAX_HOLD      = 4
 _DEFAULT_MAX_PYRAMID   = 0
 
-# Comision Bybit taker dus-intors = 0.055% x 2
-ROUND_TRIP_FEE         = 0.00055 * 2   # 0.0011
-# Extra candle-uri de gratie daca pozitia e pe minus si TP1 nu e hit
-_TIMEOUT_GRACE         = 2
+# Comision Bybit taker dus-intors
+ROUND_TRIP_FEE  = 0.00055 * 2   # 0.0011
+_TIMEOUT_GRACE  = 2
 
-PYRAMID_SCORE_MIN      = 0.70
-PYRAMID_PNL_MIN        = 0.0010
-PYRAMID_MARGIN_BUFFER  = 1.5
-CONFIRM_POLL_INTERVAL  = 0.5
-CONFIRM_POLL_MAX       = 8
+PYRAMID_SCORE_MIN     = 0.70
+PYRAMID_PNL_MIN       = 0.0010
+PYRAMID_MARGIN_BUFFER = 1.5
+CONFIRM_POLL_INTERVAL = 0.5
+CONFIRM_POLL_MAX      = 8
 
 MAX_HOLD_CANDLES = _DEFAULT_MAX_HOLD
 
@@ -207,16 +210,17 @@ class PositionManager:
         return config.symbol
 
     async def _set_breakeven_sl(self) -> None:
-        """Muta SL la breakeven (entry + comision) dupa TP1.
-        Long:  SL = entry * (1 + ROUND_TRIP_FEE)  -> cel mai rau: iesim la 0
-        Short: SL = entry * (1 - ROUND_TRIP_FEE)
-        """
+        """Muta SL la breakeven (entry + comision) dupa TP1."""
         if self._breakeven_set or self._entry_price <= 0:
             return
         if self._entry_side == "long":
-            be_price = self._entry_price * (1 + ROUND_TRIP_FEE)
+            be_price = self._entry_price * (1.0 + ROUND_TRIP_FEE)
         else:
-            be_price = self._entry_price * (1 - ROUND_TRIP_FEE)
+            be_price = self._entry_price * (1.0 - ROUND_TRIP_FEE)
+        # Guard: be_price trebuie sa fie > 0 (evita amend cu 0.0)
+        if be_price <= 0:
+            logger.warning(f"[PM] Breakeven SL invalid: {be_price} — skip")
+            return
         try:
             resp = await trader.amend_sl_tp(stop_loss=be_price)
             if resp and resp.get("retCode") == 0:
@@ -281,12 +285,42 @@ class PositionManager:
 
         return filled, qty if filled else 0.0
 
-    async def _close_full(self, reason: str, pnl_pct: float) -> None:
+    async def _close_full(self, reason: str, pnl_pct: float) -> bool:
+        """Inchide pozitia completa.
+
+        FIX BUG CRITIC v1.2.1: verifica returul close_position().
+        Daca False (toate retry-urile au esuat), NU curata state-ul local
+        si NU apeleaza risk.on_close() — pozitia ramane tracked corect.
+        Returneaza True daca inchiderea a reusit, False altfel.
+        """
         with state.lock:
             remaining_qty = state.open_qty
-        side = self._entry_side
+        side     = self._entry_side
         pnl_usdt = self._pnl_usdt(pnl_pct, remaining_qty)
-        await trader.close_position()
+
+        closed = await trader.close_position()
+
+        if not closed:
+            # Ordinul a esuat dupa toate retry-urile — NU curata state-ul
+            logger.critical(
+                f"[PM] _close_full({reason}) ESUAT — pozitia RAMANE deschisa pe exchange! "
+                f"pnl={pnl_pct:.4%} ({pnl_usdt:+.4f} USDT) — bot OPRIT din siguranta"
+            )
+            try:
+                from .telegram_ui import send_message
+                _tg_notify(send_message(
+                    f"\U0001f6a8 *CRITIC: Close ESUAT* ({reason})\n"
+                    f"`{side} qty={remaining_qty} pnl={pnl_usdt:+.4f} USDT`\n"
+                    f"Pozitia poate fi INCA DESCHISA. Verifica manual!"
+                ))
+            except Exception:
+                pass
+            # Opreste bot-ul din a deschide noi trade-uri
+            with state.lock:
+                state.paused = True
+            return False
+
+        # Inchidere reusita — curata state
         risk.on_close(pnl_usdt, pnl_pct)
         logger.info(
             f"[PM] Full close ({reason}): "
@@ -309,6 +343,8 @@ class PositionManager:
         except Exception as e:
             logger.debug(f"[PM] tg import error: {e}")
 
+        return True
+
     async def evaluate(self, current_price: float) -> bool:
         if not state.open_position:
             return True
@@ -328,18 +364,15 @@ class PositionManager:
             self._hold_candles += 1
             hold            = self._hold_candles
             entry_price_now = self._entry_price
-            tp1_already_hit = self._tp1_hit
             be_already_set  = self._breakeven_set
 
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
-        # --- Software SL (activ doar daca breakeven inca nu e setat) ---
+        # --- Software SL (doar daca breakeven inca nu e setat) ---
         if not be_already_set and pnl_pct <= -sl_pct:
-            logger.warning(
-                f"[PM] Software SL: pnl={pnl_pct:.4%} <= -{sl_pct:.4%}"
-            )
-            await self._close_full("SL_SOFTWARE", pnl_pct)
-            return True
+            logger.warning(f"[PM] Software SL: pnl={pnl_pct:.4%} <= -{sl_pct:.4%}")
+            closed = await self._close_full("SL_SOFTWARE", pnl_pct)
+            return closed  # True daca s-a inchis, False daca a esuat
 
         # --- TP1 ---
         if not self._tp1_hit and pnl_pct >= tp1_pct:
@@ -350,7 +383,6 @@ class PositionManager:
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, entry_price_now)
                 risk.on_close(partial_pnl, pnl_pct)
                 logger.info(f"[PM] TP1 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f}")
-                # --- BREAKEVEN SL: muta SL imediat dupa TP1 ---
                 await self._set_breakeven_sl()
                 try:
                     from .telegram_ui import notify_tp
@@ -397,6 +429,11 @@ class PositionManager:
                     logger.debug(f"[PM] tg notify_tp3 error: {e}")
                 return True
 
+        # FIX BUG LOGIC v1.2.1: reciteste tp1_hit DUPA blocul TP1
+        # (daca TP1 a fost atins in acest apel, tp1_now=True corect pentru timeout)
+        tp1_now = self._tp1_hit
+        be_now  = self._breakeven_set
+
         # --- Trailing stop ---
         if pnl_pct >= trail_pct:
             if not self._trail_active:
@@ -408,8 +445,8 @@ class PositionManager:
                 async with self._snapshot_lock:
                     self._trail_peak_pnl = pnl_pct
                 trail_sl = current_price * (
-                    (1 - trail_delta) if self._entry_side == "long"
-                    else (1 + trail_delta)
+                    (1.0 - trail_delta) if self._entry_side == "long"
+                    else (1.0 + trail_delta)
                 )
                 await trader.amend_sl_tp(stop_loss=trail_sl)
                 logger.debug(f"[PM] Trail SL amended to {trail_sl:.6f}")
@@ -417,36 +454,34 @@ class PositionManager:
                 logger.info(
                     f"[PM] Trail triggered: pnl={pnl_pct:.4%} peak={self._trail_peak_pnl:.4%}"
                 )
-                await self._close_full("TRAIL", pnl_pct)
-                return True
+                closed = await self._close_full("TRAIL", pnl_pct)
+                return closed
 
         # --- Timeout smart ---
-        # Daca TP1 deja hit (breakeven setat) -> inchide oricand la timeout
-        # Daca TP1 NU e hit si suntem pe minus -> 2 candle-uri extra gratie
-        # Daca TP1 NU e hit si suntem pe plus -> inchide normal la timeout
         if hold >= max_hold:
-            if not tp1_already_hit and pnl_pct < 0:
+            if not tp1_now and pnl_pct < 0:
+                # TP1 nu e atins si suntem pe minus — grace period
                 if hold < max_hold + _TIMEOUT_GRACE:
                     logger.debug(
                         f"[PM] Timeout grace: hold={hold}/{max_hold + _TIMEOUT_GRACE} "
                         f"pnl={pnl_pct:.4%} (astept revenire)"
                     )
-                    return False  # mai asteapta
+                    return False
                 else:
                     logger.info(
                         f"[PM] Timeout FORTAT dupa gratie ({hold} candle-uri) "
                         f"pnl={pnl_pct:.4%}"
                     )
-                    await self._close_full("TIMEOUT_FORCED", pnl_pct)
-                    return True
+                    closed = await self._close_full("TIMEOUT_FORCED", pnl_pct)
+                    return closed
             else:
                 label = "TIMEOUT_PROFIT" if pnl_pct >= 0 else "TIMEOUT_BE"
                 logger.info(
                     f"[PM] {label}: hold={hold} pnl={pnl_pct:.4%} "
-                    f"breakeven={'DA' if be_already_set else 'NU'}"
+                    f"breakeven={'DA' if be_now else 'NU'}"
                 )
-                await self._close_full(label, pnl_pct)
-                return True
+                closed = await self._close_full(label, pnl_pct)
+                return closed
 
         return False
 

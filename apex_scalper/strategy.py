@@ -1,18 +1,17 @@
-"""Strategy v1.1.1 — _enter() SL/TP din profil + comision inclus in TP.
+"""Strategy v1.1.2 — leverage din profil consistent, ROUND_TRIP_FEE unificat.
 
 Changelog:
-  v1.1.1 — BUG FIX CRITIC in _enter():
-    SL si TP1 erau hardcodate cu valorile BTC (sl=0.08%, tp=0.40%).
-    Acum sunt citite din config.profile(symbol):
-      sl  = prof[sl_pct]  (ex: DOGE 0.20%)
-      tp  = prof[tp3_pct] (target complet, ex: DOGE 1.00%)
-    TP trimis la exchange (tp3) e tinta finala a pozitiei.
-    Inainte de entry, verifica ca net_profit_tp1 > comision:
-      net = notional * (tp1_pct - ROUND_TRIP_FEE)
-    Daca net <= 0, skip cu warning clar.
-    Pyramid SL/TP si el din profil, nu hardcodat.
+  v1.1.2 — BUG FIX INCONSISTENTA:
+    leverage pentru net_profit_check folosea prof.get('leverage') dar
+    risk.calc_qty() folosea config.leverage (global din .env).
+    Daca LEVERAGE din .env != profil leverage -> net profit calculat gresit
+    si qty gresit -> trade-uri cu notional diferit de cel planificat.
+    Fix: _enter() suprascrie config.leverage cu prof['leverage'] inainte
+    de calc_qty() si il restaureaza dupa. Alternativ: calc_qty primeste
+    leverage explicit din profil.
+    ROUND_TRIP_FEE importat din position_manager pentru consistenta.
+  v1.1.1 — _enter() SL/TP din profil + comision inclus in TP.
   v1.1.0 — 5 features noi: GATE0/9/10, divergence, breakout.
-  v1.0.0 — debug logging la fiecare gate.
 """
 from __future__ import annotations
 
@@ -20,6 +19,7 @@ import asyncio
 from collections import deque
 from loguru import logger
 from .state import state
+from .position_manager import ROUND_TRIP_FEE
 
 # --------------------------------------------------------------------------- #
 #  Strategy parameters
@@ -38,20 +38,13 @@ BASE_SPREAD_BPS  = 3.0
 ATR_SPREAD_MULT  = 2.0
 ATR_BASELINE     = 0.001
 
-# Comision Bybit taker: 0.055% per leg, dus-intors = 0.11%
-TAKER_FEE_PCT  = 0.00055
-ROUND_TRIP_FEE = TAKER_FEE_PCT * 2  # 0.0011
+TAKER_FEE_PCT = 0.00055
+# ROUND_TRIP_FEE importat din position_manager (sursa unica de adevar)
 
-# Session filter
-_BLOCKED_SESSIONS = [
-    (0, 2),
-    (12, 13),
-]
+_BLOCKED_SESSIONS   = [(0, 2), (12, 13)]
 _NEWS_BLOCK_MINUTES = 4
-
-# Divergence + S/R buffers
-_DIV_WINDOW = 5
-_SR_WINDOW  = 20
+_DIV_WINDOW         = 5
+_SR_WINDOW          = 20
 
 _ind_lock: asyncio.Lock | None = None
 _main_loop: asyncio.AbstractEventLoop | None = None
@@ -184,43 +177,43 @@ def _get_ind_state():
 def _score_long(snapshot: IndicatorState, ob, price: float) -> float:
     score = 0.0
     from .book_pressure import bp
-    if bp.pressure_long():                                           score += 0.24
+    if bp.pressure_long():                                            score += 0.24
     if snapshot.rsi_ready:
-        if RSI_LONG_MIN <= snapshot.rsi_value <= RSI_OB_PENALTY:    score += 0.16
-        elif snapshot.rsi_value < RSI_LONG_MIN:                      score += 0.08
-    if ob.imbalance >= IMBALANCE_LONG:                               score += 0.14
-    if price > snapshot.ema_trend > 0:                               score += 0.12
-    if snapshot.ema_fast > snapshot.ema_slow > 0:                    score += 0.10
-    if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN: score += 0.08
-    if snapshot.macd_ready and snapshot.macd_histogram > 0:          score += 0.04
+        if RSI_LONG_MIN <= snapshot.rsi_value <= RSI_OB_PENALTY:     score += 0.16
+        elif snapshot.rsi_value < RSI_LONG_MIN:                       score += 0.08
+    if ob.imbalance >= IMBALANCE_LONG:                                score += 0.14
+    if price > snapshot.ema_trend > 0:                                score += 0.12
+    if snapshot.ema_fast > snapshot.ema_slow > 0:                     score += 0.10
+    if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN:  score += 0.08
+    if snapshot.macd_ready and snapshot.macd_histogram > 0:           score += 0.04
     if snapshot.stoch_ready and snapshot.stoch_k > snapshot.stoch_d and snapshot.stoch_k < 80:
         score += 0.04
-    if snapshot.bb_ready and price > snapshot.bb_mid:                score += 0.04
-    if snapshot.vwap > 0 and price > snapshot.vwap:                  score += 0.04
-    if _has_bullish_divergence():                                     score += 0.08
-    if _breakout_long(price):                                         score += 0.06
+    if snapshot.bb_ready and price > snapshot.bb_mid:                 score += 0.04
+    if snapshot.vwap > 0 and price > snapshot.vwap:                   score += 0.04
+    if _has_bullish_divergence():                                      score += 0.08
+    if _breakout_long(price):                                          score += 0.06
     return min(score, 1.0)
 
 
 def _score_short(snapshot: IndicatorState, ob, price: float) -> float:
     score = 0.0
     from .book_pressure import bp
-    if bp.pressure_short():                                          score += 0.24
+    if bp.pressure_short():                                           score += 0.24
     if snapshot.rsi_ready:
-        if RSI_OS_PENALTY <= snapshot.rsi_value <= RSI_SHORT_MAX:   score += 0.16
-        elif snapshot.rsi_value > RSI_SHORT_MAX:                     score += 0.08
-    if ob.imbalance <= IMBALANCE_SHORT:                              score += 0.14
-    if 0 < snapshot.ema_trend and price < snapshot.ema_trend:       score += 0.12
+        if RSI_OS_PENALTY <= snapshot.rsi_value <= RSI_SHORT_MAX:    score += 0.16
+        elif snapshot.rsi_value > RSI_SHORT_MAX:                      score += 0.08
+    if ob.imbalance <= IMBALANCE_SHORT:                               score += 0.14
+    if 0 < snapshot.ema_trend and price < snapshot.ema_trend:        score += 0.12
     if snapshot.ema_fast < snapshot.ema_slow and snapshot.ema_slow > 0:
         score += 0.10
-    if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN: score += 0.08
-    if snapshot.macd_ready and snapshot.macd_histogram < 0:          score += 0.04
+    if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN:  score += 0.08
+    if snapshot.macd_ready and snapshot.macd_histogram < 0:           score += 0.04
     if snapshot.stoch_ready and snapshot.stoch_k < snapshot.stoch_d and snapshot.stoch_k > 20:
         score += 0.04
-    if snapshot.bb_ready and price < snapshot.bb_mid:                score += 0.04
-    if snapshot.vwap > 0 and price < snapshot.vwap:                  score += 0.04
-    if _has_bearish_divergence():                                     score += 0.08
-    if _breakout_short(price):                                        score += 0.06
+    if snapshot.bb_ready and price < snapshot.bb_mid:                 score += 0.04
+    if snapshot.vwap > 0 and price < snapshot.vwap:                   score += 0.04
+    if _has_bearish_divergence():                                      score += 0.08
+    if _breakout_short(price):                                         score += 0.06
     return min(score, 1.0)
 
 
@@ -307,8 +300,7 @@ async def evaluate(price: float) -> None:
     from .config import config
 
     with state.lock:
-        pos      = state.open_position
-        open_qty = state.open_qty
+        pos = state.open_position
 
     if pos:
         closed = await pm.evaluate(price)
@@ -329,24 +321,25 @@ async def evaluate(price: float) -> None:
     if not state.running or state.paused:
         return
 
-    # GATE 0: Net profit check
-    prof         = config.profile(config.symbol)
-    tp1_pct      = prof.get("tp1_pct",         0.0030)
-    order_usdt   = prof.get("order_size_usdt",  5.0)
-    leverage_p   = prof.get("leverage",         10)
-    notional     = order_usdt * leverage_p
-    net_tp1      = notional * (tp1_pct - ROUND_TRIP_FEE)
+    # Profil activ
+    prof       = config.profile(config.symbol)
+    tp1_pct    = prof.get("tp1_pct",        0.0030)
+    order_usdt = prof.get("order_size_usdt", 5.0)
+    lev        = prof.get("leverage",        10)
+    notional   = order_usdt * lev
+    net_tp1    = notional * (tp1_pct - ROUND_TRIP_FEE)
+
+    # GATE 0: Net profit
     if net_tp1 <= 0:
         logger.debug(
-            f"[evaluate] GATE0 MIN_PROFIT blocat: "
-            f"net_tp1={net_tp1:.5f} USDT "
+            f"[evaluate] GATE0 MIN_PROFIT: net_tp1={net_tp1:.5f} USDT "
             f"(notional={notional:.1f} tp1={tp1_pct:.4%} fee={ROUND_TRIP_FEE:.4%})"
         )
         return
 
     # GATE 1: Risk
     if not risk.can_open():
-        logger.debug(f"[evaluate] GATE1 RISK blocat")
+        logger.debug("[evaluate] GATE1 RISK blocat")
         return
 
     # GATE 2: Regime
@@ -375,14 +368,14 @@ async def evaluate(price: float) -> None:
     atr_ratio  = ind.atr_value / (ATR_BASELINE * price) if price > 0 else 1.0
     max_spread = BASE_SPREAD_BPS * (1 + ATR_SPREAD_MULT * atr_ratio)
     if spread_bps > max_spread:
-        logger.debug(f"[evaluate] GATE3 SPREAD blocat: {spread_bps:.2f} > {max_spread:.2f}bps")
+        logger.debug(f"[evaluate] GATE3 SPREAD: {spread_bps:.2f} > {max_spread:.2f}bps")
         return
 
     # GATE 4: ATR
     if ind.atr_ready:
         atr_pct = ind.atr_value / price if price > 0 else 0
         if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
-            logger.debug(f"[evaluate] GATE4 ATR blocat: {atr_pct:.6f}")
+            logger.debug(f"[evaluate] GATE4 ATR: {atr_pct:.6f}")
             return
 
     # GATE 5: Anti-manipulation
@@ -392,7 +385,7 @@ async def evaluate(price: float) -> None:
 
     # GATE 6: MTF
     if not mtf.ready:
-        logger.debug(f"[evaluate] GATE6 MTF not ready")
+        logger.debug("[evaluate] GATE6 MTF not ready")
         return
 
     await funding.maybe_refresh(config.symbol)
@@ -401,7 +394,7 @@ async def evaluate(price: float) -> None:
         if not funding.can_enter_long():
             return
         if price <= mtf.ema50:
-            logger.debug(f"[evaluate] GATE8 MTF blocat LONG")
+            logger.debug("[evaluate] GATE8 MTF blocat LONG")
             return
         await _enter("long", "Buy", price, score_l, config, prof)
 
@@ -409,7 +402,7 @@ async def evaluate(price: float) -> None:
         if not funding.can_enter_short():
             return
         if price >= mtf.ema50:
-            logger.debug(f"[evaluate] GATE8 MTF blocat SHORT")
+            logger.debug("[evaluate] GATE8 MTF blocat SHORT")
             return
         await _enter("short", "Sell", price, score_s, config, prof)
 
@@ -417,7 +410,7 @@ async def evaluate(price: float) -> None:
         if best_score >= ENTRY_THRESHOLD * 0.85:
             logger.debug(
                 f"[evaluate] SCORE sub prag: L={score_l:.4f} S={score_s:.4f} "
-                f"prag={ENTRY_THRESHOLD} lipsa={ENTRY_THRESHOLD - best_score:.4f}"
+                f"lipsa={ENTRY_THRESHOLD - best_score:.4f}"
             )
 
 
@@ -436,28 +429,31 @@ async def _enter(
     from .telegram_ui import notify_open
 
     is_long  = side == "long"
-    sl_pct   = prof.get("sl_pct",   0.0020)
-    tp3_pct  = prof.get("tp3_pct",  0.0100)
-    tp1_pct  = prof.get("tp1_pct",  0.0030)
+    sl_pct   = prof.get("sl_pct",          0.0020)
+    tp3_pct  = prof.get("tp3_pct",         0.0100)
+    tp1_pct  = prof.get("tp1_pct",         0.0030)
+    lev      = prof.get("leverage",         10)
+    order_sz = prof.get("order_size_usdt",  5.0)
 
-    # Verifica din nou net profit (double-check inainte de plasare)
-    notional   = prof.get("order_size_usdt", 5.0) * prof.get("leverage", 10)
-    net_tp1    = notional * (tp1_pct - ROUND_TRIP_FEE)
+    # FIX BUG v1.1.2: usa leverage si order_size DIN PROFIL, nu din config global
+    # config.leverage vine din .env si poate sa nu fie sincronizat cu profilul
+    notional = order_sz * lev
+    net_tp1  = notional * (tp1_pct - ROUND_TRIP_FEE)
     if net_tp1 <= 0:
         logger.warning(
-            f"[{side.upper()}] Skip entry: net_tp1={net_tp1:.5f} <= 0 "
+            f"[{side.upper()}] Skip: net_tp1={net_tp1:.5f} <= 0 "
             f"(tp1={tp1_pct:.4%} fee={ROUND_TRIP_FEE:.4%})"
         )
         return
 
-    # SL si TP3 din profil
-    sl = price * (1 - sl_pct  if is_long else 1 + sl_pct)
-    tp = price * (1 + tp3_pct if is_long else 1 - tp3_pct)
+    sl = price * (1.0 - sl_pct  if is_long else 1.0 + sl_pct)
+    tp = price * (1.0 + tp3_pct if is_long else 1.0 - tp3_pct)
 
+    # calc_qty cu leverage si order_size din profil
     qty = risk.calc_qty(
         price,
-        order_size_usdt=config.order_size_usdt,
-        leverage=config.leverage,
+        order_size_usdt=order_sz,
+        leverage=lev,
         regime_factor=regime.size_factor(),
     )
     if qty <= 0:
@@ -467,7 +463,7 @@ async def _enter(
     logger.info(
         f"[{side.upper()}] ENTRY score={score:.4f} price={price} qty={qty} "
         f"sl={sl:.5f} ({sl_pct:.3%}) tp={tp:.5f} ({tp3_pct:.3%}) "
-        f"net_tp1={net_tp1:.4f} USDT"
+        f"net_tp1={net_tp1:.4f} USDT notional={notional:.1f}"
     )
 
     trade_id = await place_entry_order(
