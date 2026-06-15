@@ -1,13 +1,10 @@
-"""Settings loader v0.9.4 — DOGEUSDT leverage 50x.
+"""Settings loader v0.9.5 — wall_ratio + wall_distance_ticks properties.
 
 Changelog:
-  v0.9.4 — DOGEUSDT leverage 10→50x la cererea utilizatorului.
-    - leverage: 10→50
-    - order_size_usdt: 5 (notional = 5 × 50 = 250 USDT)
-    - daily_loss_limit_usdt: 2→5 (mai relevant cu notional mare)
-    - tp1_pct: 0.0030 (TP1 net = 250 * 0.0030 - fee = ~0.475 USDT)
-    - sl_pct: 0.0020 (SL = 250 * 0.0020 = 0.50 USDT risc/trade)
-    - Lichidare estimata la ~2% miscare adversa (implicit 50x)
+  v0.9.5 — Adaugat Config.wall_ratio si Config.wall_distance_ticks ca @property
+    care citesc din SYMBOL_PROFILES[symbol]. Rezolva AttributeError la startup
+    din inject_wall_params(config.wall_ratio, config.wall_distance_ticks).
+  v0.9.4 — DOGEUSDT leverage 10->50x.
   v0.9.3 — DOGEUSDT recalibrat pentru cont mic.
   v0.9.2 — Config.validate() adaugat.
 """
@@ -261,6 +258,17 @@ class Config:
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
+    # ── Proprietati din SYMBOL_PROFILES ──────────────────────────────────────
+    @property
+    def wall_ratio(self) -> float:
+        """Wall ratio per-simbol din SYMBOL_PROFILES (default 8.0)."""
+        return float(self.profile(self.symbol).get("wall_ratio", 8.0))
+
+    @property
+    def wall_distance_ticks(self) -> int:
+        """Wall distance ticks per-simbol din SYMBOL_PROFILES (default 5)."""
+        return int(self.profile(self.symbol).get("wall_distance_ticks", 5))
+
     def validate(self) -> None:
         errors: list[str] = []
         if not self.api_key:
@@ -303,7 +311,7 @@ class Config:
         sym = symbol or self.symbol
         return SYMBOL_PROFILES.get(sym, SYMBOL_PROFILES[DEFAULT_SYMBOL])
 
-    def active_symbols(self) -> list[str] :
+    def active_symbols(self) -> list[str]:
         return self.symbols if self.symbols else [self.symbol]
 
     @property
