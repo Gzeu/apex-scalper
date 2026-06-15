@@ -1,7 +1,12 @@
-"""Main entry point v1.4.0 — dashboard GUI integrat.
+"""Main entry point v1.4.1 — inject_wall_params + trader.setup() fix.
 
 Changelog:
-  v1.4.0 — adaugat run_dashboard() la startup (port 8050).
+  v1.4.1 — inject_wall_params(config.wall_ratio, config.wall_distance_ticks)
+    Fixat AttributeError: 'Config' object has no attribute 'wall_ratio'
+    (rezolvat in config v0.9.5 cu @property din SYMBOL_PROFILES)
+    Fixat AttributeError: 'Trader' object has no attribute 'connect'
+    (inlocuit trader.connect() + trader.setup_symbol() cu trader.setup())
+  v1.4.0 — dashboard GUI integrat.
   v1.3.x — funding rate, drawdown sizing, etc.
 """
 from __future__ import annotations
@@ -50,12 +55,11 @@ async def main() -> None:
     _setup_logging()
     config.validate()
 
-    inject_wall_params(config.symbol)
+    inject_wall_params(config.wall_ratio, config.wall_distance_ticks)
 
     logger.info(f"Apex Scalper pornit: {config.symbol} | testnet={config.testnet}")
 
-    await trader.connect()
-    await trader.setup_symbol(config.symbol)
+    await trader.setup()
 
     # Sincronizeaza pozitia existenta la restart
     existing = await trader.get_open_position(config.symbol)
@@ -104,7 +108,7 @@ async def main() -> None:
     )
 
     def _shutdown(sig, frame):
-        logger.info(f"Semnal {sig} primit — oprire...")
+        logger.info(f"Semnal {sig} primit \u2014 oprire...")
         for t in tasks:
             t.cancel()
 
