@@ -1,12 +1,10 @@
-"""Entrypoint v0.9.4.
+"""Entrypoint v0.9.6.
 
 Changelog:
-  v0.9.4 — Improvement #10: graceful shutdown confirma inchiderea pozitiei
-    inainte de loop.stop(). Vechi: _shutdown() apela trader.close_position()
-    dar nu astepta confirmarea de la exchange -> la SIGTERM rapid, pozitia
-    putea ramane deschisa. Nou: close_position() returneaza bool (v0.9.2);
-    _shutdown() asteapta True sau logeaza CRITICAL cu alerta Telegram.
-    Timeout de 15s pentru inchidere, dupa care forteaza oprirea.
+  v0.9.6 — db.run_maintenance() apelat in _midnight_reset_loop.
+    Improvement #6 complet: VACUUM complet + cleanup records vechi
+    ruleaza automat la UTC midnight, o data pe zi.
+  v0.9.4 — Improvement #10: graceful shutdown cu confirmare.
   v0.9.3 — config.validate() fail-fast la startup.
   v0.8.8 — BUG 35/36 fix.
 """
@@ -35,7 +33,7 @@ from .health import start_health_server
 from .log_sink import setup_json_sink
 from .strategy import set_main_loop
 
-SHUTDOWN_CLOSE_TIMEOUT = 15.0  # secunde max asteptare confirmare inchidere pozitie
+SHUTDOWN_CLOSE_TIMEOUT = 15.0
 
 
 def setup_logging() -> None:
@@ -130,6 +128,7 @@ async def _midnight_reset_loop() -> None:
             hour=0, minute=0, second=5, microsecond=0
         )
         await asyncio.sleep((target - now).total_seconds())
+
         from .risk import risk as r
         r.reset_daily()
         with state.lock:
@@ -138,16 +137,18 @@ async def _midnight_reset_loop() -> None:
             state.win_trades   = 0
         logger.info("Daily counters reset at UTC midnight (pnl + trades + wins)")
 
+        # Improvement #6: DB maintenance o data pe zi la midnight.
+        # VACUUM complet + stergere records mai vechi de 90 zile (trades)
+        # si 30 zile (metrics_snapshot). Rulat in executor pentru a nu bloca event loop-ul.
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, db.run_maintenance)
+        except Exception as e:
+            logger.warning(f"DB maintenance failed: {e}")
+
 
 async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
-    """Graceful shutdown cu confirmare inchidere pozitie.
-
-    Improvement #10: asteapta confirmarea ca pozitia a fost inchisa pe exchange
-    inainte de loop.stop(). Daca close_position() returneaza False sau
-    timeout-ul de SHUTDOWN_CLOSE_TIMEOUT secunde e depasit, logeaza CRITICAL
-    si trimite alert Telegram — pozitia poate fi inca deschisa pe exchange.
-    """
-    logger.warning("\U0001f6d1 Shutdown initiata — astept inchiderea pozitiei...")
+    logger.warning("\U0001f6d1 Shutdown initiata \u2014 astept inchiderea pozitiei...")
     state.running = False
 
     with state.lock:
@@ -158,8 +159,8 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
 
     if has_position:
         logger.warning(
-            f"Shutdown: pozitie activa detectata — "
-            f"{pos_side} qty={pos_qty} entry={pos_entry} — inchidere fortata..."
+            f"Shutdown: pozitie activa detectata \u2014 "
+            f"{pos_side} qty={pos_qty} entry={pos_entry} \u2014 inchidere fortata..."
         )
         try:
             closed = await asyncio.wait_for(
@@ -172,7 +173,7 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
                 _alert_shutdown_failure(pos_side, pos_qty, pos_entry)
         except asyncio.TimeoutError:
             logger.critical(
-                f"Shutdown: TIMEOUT {SHUTDOWN_CLOSE_TIMEOUT}s depasit — "
+                f"Shutdown: TIMEOUT {SHUTDOWN_CLOSE_TIMEOUT}s depasit \u2014 "
                 f"pozitia {pos_side} qty={pos_qty} POATE FI INCA DESCHISA!"
             )
             _alert_shutdown_failure(pos_side, pos_qty, pos_entry, timeout=True)
@@ -180,7 +181,7 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
             logger.error(f"Shutdown close_position error: {e}")
             _alert_shutdown_failure(pos_side, pos_qty, pos_entry)
     else:
-        logger.info("Shutdown: fara pozitie activa — oprire curata.")
+        logger.info("Shutdown: fara pozitie activa \u2014 oprire curata.")
 
     if tg_app:
         try:
@@ -202,10 +203,10 @@ def _alert_shutdown_failure(
 ) -> None:
     reason = f"TIMEOUT {SHUTDOWN_CLOSE_TIMEOUT}s" if timeout else "close_position ESUAT"
     msg = (
-        f"\U0001f6a8 *CRITIC — Shutdown incomplet!*\n"
+        f"\U0001f6a8 *CRITIC \u2014 Shutdown incomplet!*\n"
         f"Reason: `{reason}`\n"
         f"Pozitie: `{side} qty={qty} entry={entry}`\n"
-        f"Verifica manual pe Bybit — pozitia poate fi INCA DESCHISA!"
+        f"Verifica manual pe Bybit \u2014 pozitia poate fi INCA DESCHISA!"
     )
     logger.critical(msg)
     try:
@@ -223,7 +224,7 @@ async def main() -> None:
     config.validate()
 
     logger.info(
-        f"\u26a1 Apex Scalper v0.9.4 | {config.symbol} | "
+        f"\u26a1 Apex Scalper v0.9.6 | {config.symbol} | "
         f"{'TESTNET' if config.testnet else chr(9888)+' MAINNET'} | "
         f"lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
@@ -248,7 +249,7 @@ async def main() -> None:
     if mtf.ready:
         logger.info(f"MTF ready: EMA50(15m)={mtf.ema50:.4f}")
     else:
-        logger.warning("MTF fetch failed — entries BLOCKED until first successful refresh.")
+        logger.warning("MTF fetch failed \u2014 entries BLOCKED until first successful refresh.")
 
     start_health_server()
 
@@ -266,7 +267,7 @@ async def main() -> None:
         await tg_app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram bot ready")
     else:
-        logger.warning("TELEGRAM_TOKEN not set — Telegram disabled")
+        logger.warning("TELEGRAM_TOKEN not set \u2014 Telegram disabled")
 
     asyncio.create_task(run_watchdog())
     asyncio.create_task(run_mtf_refresh_loop(config.symbol))
@@ -282,7 +283,7 @@ async def main() -> None:
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.9.4 active\n"
+        f"state.running = True \u2014 strategy v0.9.6 active\n"
         f"  JSON logs:   logs/apex_structured.jsonl\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"
