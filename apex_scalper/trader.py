@@ -1,11 +1,14 @@
-"""Trader module v0.8.7 — Bug 33 fix.
+"""Trader module v0.9.2.
 
 Changelog:
-  v0.8.7 — BUG 33 FIX: get_balance() metoda inexistenta -> /balance crash AttributeError.
-    Adaugat get_balance() via get_wallet_balance(accountType='UNIFIED').
-    Returneaza float USDT disponibil sau 0.0 la eroare.
-  v0.8.6 — BUG 25 FIX: close_position() Market fallback DOAR daca Limit nu filled.
-  v0.8.6 — BUG 26 FIX: amend_order() + amend_sl_tp() guard _client is None.
+  v0.9.2 — Improvement #3: close_position() retry logic.
+    Vechi: daca ordinul de inchidere esua o data, functia returna silentios.
+    Pozitia ramanea deschisa nesupravegheat, fara niciun log de eroare.
+    Nou: retry de MAX_CLOSE_RETRIES ori cu backoff exponential.
+    Dupa toate retry-urile esuate, se trimite alert Telegram si se logheaza CRITICAL.
+    close_position() returneaza bool: True=pozitie inchisa, False=toate retry-urile esuate.
+  v0.8.7 — BUG 33 FIX: get_balance() adaugat.
+  v0.8.6 — BUG 25-26 FIX: close_position Market fallback, amend guard.
   v0.8.1 — BUG 12 FIX: close_position guard client None.
   v0.7.1 — RateLimiter + sync_position_from_exchange.
 """
@@ -19,6 +22,9 @@ from pybit.unified_trading import HTTP
 
 from .config import config
 from .state import state
+
+MAX_CLOSE_RETRIES  = 4
+CLOSE_BACKOFF      = [0.5, 1.0, 2.0, 4.0]  # secunde intre retry-uri
 
 
 class RateLimiter:
@@ -156,13 +162,6 @@ class Trader:
         return round(qty * price * rate, 6)
 
     async def get_balance(self) -> float:
-        """Returneaza balanta USDT disponibila din contul UNIFIED.
-
-        v0.8.7 BUG 33 FIX: metoda lipsea complet -> /balance in telegram_ui
-        crasha cu AttributeError la fiecare apel.
-        Implementat via get_wallet_balance(accountType='UNIFIED').
-        Returneaza 0.0 la eroare pentru a nu crasha handler-ul Telegram.
-        """
         if self._client is None:
             return 0.0
         try:
@@ -257,61 +256,111 @@ class Trader:
         self,
         use_limit: bool = True,
         limit_timeout_s: float = 3.0,
-    ) -> None:
+    ) -> bool:
+        """Inchide pozitia curenta cu retry logic.
+
+        Improvement #3: retry de MAX_CLOSE_RETRIES ori cu backoff exponential.
+        Returneaza True daca pozitia a fost inchisa, False daca toate retry-urile au esuat.
+        La esec total: log CRITICAL + alert Telegram.
+        """
         if self._client is None:
             logger.debug("[trader] close_position: client not initialized, skipping")
-            return
+            return False
 
         with state.lock:
-            pos = state.open_position
-            qty = state.open_qty
+            pos      = state.open_position
+            qty      = state.open_qty
             best_bid = state.orderbook.best_bid
             best_ask = state.orderbook.best_ask
+            entry    = state.open_entry
 
         if not pos or qty <= 0:
-            return
+            return True
 
         close_side = "Sell" if pos == "long" else "Buy"
 
-        limit_filled = False
-        if use_limit:
-            limit_px = best_ask if pos == "long" else best_bid
-            resp = await self.place_order(
-                side=close_side, qty=qty,
-                order_type="Limit", post_only=False,
-                price=limit_px, reduce_only=True,
-            )
-            if resp.get("retCode") == 0:
-                order_id = resp.get("result", {}).get("orderId", "")
-                await asyncio.sleep(limit_timeout_s)
-                if order_id:
-                    try:
-                        fill_result = await _api_call_with_retry(
-                            self._client.get_order_history,
-                            category="linear",
-                            symbol=self._symbol,
-                            orderId=order_id,
-                            limit=1,
-                        )
-                        orders = fill_result.get("result", {}).get("list", [])
-                        if orders and orders[0].get("orderStatus") == "Filled":
-                            limit_filled = True
-                            logger.debug("[trader] close_position: Limit filled, skipping Market fallback")
-                    except Exception as e:
-                        logger.warning(f"[trader] close_position fill poll error: {e}")
+        for attempt in range(MAX_CLOSE_RETRIES):
+            backoff = CLOSE_BACKOFF[min(attempt, len(CLOSE_BACKOFF) - 1)]
+            limit_filled = False
 
-        if not limit_filled:
-            await self.place_order(
+            if use_limit and attempt == 0:
+                # Prima incercare: Limit order
+                limit_px = best_ask if pos == "long" else best_bid
+                if limit_px:
+                    resp = await self.place_order(
+                        side=close_side, qty=qty,
+                        order_type="Limit", post_only=False,
+                        price=limit_px, reduce_only=True,
+                    )
+                    if resp.get("retCode") == 0:
+                        order_id = resp.get("result", {}).get("orderId", "")
+                        await asyncio.sleep(limit_timeout_s)
+                        if order_id:
+                            try:
+                                fill_result = await _api_call_with_retry(
+                                    self._client.get_order_history,
+                                    category="linear",
+                                    symbol=self._symbol,
+                                    orderId=order_id,
+                                    limit=1,
+                                )
+                                orders = fill_result.get("result", {}).get("list", [])
+                                if orders and orders[0].get("orderStatus") == "Filled":
+                                    limit_filled = True
+                                    logger.debug("[trader] close_position: Limit filled")
+                            except Exception as e:
+                                logger.warning(f"[trader] close_position fill poll error: {e}")
+
+            if limit_filled:
+                break
+
+            # Market order (toate incercarile dupa prima, sau daca Limit nu a fost filled)
+            resp = await self.place_order(
                 side=close_side, qty=qty,
                 order_type="Market", post_only=False,
                 reduce_only=True,
             )
 
+            if resp.get("retCode") == 0:
+                logger.info(
+                    f"[trader] close_position: Market OK "
+                    f"(attempt {attempt+1}/{MAX_CLOSE_RETRIES}) "
+                    f"{pos} qty={qty} entry={entry}"
+                )
+                limit_filled = True  # refolosim flagul pentru break
+                break
+
+            # Market order esuat — retry
+            logger.warning(
+                f"[trader] close_position: attempt {attempt+1}/{MAX_CLOSE_RETRIES} "
+                f"failed: {resp.get('retMsg')} — retry in {backoff}s"
+            )
+            if attempt < MAX_CLOSE_RETRIES - 1:
+                await asyncio.sleep(backoff)
+
+        else:
+            # Toate retry-urile au esuat
+            msg = (
+                f"\U0001f6a8 *CRITIC*: close_position ESUAT dupa {MAX_CLOSE_RETRIES} "
+                f"incercari!\n"
+                f"`{pos} qty={qty} entry={entry}`\n"
+                f"Pozitia poate fi INCA DESCHISA pe exchange!"
+            )
+            logger.critical(msg)
+            try:
+                from .telegram_ui import send_message
+                await send_message(msg)
+            except Exception:
+                pass
+            return False
+
+        # Curata starea locala
         with state.lock:
             state.open_position = ""
             state.open_qty      = 0.0
             state.open_entry    = 0.0
             state.trailing_stop = 0.0
+        return True
 
     async def sync_position_from_exchange(self) -> None:
         if self._client is None:

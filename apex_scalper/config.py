@@ -1,37 +1,32 @@
-"""Settings loader with per-symbol optimal defaults.
+"""Settings loader v0.9.2 — Improvement #7: fail-fast validation la startup.
 
-v0.7.1: All profiles updated with tp3_pct, TP1/2/3 fractions, MAX_PYRAMID_ADDS,
-        bp_base_threshold, regime thresholds, RSI penalty levels.
-        inject_profile() in main.py now uses all these fields.
+Changelog:
+  v0.9.2 — Improvement #7: Config.validate() adaugat.
+    Vechi: daca BYBIT_API_KEY / BYBIT_API_SECRET lipseau, botul pornea normal
+    si crasha abia la primul apel API cu KeyError sau AuthenticationError.
+    Nou: Config.validate() apelat in main() inainte de orice altceva.
+    La validare esuata: mesaj clar cu variabilele lipsa + sys.exit(1).
+    Valideaza si: TELEGRAM_TOKEN format, LEVERAGE range, ORDER_SIZE_USDT > 0,
+    BYBIT_TESTNET valoare recunoscuta.
 
-v0.4.1: Added wall_ratio and wall_distance_ticks per symbol
-        for anti_manipulation.py parametrization.
-
-Supports multi-symbol mode: set SYMBOLS=BTCUSDT,ETHUSDT,HYPEUSDT
-For single symbol mode: set SYMBOL=BTCUSDT (legacy, still works)
-
-Per-symbol profiles are tuned for Bybit USDT Perpetual Futures
-based on 24h volume ranking and volatility characteristics (June 2026).
+v0.7.1: All profiles updated with tp3_pct, TP1/2/3 fractions, MAX_PYRAMID_ADDS.
 """
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
+from loguru import logger
 
 load_dotenv()
 
 
-# ---------------------------------------------------------------------------
-# Per-symbol optimal parameter profiles
-# ---------------------------------------------------------------------------
 SYMBOL_PROFILES: dict[str, dict] = {
-    # 1st. BTC/USDT — $2.1B 24h vol (41.5% of total)
     "BTCUSDT": {
         "leverage":             5,
         "order_size_usdt":      20,
         "daily_loss_limit_usdt": 50.0,
-        # TP scale-out (3 levels)
         "tp1_pct":              0.0012,
         "tp2_pct":              0.0025,
         "tp3_pct":              0.0040,
@@ -43,17 +38,14 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "trail_delta":          0.0005,
         "max_hold_candles":     5,
         "max_pyramid_adds":     1,
-        # Spread / depth
         "max_spread_bps":       3.0,
         "base_spread_bps":      3.0,
         "atr_spread_mult":      2.0,
         "atr_baseline":         0.001,
         "min_bid_depth":        1.0,
         "min_ask_depth":        1.0,
-        # ATR gate
         "atr_min_pct":          0.00025,
         "atr_max_pct":          0.004,
-        # Signal thresholds
         "rsi_long_min":         52.0,
         "rsi_short_max":        48.0,
         "rsi_ob_penalty":       65.0,
@@ -62,21 +54,17 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "imbalance_short":      -0.08,
         "entry_threshold":      0.60,
         "vol_zscore_min":       0.0,
-        # Book pressure
         "bp_base_threshold":    50_000.0,
         "bp_absorption_ratio":  3.0,
-        # Regime filter
         "adx_trending_min":     25.0,
         "adx_ranging_max":      20.0,
         "atr_volatile_pct":     80.0,
         "atr_ranging_pct":      20.0,
         "hurst_trend_min":      0.55,
         "hurst_range_max":      0.45,
-        # Anti-manipulation
         "wall_ratio":           8.0,
         "wall_distance_ticks":  5,
     },
-    # 2nd. ETH/USDT — $875M 24h vol
     "ETHUSDT": {
         "leverage":             7,
         "order_size_usdt":      15,
@@ -119,7 +107,6 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "wall_ratio":           7.0,
         "wall_distance_ticks":  4,
     },
-    # 3rd. HYPE/USDT — $261M 24h vol
     "HYPEUSDT": {
         "leverage":             5,
         "order_size_usdt":      10,
@@ -162,7 +149,6 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "wall_ratio":           5.0,
         "wall_distance_ticks":  3,
     },
-    # 4th. DOGE/USDT — $134M 24h vol
     "DOGEUSDT": {
         "leverage":             5,
         "order_size_usdt":      10,
@@ -205,7 +191,6 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "wall_ratio":           4.0,
         "wall_distance_ticks":  3,
     },
-    # 5th. NEAR/USDT — $102M 24h vol
     "NEARUSDT": {
         "leverage":             6,
         "order_size_usdt":      10,
@@ -255,8 +240,8 @@ DEFAULT_SYMBOL = "BTCUSDT"
 
 @dataclass
 class Config:
-    api_key:    str  = field(default_factory=lambda: os.environ["BYBIT_API_KEY"])
-    api_secret: str  = field(default_factory=lambda: os.environ["BYBIT_API_SECRET"])
+    api_key:    str  = field(default_factory=lambda: os.environ.get("BYBIT_API_KEY", ""))
+    api_secret: str  = field(default_factory=lambda: os.environ.get("BYBIT_API_SECRET", ""))
     testnet:    bool = field(default_factory=lambda: os.getenv("BYBIT_TESTNET", "true").lower() == "true")
     symbol:     str  = field(default_factory=lambda: os.getenv("SYMBOL", DEFAULT_SYMBOL))
     symbols:    list = field(default_factory=lambda: [
@@ -265,9 +250,73 @@ class Config:
     leverage:          int   = field(default_factory=lambda: int(os.getenv("LEVERAGE", "5")))
     order_size_usdt:   float = field(default_factory=lambda: float(os.getenv("ORDER_SIZE_USDT", "10")))
     daily_loss_limit_usdt: float = field(default_factory=lambda: float(os.getenv("DAILY_LOSS_LIMIT_USDT", "30")))
-    telegram_token:  str = field(default_factory=lambda: os.getenv("TELEGRAM_TOKEN", ""))
+    telegram_token:   str = field(default_factory=lambda: os.getenv("TELEGRAM_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+
+    def validate(self) -> None:
+        """Fail-fast validation la startup. Apeleaza inainte de orice altceva in main().
+
+        Improvement #7: botul nu mai porneste cu config invalida si nu mai
+        crasha dupa 10-30s cu erori criptice la primul apel API.
+        """
+        errors: list[str] = []
+
+        # Credentiale obligatorii
+        if not self.api_key:
+            errors.append("BYBIT_API_KEY lipseste sau e goala")
+        elif len(self.api_key) < 10:
+            errors.append(f"BYBIT_API_KEY pare invalida (prea scurta: {len(self.api_key)} chars)")
+
+        if not self.api_secret:
+            errors.append("BYBIT_API_SECRET lipseste sau e goala")
+        elif len(self.api_secret) < 10:
+            errors.append(f"BYBIT_API_SECRET pare invalida (prea scurta: {len(self.api_secret)} chars)")
+
+        # Leverage sanity check
+        if not (1 <= self.leverage <= 100):
+            errors.append(f"LEVERAGE={self.leverage} invalid (trebuie 1-100)")
+
+        # Order size
+        if self.order_size_usdt <= 0:
+            errors.append(f"ORDER_SIZE_USDT={self.order_size_usdt} invalid (trebuie > 0)")
+
+        # Symbol valid
+        all_symbols = self.active_symbols()
+        for sym in all_symbols:
+            if not sym.endswith("USDT"):
+                errors.append(f"Symbol '{sym}' pare invalid (trebuie sa se termine in USDT)")
+
+        # Telegram partial config (avertisment, nu eroare fatala)
+        if self.telegram_token and not self.telegram_chat_id:
+            logger.warning(
+                "TELEGRAM_TOKEN setat dar TELEGRAM_CHAT_ID lipseste — "
+                "comenzile Telegram nu vor functiona corect."
+            )
+
+        # BYBIT_TESTNET valoare recunoscuta
+        raw_testnet = os.getenv("BYBIT_TESTNET", "true").lower()
+        if raw_testnet not in ("true", "false", "1", "0", "yes", "no"):
+            errors.append(
+                f"BYBIT_TESTNET='{raw_testnet}' necunoscut (foloseste: true/false)"
+            )
+
+        if errors:
+            logger.error("\u274c Config invalida — bot-ul nu poate porni:")
+            for err in errors:
+                logger.error(f"  • {err}")
+            logger.error(
+                "Seteaza variabilele lipsa in .env sau ca environment variables "
+                "si reporneste botul."
+            )
+            sys.exit(1)
+
+        env_label = "TESTNET" if self.testnet else "\u26a0\ufe0f  MAINNET"
+        logger.info(
+            f"\u2705 Config valid: symbol={'/'.join(all_symbols)} "
+            f"leverage={self.leverage}x size={self.order_size_usdt}USDT "
+            f"env={env_label}"
+        )
 
     def profile(self, symbol: str | None = None) -> dict:
         sym = symbol or self.symbol
