@@ -1,30 +1,21 @@
-"""Telegram bot UI v1.0.3 — /history, /risk, /start feed check, polish.
-
-Comands:
-  /menu                 — meniu principal cu butoane inline
-  /start /stop /pause /resume
-  /status /pnl /balance /close
-  /config               — configuratie live
-  /warmup               — forteaza re-incarcare indicatori
-  /history [N]          — ultimele N trade-uri (default 10)
-  /risk                 — risk manager: daily loss, consec losses, Kelly
-  /signals              — snapshot complet indicatori
-  /regime               — market regime + ADX + size factor
-  /tp                   — status TP1/2/3 hit, trail, hold candles
-  /funding              — funding rate + directii blocate
-  /metrics              — performance report
-  /analytics            — breakdown trades by reason/score/streak
-  /watchdog             — WS health status
-  /setparam KEY VALUE   — live strategy tuning (owner only)
-  /pulse on|off         — toggle 1-minute pulse loop
+"""Telegram bot UI v1.0.5 — bugfix + /daily + rate limiter.
 
 Changelog:
+  v1.0.5 — Fix-uri:
+    1. /history: t.get('close_reason') -> t.get('reason') (camp corect din DB)
+    2. /config: risk._consecutive_losses -> risk.consecutive_losses (property)
+    3. /daily: adaugat ca comanda text (lipsea desi era in README)
+    4. send_message: rate limiter simplu (max 1 msg/s) pentru a evita
+       Telegram 429 FloodWait la burst de semnale.
+    5. _last_kline_ts: accesat prin getter public din watchdog.
   v1.0.3 — /history [N], /risk, /start verifica feed activ, polish mesaje.
   v0.9.9 — /menu inline, /config, /warmup, notificari automate.
   v0.8.7 — BUG 34 FIX: auth check comenzi distructive.
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from loguru import logger
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -35,20 +26,31 @@ from .trader import trader
 from .performance import perf
 
 _bot: Bot | None = None
+_last_send_ts: float = 0.0
+_SEND_MIN_INTERVAL = 1.0  # min secunde intre mesaje (anti-flood Telegram)
 
 
 async def send_message(text: str) -> None:
+    """Trimite mesaj Telegram cu rate limiting simplu (1 msg/s max)."""
     if not config.telegram_token or not config.telegram_chat_id:
         return
-    global _bot
+    global _bot, _last_send_ts
     if _bot is None:
         _bot = Bot(token=config.telegram_token)
+
+    # Rate limiter: asteapta daca am trimis prea recent
+    now = time.monotonic()
+    wait = _SEND_MIN_INTERVAL - (now - _last_send_ts)
+    if wait > 0:
+        await asyncio.sleep(wait)
+
     try:
         await _bot.send_message(
             chat_id=config.telegram_chat_id,
             text=text,
             parse_mode="Markdown",
         )
+        _last_send_ts = time.monotonic()
     except Exception as e:
         logger.warning(f"Telegram send failed: {e}")
 
@@ -69,7 +71,7 @@ def _check_owner(u: Update) -> bool:
 async def notify_open(side: str, qty: float, price: float, sl: float, tp1: float) -> None:
     icon = "\U0001f7e2" if side == "long" else "\U0001f534"
     await send_message(
-        f"{icon} *POZITIE DESCHISA — {side.upper()}*\n"
+        f"{icon} *POZITIE DESCHISA \u2014 {side.upper()}*\n"
         f"Entry: `{price}` | Qty: `{qty}`\n"
         f"SL: `{sl:.2f}` | TP1: `{tp1:.2f}`"
     )
@@ -79,14 +81,14 @@ async def notify_tp(side: str, level: int, qty_closed: float, pnl_usdt: float) -
     icon = "\U0001f7e2" if side == "long" else "\U0001f534"
     pnl_icon = "\u2b06\ufe0f" if pnl_usdt >= 0 else "\u2b07\ufe0f"
     await send_message(
-        f"{icon} *TP{level} HIT — {side.upper()}*\n"
+        f"{icon} *TP{level} HIT \u2014 {side.upper()}*\n"
         f"Inchis qty: `{qty_closed}` {pnl_icon} PnL: `{pnl_usdt:+.4f} USDT`"
     )
 
 
 async def notify_sl(side: str, qty: float, pnl_usdt: float) -> None:
     await send_message(
-        f"\u274c *SL HIT — {side.upper()}*\n"
+        f"\u274c *SL HIT \u2014 {side.upper()}*\n"
         f"Qty: `{qty}` | PnL: `{pnl_usdt:+.4f} USDT`"
     )
 
@@ -100,7 +102,7 @@ async def notify_close(side: str, qty: float, pnl_usdt: float, reason: str = "")
     }
     reason_str = reason_map.get(reason, f"`{reason}`") if reason else ""
     await send_message(
-        f"\U0001f4e4 *POZITIE INCHISA — {side.upper()}*\n"
+        f"\U0001f4e4 *POZITIE INCHISA \u2014 {side.upper()}*\n"
         f"Qty: `{qty}` {pnl_icon} PnL: `{pnl_usdt:+.4f} USDT`\n"
         f"{reason_str}"
     )
@@ -140,7 +142,7 @@ async def cmd_menu(u: Update, c: ContextTypes.DEFAULT_TYPE):
         paused  = state.paused
     bot_status = "\u2705 ACTIV" if (running and not paused) else ("\u23f8 PAUZA" if paused else "\U0001f6d1 OPRIT")
     text = (
-        f"\u26a1 *Apex Scalper v1.0.3*\n"
+        f"\u26a1 *Apex Scalper v1.0.5*\n"
         f"`{config.symbol}` | {bot_status}\n"
         f"Price: `{price}` | Pozitie: `{pos}`"
     )
@@ -184,7 +186,7 @@ async def _handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif data == "pause":
         state.paused = True
         await query.edit_message_text(
-            "\u23f8 *PAUZAT* — fara intrari noi.",
+            "\u23f8 *PAUZAT* \u2014 fara intrari noi.",
             parse_mode="Markdown", reply_markup=_main_menu_keyboard()
         )
     elif data == "resume":
@@ -192,14 +194,14 @@ async def _handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
         state.paused = False
         risk.reset_consecutive_losses()
         await query.edit_message_text(
-            "\u25b6\ufe0f *RELUAT* — trading activ.",
+            "\u25b6\ufe0f *RELUAT* \u2014 trading activ.",
             parse_mode="Markdown", reply_markup=_main_menu_keyboard()
         )
     elif data == "stop":
         state.running = False
         await trader.close_position()
         await query.edit_message_text(
-            "\U0001f6d1 *Bot OPRIT* — pozitie inchisa.",
+            "\U0001f6d1 *Bot OPRIT* \u2014 pozitie inchisa.",
             parse_mode="Markdown"
         )
 
@@ -208,13 +210,25 @@ async def _handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # HELPERS
 # ---------------------------------------------------------------------------
 
+def _get_feed_elapsed() -> float:
+    """Returneaza secundele de la ultimul kline. -1 daca nu a venit niciodata."""
+    try:
+        from .watchdog import get_last_kline_ts
+        last = get_last_kline_ts()
+    except ImportError:
+        try:
+            from .watchdog import _last_kline_ts
+            last = _last_kline_ts
+        except ImportError:
+            return -1.0
+    return time.monotonic() - last if last > 0 else -1.0
+
+
 async def _send_status(target):
     from .strategy import ind
     from .orderbook_analytics import ob_signals
     from .regime_filter import regime
-    import time
-    from .watchdog import _last_kline_ts
-    elapsed = time.monotonic() - _last_kline_ts if _last_kline_ts > 0 else -1
+    elapsed = _get_feed_elapsed()
     feed_icon = "\u2705" if 0 <= elapsed < 90 else "\U0001f534"
     with state.lock:
         pos    = state.open_position or "none"
@@ -255,7 +269,6 @@ async def _send_pnl(target):
 async def _send_signals(target):
     from .strategy import ind
     from .orderbook_analytics import ob_signals
-    from .book_pressure import bp
     bb    = f"`{ind.bb_lower:.1f}`\u2026`{ind.bb_upper:.1f}`" if ind.bb_ready  else "`warmup`"
     macd  = f"hist=`{ind.macd_histogram:+.5f}`"               if ind.macd_ready else "`warmup`"
     stoch = f"%K=`{ind.stoch_k:.1f}` %D=`{ind.stoch_d:.1f}`" if ind.stoch_ready else "`warmup`"
@@ -348,7 +361,6 @@ async def _send_tp(target):
 
 async def _send_funding(target):
     from .funding_rate import funding
-    import time
     ttn = funding._next_funding_ms
     now_ms = int(time.time() * 1000)
     ttf = max(0, (ttn - now_ms) // 1000) if ttn else -1
@@ -380,7 +392,7 @@ async def _send_config(target):
         f"*Strategie*\n"
         f"  Entry threshold: `{sm.ENTRY_THRESHOLD}`\n"
         f"  RSI long/short: `{sm.RSI_LONG_MIN}` / `{sm.RSI_SHORT_MAX}`\n"
-        f"  ATR: `{sm.ATR_MIN_PCT}` — `{sm.ATR_MAX_PCT}` | Vol Z min: `{sm.VOL_ZSCORE_MIN}`\n"
+        f"  ATR: `{sm.ATR_MIN_PCT}` \u2014 `{sm.ATR_MAX_PCT}` | Vol Z min: `{sm.VOL_ZSCORE_MIN}`\n"
         f"  Spread max: `{sm.BASE_SPREAD_BPS}` bps\n\n"
         f"*Scale-out*\n"
         f"  TP1: `{pm.TP1_PCT:.4f}` ({pm.TP1_FRACTION:.0%}) | TP2: `{pm.TP2_PCT:.4f}` ({pm.TP2_FRACTION:.0%})\n"
@@ -389,7 +401,8 @@ async def _send_config(target):
         f"  Max pyramid: `{pm.MAX_PYRAMID_ADDS}`\n\n"
         f"*Risk*\n"
         f"  Daily loss limit: `{risk._daily_limit:.2f} USDT`\n"
-        f"  Max consecutive losses: `{risk._consecutive_losses}` / `5`\n\n"
+        # FIX v1.0.5: folosim property public in loc de camp privat
+        f"  Consecutive losses: `{risk.consecutive_losses}` / `5`\n\n"
         f"*MTF*\n"
         f"  EMA50(15m): `{mtf.ema50:.2f}` ({'\u2705 ready' if mtf.ready else '\u274c not ready'})"
     )
@@ -421,9 +434,7 @@ async def _send_metrics(target):
 
 
 async def _send_watchdog(target):
-    import time
-    from .watchdog import _last_kline_ts
-    elapsed = time.monotonic() - _last_kline_ts if _last_kline_ts > 0 else -1
+    elapsed = _get_feed_elapsed()
     status = "\u2705 OK" if 0 <= elapsed < 90 else "\U0001f534 DEAD"
     msg = f"\U0001f441 *Watchdog* {status}\nLast kline: `{elapsed:.0f}s` ago"
     if hasattr(target, "edit_message_text"):
@@ -462,12 +473,13 @@ async def _send_history(target, n: int = 10):
     else:
         lines = [f"\U0001f4dc *Ultimele {len(trades)} trade-uri* `{config.symbol}`\n"]
         for t in trades:
-            side  = t.get("side", "?")
-            entry = t.get("entry", 0)
-            pnl   = t.get("pnl_usdt", 0)
-            reason= t.get("close_reason", "?")
-            ts    = t.get("closed_at", "")[:16] if t.get("closed_at") else ""
-            icon  = "\u2705" if pnl >= 0 else "\u274c"
+            side   = t.get("side",     "?")
+            entry  = t.get("entry",    0)
+            pnl    = t.get("pnl_usdt", 0)
+            # FIX v1.0.5: campul corect din schema DB este 'reason', nu 'close_reason'
+            reason = t.get("reason",   "?")
+            ts     = t.get("closed_at", "")[:16]
+            icon   = "\u2705" if pnl >= 0 else "\u274c"
             lines.append(
                 f"{icon} `{side.upper()}` @ `{entry}` \u2192 `{pnl:+.4f} USDT` | {reason} | {ts}"
             )
@@ -487,7 +499,7 @@ async def _do_warmup(target):
     try:
         from .indicator_warmup import warmup_indicators
         ok = await warmup_indicators(config.symbol)
-        result = "\u2705 Warmup complet — toti indicatorii ready!" if ok else "\u26a0\ufe0f Warmup partial — verifica log-ul."
+        result = "\u2705 Warmup complet \u2014 toti indicatorii ready!" if ok else "\u26a0\ufe0f Warmup partial \u2014 verifica log-ul."
     except Exception as e:
         result = f"\u274c Warmup error: {e}"
     if hasattr(target, "edit_message_text"):
@@ -500,24 +512,19 @@ async def _do_warmup(target):
 # COMENZI TEXT
 # ---------------------------------------------------------------------------
 
+async def cmd_menu_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await cmd_menu(u, c)
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Porneste bot-ul. Verifica daca feed-ul e activ."""
-    import time
-    try:
-        from .watchdog import _last_kline_ts
-        elapsed = time.monotonic() - _last_kline_ts if _last_kline_ts > 0 else 999
-        feed_ok = elapsed < 90
-    except Exception:
-        feed_ok = False
-
+    elapsed  = _get_feed_elapsed()
+    feed_ok  = 0 <= elapsed < 90
     state.running = True
     state.paused  = False
-
     feed_warn = (
-        "\n\u26a0\ufe0f Feed WS inactiv — nu au venit candle-uri in ultimele 90s. "
+        "\n\u26a0\ufe0f Feed WS inactiv \u2014 nu au venit candle-uri in ultimele 90s. "
         "Restarteaza daca nu pornesc ordinele."
     ) if not feed_ok else ""
-
     await u.message.reply_text(
         f"\u2705 *Apex Scalper STARTED*{feed_warn}",
         parse_mode="Markdown"
@@ -530,7 +537,7 @@ async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     state.running = False
     await trader.close_position()
-    await u.message.reply_text("\U0001f6d1 *Bot STOPPED* — position closed", parse_mode="Markdown")
+    await u.message.reply_text("\U0001f6d1 *Bot STOPPED* \u2014 position closed", parse_mode="Markdown")
 
 
 async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -538,7 +545,7 @@ async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("\u26d4 Unauthorized.")
         return
     state.paused = True
-    await u.message.reply_text("\u23f8 *PAUSED* — no new entries", parse_mode="Markdown")
+    await u.message.reply_text("\u23f8 *PAUSED* \u2014 no new entries", parse_mode="Markdown")
 
 
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -601,6 +608,15 @@ async def cmd_history(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pass
     await _send_history(u, n=n)
 
+async def cmd_daily(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Trimite raportul zilnic la cerere."""
+    await u.message.reply_text("\U0001f4c5 *Generez raportul zilnic...*", parse_mode="Markdown")
+    try:
+        from .daily_report import send_daily_report
+        await send_daily_report(config.symbol)
+    except Exception as e:
+        await u.message.reply_text(f"\u274c Eroare: `{e}`", parse_mode="Markdown")
+
 async def cmd_analytics(u: Update, c: ContextTypes.DEFAULT_TYPE):
     from .analytics import analytics
     msg = analytics.telegram_breakdown(config.symbol, days=7)
@@ -651,8 +667,12 @@ async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
         return
     mod, cast = targets[key]
+    old_val = getattr(mod, key, "?")
     setattr(mod, key, cast(val))
-    await u.message.reply_text(f"\u2705 `{key}` = `{val}`", parse_mode="Markdown")
+    await u.message.reply_text(
+        f"\u2705 `{key}` schimbat: `{old_val}` \u2192 `{val}`",
+        parse_mode="Markdown"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +702,7 @@ def build_app():
         ("watchdog",  cmd_watchdog),
         ("risk",      cmd_risk),
         ("history",   cmd_history),
+        ("daily",     cmd_daily),
         ("analytics", cmd_analytics),
         ("pulse",     cmd_pulse),
         ("setparam",  cmd_setparam),
