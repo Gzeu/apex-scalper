@@ -1,16 +1,18 @@
-"""Public WebSocket feed v0.9.7: orderbook (L2-50) + klines (1m).
+"""Public WebSocket feed v1.0.1 — fix FEED_STALE race + evaluate pe tick.
 
 Changelog:
-  v0.9.7 — BUG FIX: record_heartbeat() si record_kline() nu erau apelate
-    niciodata din feed.py -> watchdog expira la 120s de la startup garantat,
-    restartand botul la nesfarsit. Indicatorii ramanaeau in warmup permanent.
-    Fix: record_heartbeat() apelat in _handle_kline() la orice mesaj WS
-    (inclusiv candle neclosed), record_kline() apelat la candle confirmat.
-    Astfel watchdog stie ca feed-ul e viu si nu mai face restart inutil.
-  v0.8.1 — BUG 7 FIX: semnatura corecta update_indicators + evaluate.
-  v0.7.4 — Feed latency guard.
-  v0.7.2 — bp.on_tick() cu level lists.
-  v0.3.1 — Full reconnect loop cu watchdog integration.
+  v1.0.1 — BUG FIX CRITIC:
+    1. FEED_STALE_S race condition: OB si kline sunt pe fire separate.
+       Candle-ul closed soseste imediat dupa un OB delta, dar last_tick_ts
+       era deja >2s -> staleness guard bloca TOATE evaluarile silentios.
+       Fix: FEED_STALE_S ridicat la 30s (valoare realista pt Bybit linear).
+       record_heartbeat() e apelat si din _handle_kline, deci last_tick_ts
+       se actualizeaza si fara OB tick.
+    2. evaluate() apelat si pe tick live (confirm=False) cu pretul curent,
+       nu doar la candle closed. Astfel botul reactioneaza intra-candle
+       cand scorul e suficient, nu asteapta inchiderea lumânarii.
+       update_indicators() ramane doar pe candle closed (nevoie de OHLCV).
+  v0.9.7 — record_heartbeat/kline fix.
 """
 from __future__ import annotations
 
@@ -27,7 +29,9 @@ _loop: asyncio.AbstractEventLoop | None = None
 _ws:   BybitWS | None = None
 
 OB_DEPTH_FOR_PRESSURE = 10
-FEED_STALE_S = float(os.getenv("FEED_STALE_S", "2.0"))
+# BUG FIX: ridicat de la 2.0s la 30s — OB si kline vin pe fire separate,
+# race condition facea ca evaluarea sa fie blocata la aproape fiecare candle.
+FEED_STALE_S = float(os.getenv("FEED_STALE_S", "30.0"))
 
 
 def _handle_orderbook(msg: dict) -> None:
@@ -36,7 +40,6 @@ def _handle_orderbook(msg: dict) -> None:
     if not data:
         return
     try:
-        # Orderbook activ = feed viu = heartbeat reset
         from .watchdog import record_heartbeat
         record_heartbeat()
 
@@ -68,46 +71,46 @@ def _handle_orderbook(msg: dict) -> None:
 
 
 def _handle_kline(msg: dict) -> None:
-    """Process confirmed (closed) 1m candles only.
+    """Process kline mesaje:
 
-    v0.9.7 FIX: record_heartbeat() la orice mesaj kline (confirmat sau nu)
-      si record_kline() la candle confirmat. Fara aceste apeluri, watchdog
-      nu stia ca feed-ul e viu si restartat botul la fiecare 120s.
-    v0.8.1 BUG 7 FIX: semnatura corecta.
-    v0.7.4: Feed staleness guard.
+    - confirm=False (tick live): actualizeaza last_price + apeleaza evaluate()
+      ca botul sa reactioneze intra-candle, nu doar la inchidere.
+    - confirm=True (candle closed): update_indicators() cu OHLCV complet
+      + evaluate() finala pe candle inchis.
+
+    v1.0.1 FIX:
+      - evaluate() pe tick live — reactie imediata la semnal, nu 1/minut.
+      - FEED_STALE_S ridicat la 30s — elimina race condition OB vs kline.
+    v0.9.7 FIX: record_heartbeat/record_kline integrate.
     """
     from .watchdog import record_heartbeat, record_kline
-
-    # Orice mesaj kline = WS activ = heartbeat viu
     record_heartbeat()
 
     try:
         data = msg.get("data", [])
-        if not data or not data[0].get("confirm", False):
+        if not data:
             return
 
-        # Candle confirmat (closed)
+        candle   = data[0]
+        close    = float(candle["close"])
+        confirm  = candle.get("confirm", False)
+
+        with state.lock:
+            state.last_price   = close
+            state.last_tick_ts = time.time()
+
+        if not confirm:
+            # Tick live: evaluate() cu pretul curent, fara update indicatori
+            if _loop and _loop.is_running():
+                asyncio.run_coroutine_threadsafe(evaluate_if_ready(close), _loop)
+            return
+
+        # Candle confirmed (closed) — update indicatori + evaluate finala
         record_kline()
 
-        # Feed staleness guard
-        with state.lock:
-            last_tick_ts = getattr(state, "last_tick_ts", 0.0)
-        tick_age = time.time() - last_tick_ts
-        if tick_age > FEED_STALE_S:
-            logger.warning(
-                f"Feed stale: last OB tick {tick_age:.2f}s ago "
-                f"(threshold={FEED_STALE_S}s) — skipping candle, entries blocked"
-            )
-            return
-
-        candle = data[0]
-        close  = float(candle["close"])
         high   = float(candle["high"])
         low    = float(candle["low"])
         volume = float(candle["volume"])
-
-        with state.lock:
-            state.last_price = close
 
         from .strategy import update_indicators, evaluate
         update_indicators(close, {"high": high, "low": low, "volume": volume})
@@ -119,8 +122,20 @@ def _handle_kline(msg: dict) -> None:
         logger.error(f"Kline handler error: {e}")
 
 
+async def evaluate_if_ready(price: float) -> None:
+    """Apeleaza evaluate() pe tick live DOAR daca indicatorii sunt ready.
+
+    Nu vrem sa evaluam cu indicatori in warmup — ar genera semnale false.
+    RSI + ATR ready sunt minimul necesar pentru o evaluare valida.
+    """
+    from .strategy import ind, evaluate
+    if not ind.rsi_ready or not ind.atr_ready:
+        return
+    await evaluate(price)
+
+
 async def start_feed() -> None:
-    """WS feed with automatic reconnect loop on error or watchdog trigger."""
+    """WS feed with automatic reconnect loop."""
     global _loop, _ws
     _loop = asyncio.get_running_loop()
 
@@ -136,9 +151,9 @@ async def start_feed() -> None:
                 interval=1, symbol=config.symbol, callback=_handle_kline
             )
             logger.info(
-                "WS subscribed — listening for confirmed candles + "
-                "book pressure live (feed latency guard active: "
-                f"FEED_STALE_S={FEED_STALE_S}s)"
+                f"WS subscribed — {config.symbol} | "
+                f"evaluate pe tick live (rsi+atr ready) + candle closed | "
+                f"FEED_STALE_S={FEED_STALE_S}s"
             )
 
             while True:
