@@ -6,3 +6,4 @@ pandas>=2.2.0
 aiohttp>=3.9.0
 loguru>=0.7.2
 sortedcontainers>=2.4.0
+websockets>=12.0
