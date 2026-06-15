@@ -1,18 +1,15 @@
-"""Main entry point v1.4.1 — inject_wall_params + trader.setup() fix.
+"""Main entry point v1.4.2 — toate metodele trader corecte.
 
 Changelog:
-  v1.4.1 — inject_wall_params(config.wall_ratio, config.wall_distance_ticks)
-    Fixat AttributeError: 'Config' object has no attribute 'wall_ratio'
-    (rezolvat in config v0.9.5 cu @property din SYMBOL_PROFILES)
-    Fixat AttributeError: 'Trader' object has no attribute 'connect'
-    (inlocuit trader.connect() + trader.setup_symbol() cu trader.setup())
+  v1.4.2 — inlocuit trader.get_open_position() (inexistent) cu
+    trader.sync_position_from_exchange() care exista si gestioneaza
+    intern restaurarea starii la restart.
+  v1.4.1 — inject_wall_params via config.wall_ratio + trader.setup().
   v1.4.0 — dashboard GUI integrat.
-  v1.3.x — funding rate, drawdown sizing, etc.
 """
 from __future__ import annotations
 
 import asyncio
-import os
 import signal
 import sys
 from loguru import logger
@@ -40,11 +37,10 @@ async def main() -> None:
     from .config import config
     from .trader import trader
     from .persistence import db
-    from .mtf_filter import mtf, run_mtf_refresh_loop
+    from .mtf_filter import run_mtf_refresh_loop
     from .funding_rate import run_funding_refresh_loop, funding
     from .daily_report import run_daily_report_loop
     from .anti_manipulation import inject_wall_params
-    from .regime_filter import regime
     from .state import state
     from .telegram_ui import start_telegram_bot
     from .health import run_health_server
@@ -61,24 +57,11 @@ async def main() -> None:
 
     await trader.setup()
 
-    # Sincronizeaza pozitia existenta la restart
-    existing = await trader.get_open_position(config.symbol)
-    if existing:
-        side     = existing.get("side", "").lower()
-        qty      = float(existing.get("size",        0))
-        entry    = float(existing.get("avgPrice",    0))
-        trade_id = int(existing.get("tradeId", 0)) if existing.get("tradeId") else 0
-        if side in ("buy", "sell") and qty > 0:
-            norm_side = "long" if side == "buy" else "short"
-            with state.lock:
-                state.open_position = norm_side
-                state.open_qty      = qty
-                state.open_entry    = entry
-            logger.info(f"Pozitie existenta restaurata: {norm_side} {qty} @ {entry}")
+    # Sincronizeaza pozitia existenta la restart (gestioneaza intern starea)
+    await trader.sync_position_from_exchange()
 
-    logger.info(f"Watchdog started (timeout=120s, max_restarts=5)")
+    logger.info("Watchdog started (timeout=120s, max_restarts=5)")
 
-    # Incarca funding rate initial
     await funding.maybe_refresh(config.symbol)
 
     state.running = True
