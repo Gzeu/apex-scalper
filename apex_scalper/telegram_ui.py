@@ -1,7 +1,7 @@
-"""Telegram bot UI v0.7.7
+"""Telegram bot UI v0.8.7 — Bug 34 fix.
 Commands:
   /start /stop /pause /resume /status /pnl /balance /close
-  /setparam KEY VALUE   — live strategy tuning
+  /setparam KEY VALUE   — live strategy tuning (owner only)
   /metrics              — full performance report
   /watchdog             — WS health status
   /signals              — full indicator snapshot
@@ -12,7 +12,11 @@ Commands:
   /pulse on|off         — toggle 1-minute pulse loop
 
 Changelog:
-  v0.7.7 — FIX: /pause apela cmd_resume (copy-paste bug) — acum corect.
+  v0.8.7 — BUG 34 FIX: /setparam, /stop, /close, /pause fara auth check.
+    Orice utilizator cu acces la chat putea modifica SL_PCT, ENTRY_THRESHOLD
+    sau opri botul. Fix: _check_owner() verifica effective_user.id vs
+    config.telegram_chat_id. Comenzile distructive refuza daca nu e owner.
+  v0.7.7 — FIX: /pause apela cmd_resume (copy-paste bug).
              NEW: /analytics, /tp, /funding, /pulse on|off
   v0.7.2 — GAP #3 fix: /resume reseteaza consecutive_losses
 """
@@ -46,22 +50,45 @@ async def send_message(text: str) -> None:
         logger.warning(f"Telegram send failed: {e}")
 
 
+def _check_owner(u: Update) -> bool:
+    """BUG 34 FIX: Verifica ca utilizatorul este owner-ul autorizat.
+
+    Compara effective_user.id (int) cu config.telegram_chat_id (str).
+    telegram_chat_id e folosit atat ca chat destinatie cat si ca owner ID
+    pentru comenzile distructive — in setup-uri single-user acesta e corect.
+    Returneaza True daca autorizat, False altfel.
+    """
+    if not config.telegram_chat_id:
+        return True  # daca nu e configurat, permite (backward compat)
+    user = u.effective_user
+    if user is None:
+        return False
+    return str(user.id) == str(config.telegram_chat_id)
+
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     state.running = True
     state.paused  = False
-    await u.message.reply_text("✅ *Apex Scalper STARTED*", parse_mode="Markdown")
+    await u.message.reply_text("\u2705 *Apex Scalper STARTED*", parse_mode="Markdown")
 
 
 async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    # BUG 34 FIX: auth check
+    if not _check_owner(u):
+        await u.message.reply_text("\u26d4 Unauthorized.", parse_mode="Markdown")
+        return
     state.running = False
     await trader.close_position()
-    await u.message.reply_text("🛑 *Bot STOPPED* — position closed", parse_mode="Markdown")
+    await u.message.reply_text("\U0001f6d1 *Bot STOPPED* — position closed", parse_mode="Markdown")
 
 
 async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """v0.7.7 FIX: apela cmd_resume in loc de cmd_pause."""
+    # BUG 34 FIX: auth check
+    if not _check_owner(u):
+        await u.message.reply_text("\u26d4 Unauthorized.", parse_mode="Markdown")
+        return
     state.paused = True
-    await u.message.reply_text("⏸ *PAUSED* — no new entries", parse_mode="Markdown")
+    await u.message.reply_text("\u23f8 *PAUSED* — no new entries", parse_mode="Markdown")
 
 
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -70,7 +97,7 @@ async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
     state.daily_pnl = 0.0
     risk.reset_consecutive_losses()
     await u.message.reply_text(
-        "▶️ *RESUMED*\n"
+        "\u25b6\ufe0f *RESUMED*\n"
         "`daily_pnl` reset la 0\n"
         "`consecutive_losses` reset la 0",
         parse_mode="Markdown",
@@ -88,15 +115,15 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bid_d  = state.orderbook.bid_depth(5)
         ask_d  = state.orderbook.ask_depth(5)
     msg = (
-        f"📊 *Status* `{config.symbol}`\n"
-        f"Running: {'\u2705' if state.running else '\ud83d\uded1'} "
+        f"\U0001f4ca *Status* `{config.symbol}`\n"
+        f"Running: {'\u2705' if state.running else '\U0001f6d1'} "
         f"Paused: {'\u23f8' if state.paused else '\u25b6\ufe0f'}\n"
         f"Position: `{pos}`\n"
         f"Price: `{price}` | Spread: `{spread}`\n"
-        f"Bid↓ `{bid_d:.3f}` Ask↑ `{ask_d:.3f}`\n"
+        f"Bid\u2193 `{bid_d:.3f}` Ask\u2191 `{ask_d:.3f}`\n"
         f"EMA 9/21/50: `{ind.ema_fast:.1f}`/`{ind.ema_slow:.1f}`/`{ind.ema_trend:.1f}`\n"
         f"RSI(14): `{ind.rsi_value:.1f}` ATR: `{ind.atr_value:.2f}`\n"
-        f"Regime: `{regime.label}` (ADX `{regime.adx}` sz×`{regime.size_factor():.2f}`)\n"
+        f"Regime: `{regime.label}` (ADX `{regime.adx}` sz\u00d7`{regime.size_factor():.2f}`)\n"
         f"Imbalance: `{ob_signals.imbalance:.3f}` Pressure: `{ob_signals.pressure_score:.3f}`"
     )
     await u.message.reply_text(msg, parse_mode="Markdown")
@@ -104,7 +131,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_pnl(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = (
-        f"💰 *PnL*\n"
+        f"\U0001f4b0 *PnL*\n"
         f"Realized: `{state.realized_pnl:+.4f} USDT`\n"
         f"Daily: `{state.daily_pnl:+.4f} USDT`\n"
         f"Trades: `{state.total_trades}` | WR: `{state.winrate}%`"
@@ -114,12 +141,16 @@ async def cmd_pnl(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_balance(u: Update, c: ContextTypes.DEFAULT_TYPE):
     bal = await trader.get_balance()
-    await u.message.reply_text(f"💳 Balance: `{bal:.4f} USDT`", parse_mode="Markdown")
+    await u.message.reply_text(f"\U0001f4b3 Balance: `{bal:.4f} USDT`", parse_mode="Markdown")
 
 
 async def cmd_close(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    # BUG 34 FIX: auth check
+    if not _check_owner(u):
+        await u.message.reply_text("\u26d4 Unauthorized.", parse_mode="Markdown")
+        return
     await trader.close_position()
-    await u.message.reply_text("📤 *Close executed*", parse_mode="Markdown")
+    await u.message.reply_text("\U0001f4e4 *Close executed*", parse_mode="Markdown")
 
 
 async def cmd_metrics(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -127,7 +158,7 @@ async def cmd_metrics(u: Update, c: ContextTypes.DEFAULT_TYPE):
     with risk._lock:
         kelly_trades = len(risk._trade_results)
     msg = (
-        f"📊 *Performance Metrics*\n"
+        f"\U0001f4ca *Performance Metrics*\n"
         f"Trades: `{len(perf.trades)}`\n"
         f"Win Rate: `{perf.win_rate:.1f}%`\n"
         f"Sharpe: `{perf.sharpe:.2f}`\n"
@@ -145,9 +176,9 @@ async def cmd_watchdog(u: Update, c: ContextTypes.DEFAULT_TYPE):
     import time
     from .watchdog import _last_kline_ts
     elapsed = time.monotonic() - _last_kline_ts if _last_kline_ts > 0 else -1
-    status = "✅ OK" if elapsed < 90 else "🔴 DEAD"
+    status = "\u2705 OK" if elapsed < 90 else "\U0001f534 DEAD"
     await u.message.reply_text(
-        f"👁 *Watchdog* {status}\nLast kline: `{elapsed:.0f}s` ago",
+        f"\U0001f441 *Watchdog* {status}\nLast kline: `{elapsed:.0f}s` ago",
         parse_mode="Markdown",
     )
 
@@ -166,24 +197,24 @@ async def cmd_signals(u: Update, c: ContextTypes.DEFAULT_TYPE):
              if ind.stoch_ready else "warming up")
 
     msg = (
-        f"🔮 *Signals Snapshot* `{config.symbol}`\n\n"
-        f"📈 *Trend*\n"
+        f"\U0001f52e *Signals Snapshot* `{config.symbol}`\n\n"
+        f"\U0001f4c8 *Trend*\n"
         f"EMA 9/21/50: `{ind.ema_fast:.2f}` / `{ind.ema_slow:.2f}` / `{ind.ema_trend:.2f}`\n"
-        f"Regime: `{regime.label}` | ADX: `{regime.adx}` | sz×: `{regime.size_factor():.2f}`\n\n"
-        f"📊 *Momentum*\n"
+        f"Regime: `{regime.label}` | ADX: `{regime.adx}` | sz\u00d7: `{regime.size_factor():.2f}`\n\n"
+        f"\U0001f4ca *Momentum*\n"
         f"RSI(14): `{ind.rsi_value:.2f}` ({'ready' if ind.rsi_ready else 'warmup'})\n"
         f"MACD(12,26,9): {macd}\n"
         f"Stoch RSI(14,3,3): {stoch}\n\n"
-        f"📌 *Volatility*\n"
+        f"\U0001f4cc *Volatility*\n"
         f"ATR(14): `{ind.atr_value:.4f}` ({'ready' if ind.atr_ready else 'warmup'})\n"
         f"BB(20,2): `{bb}`\n\n"
-        f"💧 *Volume*\n"
+        f"\U0001f4a7 *Volume*\n"
         f"Vol Z-Score: `{ind.vol_zscore:.2f}` ({'ready' if ind.vol_ready else 'warmup'})\n"
         f"VWAP: `{ind.vwap:.2f}`\n\n"
-        f"📖 *Order Book*\n"
+        f"\U0001f4d6 *Order Book*\n"
         f"Imbalance: `{ob_signals.imbalance:.4f}`\n"
         f"Pressure score: `{ob_signals.pressure_score:.4f}`\n"
-        f"Book Δ (cum delta): `{bp.cum_delta:.1f}`\n"
+        f"Book \u0394 (cum delta): `{bp.cum_delta:.1f}`\n"
         f"Large Bid Wall: `{ob_signals.large_bid}` | Large Ask Wall: `{ob_signals.large_ask}`"
     )
     await u.message.reply_text(msg, parse_mode="Markdown")
@@ -197,35 +228,33 @@ async def cmd_regime(u: Update, c: ContextTypes.DEFAULT_TYPE):
     sz_f   = regime.size_factor()
     allow  = regime.allow_entry()
     emoji  = {
-        "TRENDING": "🟢",
-        "RANGING":  "🔴",
-        "VOLATILE": "🟡",
-        "NEUTRAL":  "🟤",
-        "UNKNOWN":  "⚫",
-    }.get(label, "⚫")
+        "TRENDING": "\U0001f7e2",
+        "RANGING":  "\U0001f534",
+        "VOLATILE": "\U0001f7e1",
+        "NEUTRAL":  "\U0001f7e4",
+        "UNKNOWN":  "\u26ab",
+    }.get(label, "\u26ab")
     msg = (
         f"{emoji} *Market Regime: {label}*\n\n"
         f"ADX(14): `{adx}`\n"
         f"ATR(14): `{ind.atr_value:.4f}`\n"
         f"Entry allowed: `{'YES' if allow else 'NO — BLOCKED'}`\n"
-        f"Size factor: `{sz_f:.2f}×`\n\n"
-        f"_TRENDING → full size | VOLATILE → 50% size_\n"
-        f"_RANGING → entries blocked | NEUTRAL → 75% size_"
+        f"Size factor: `{sz_f:.2f}\u00d7`\n\n"
+        f"_TRENDING \u2192 full size | VOLATILE \u2192 50% size_\n"
+        f"_RANGING \u2192 entries blocked | NEUTRAL \u2192 75% size_"
     )
     await u.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_analytics(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Breakdown trades by reason, score bucket, worst streak."""
     from .analytics import analytics
     msg = analytics.telegram_breakdown(config.symbol, days=7)
     if not msg:
-        msg = "ℹ️ Nu sunt suficiente date (minim 1 trade inchis)."
+        msg = "\u2139\ufe0f Nu sunt suficiente date (minim 1 trade inchis)."
     await u.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_tp(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Status detaliat al pozitiei: TP1/2/3 hit, trail, hold candles."""
     from .position_manager import (
         position_manager as pm, TP1_PCT, TP2_PCT, TP3_PCT, SL_PCT, MAX_HOLD_CANDLES
     )
@@ -235,13 +264,13 @@ async def cmd_tp(u: Update, c: ContextTypes.DEFAULT_TYPE):
         qty   = state.open_qty
 
     if not pos or pm._entry_price == 0:
-        await u.message.reply_text("▫️ Nicio pozitie deschisa.", parse_mode="Markdown")
+        await u.message.reply_text("\u25ab\ufe0f Nicio pozitie deschisa.", parse_mode="Markdown")
         return
 
     entry   = pm._entry_price
     pnl_pct = pm._unrealised_pnl_pct(price)
     pnl_u   = round(pnl_pct * entry * qty, 4)
-    pnl_i   = "⬆️" if pnl_pct >= 0 else "⬇️"
+    pnl_i   = "\u2b06\ufe0f" if pnl_pct >= 0 else "\u2b07\ufe0f"
     tp1_p   = round(entry * (1 + TP1_PCT if pos == "long" else 1 - TP1_PCT), 2)
     tp2_p   = round(entry * (1 + TP2_PCT if pos == "long" else 1 - TP2_PCT), 2)
     tp3_p   = round(entry * (1 + TP3_PCT if pos == "long" else 1 - TP3_PCT), 2)
@@ -252,7 +281,7 @@ async def cmd_tp(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Entry: `{entry}` | Acum: `{price}` {pnl_i} `{pnl_pct*100:+.4f}%` (`{pnl_u:+.4f}` USDT)\n"
         f"Qty: `{qty}` | Hold: `{pm._hold_candles}/{MAX_HOLD_CANDLES}` candle(s)\n\n"
         f"*Scale-out:*\n"
-        f"  TP1 {'\u2705 HIT' if pm._tp1_hit else f'`{tp1_p}` (Δ`{round(tp1_p - price if pos == chr(108)+chr(111)+chr(110)+chr(103) else price - tp1_p, 2)}`)'} \n"
+        f"  TP1 {'\u2705 HIT' if pm._tp1_hit else f'`{tp1_p}`'} \n"
         f"  TP2 {'\u2705 HIT' if pm._tp2_hit else f'`{tp2_p}`'} \n"
         f"  TP3 {'\u2705 HIT' if pm._tp3_hit else f'`{tp3_p}`'}\n"
         f"  SL: `{sl_p}`\n"
@@ -263,7 +292,6 @@ async def cmd_tp(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_funding(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Funding rate curent + directii blocate."""
     from .funding_rate import funding
     import time
     can_l = funding.can_enter_long()
@@ -274,7 +302,7 @@ async def cmd_funding(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ttf_str = f"`{time_to_next // 3600}h {(time_to_next % 3600) // 60}m`" if time_to_next >= 0 else "`necunoscut`"
 
     msg = (
-        f"💸 *Funding Rate* `{config.symbol}`\n"
+        f"\U0001f4b8 *Funding Rate* `{config.symbol}`\n"
         f"Rata: `{funding.rate_pct}` (`{funding.rate:.8f}`)\n"
         f"LONG: {'\u2705 permis' if can_l else '\u274c blocat'}\n"
         f"SHORT: {'\u2705 permis' if can_s else '\u274c blocat'}\n"
@@ -285,21 +313,24 @@ async def cmd_funding(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_pulse(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Toggle pulse loop on/off."""
     from .pulse import set_pulse_active, is_pulse_active
     args = c.args
     if args and args[0].lower() == "off":
         set_pulse_active(False)
-        await u.message.reply_text("⏸ *Pulse OPRIT* — nu mai primesti rapoarte la 1 min.", parse_mode="Markdown")
+        await u.message.reply_text("\u23f8 *Pulse OPRIT* — nu mai primesti rapoarte la 1 min.", parse_mode="Markdown")
     elif args and args[0].lower() == "on":
         set_pulse_active(True)
-        await u.message.reply_text("✅ *Pulse PORNIT* — raport la fiecare 1 min.", parse_mode="Markdown")
+        await u.message.reply_text("\u2705 *Pulse PORNIT* — raport la fiecare 1 min.", parse_mode="Markdown")
     else:
         status = "activ" if is_pulse_active() else "oprit"
-        await u.message.reply_text(f"⚡ Pulse e `{status}`. Foloseste `/pulse on` sau `/pulse off`.", parse_mode="Markdown")
+        await u.message.reply_text(f"\u26a1 Pulse e `{status}`. Foloseste `/pulse on` sau `/pulse off`.", parse_mode="Markdown")
 
 
 async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    # BUG 34 FIX: auth check — /setparam poate modifica SL_PCT, ENTRY_THRESHOLD etc.
+    if not _check_owner(u):
+        await u.message.reply_text("\u26d4 Unauthorized.", parse_mode="Markdown")
+        return
     import apex_scalper.strategy as sm
     import apex_scalper.risk as rm
     import apex_scalper.position_manager as pm
@@ -327,13 +358,13 @@ async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if key not in targets:
         available = ", ".join(f"`{k}`" for k in sorted(targets))
         await u.message.reply_text(
-            f"❌ Unknown `{key}`\nAvailable: {available}",
+            f"\u274c Unknown `{key}`\nAvailable: {available}",
             parse_mode="Markdown",
         )
         return
     mod, cast = targets[key]
     setattr(mod, key, cast(val))
-    await u.message.reply_text(f"✅ `{key}` = `{val}`", parse_mode="Markdown")
+    await u.message.reply_text(f"\u2705 `{key}` = `{val}`", parse_mode="Markdown")
 
 
 def build_app():
@@ -341,7 +372,7 @@ def build_app():
     for name, fn in [
         ("start",     cmd_start),
         ("stop",      cmd_stop),
-        ("pause",     cmd_pause),     # v0.7.7 FIX: era cmd_resume
+        ("pause",     cmd_pause),
         ("resume",    cmd_resume),
         ("status",    cmd_status),
         ("pnl",       cmd_pnl),

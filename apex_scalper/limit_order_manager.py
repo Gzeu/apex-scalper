@@ -1,22 +1,13 @@
-"""Limit order manager v0.8.1 — Bug 8+9 fix.
+"""Limit order manager v0.8.7 — Bug 32 fix.
 
 Changelog:
-  v0.8.1 — BUG 8 FIX: adaugat place_entry_order() wrapper la nivel de modul.
-    strategy.py face 'from .limit_order_manager import place_entry_order' —
-    functia nu exista -> ImportError la prima intrare.
-    Fix: place_entry_order(side, qty, stop_loss, take_profit) apeleaza
-    lom.place_entry() si returneaza orderId (str) sau None.
-
-    BUG 9 FIX: trader.round_price() nu exista -> AttributeError.
-    Fix: round_price implementat inline cu tick_size din trader._tick_size.
-    trader.get_instrument_info(sym) returna None -> nu mai e apelat;
-    tick_size citit din trader._tick_size (setat in trader.setup()).
-    trader.fee_estimate(notional, type) -> semnaura gresita;
-    Fix: trader.fee_estimate(qty, price, order_type) conform trader.py.
-    trader.amend_order(symbol=sym) -> param inexistent;
-    Fix: symbol eliminat din amend_order call (trader foloseste self._symbol).
-    trader._session -> trader._client (numele corect din trader.py).
-
+  v0.8.7 — BUG 32 FIX: place_entry_order() returna un ID sintetic str
+    (ex: 'Buy_65432.1_0.001') in loc de int -> close_trade_record(trade_id: int)
+    facea trade_id > 0 -> TypeError sau fallback mereu -> duplicate insert in DB.
+    Fix: place_entry_order() apeleaza db.record_open_trade() si returneaza
+    int row_id (sau 0 la esec). close_trade_record() primeste int valid -> UPDATE corect.
+  v0.8.1 — BUG 8+9 fix: place_entry_order() wrapper, round_price inline,
+    fee_estimate, amend_order fara symbol, trader._client.
   v0.5.1 — _market_fallback SL/TP fix, tick_size cached.
 """
 from __future__ import annotations
@@ -40,16 +31,12 @@ class LimitOrderManager:
     """PostOnly Limit entry with amend-on-move and Market fallback."""
 
     def __init__(self):
-        # tick_size citit direct din trader._tick_size (setat in trader.setup())
-        # Nu mai apelam get_instrument_info() per-entry (Bug 9 fix)
         pass
 
     def _get_tick_size(self) -> float:
-        """Returneaza tick_size din trader (setat la setup). Fallback 0.01."""
         return getattr(trader, "_tick_size", 0.01) or 0.01
 
     def _round_price(self, price: float) -> float:
-        """Round price la tick_size. Inlocuieste trader.round_price() inexistent."""
         tick = self._get_tick_size()
         if tick <= 0:
             return price
@@ -62,15 +49,15 @@ class LimitOrderManager:
         symbol: Optional[str] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-    ) -> tuple[bool, float, float]:
+    ) -> tuple[bool, float, float, str]:
         """Place PostOnly Limit with native SL/TP and amend-on-move.
 
-        Returns (success, filled_qty, avg_price).
+        Returns (success, filled_qty, avg_price, order_id).
         """
         sym      = symbol or config.symbol
         deadline = time.monotonic() + FILL_TIMEOUT_S
         amend_count = 0
-        order_id    = None
+        order_id    = ""
 
         with state.lock:
             best_bid = state.orderbook.best_bid
@@ -83,7 +70,7 @@ class LimitOrderManager:
             return await self._market_fallback(side, qty, sym, stop_loss, take_profit)
 
         limit_price = best_bid if side == "Buy" else best_ask
-        limit_price = self._round_price(limit_price)   # BUG 9 FIX
+        limit_price = self._round_price(limit_price)
 
         resp = await trader.place_order(
             side=side, qty=qty,
@@ -98,7 +85,7 @@ class LimitOrderManager:
         order_id = resp.get("result", {}).get("orderId", "")
         logger.info(
             f"[LOM] Limit placed: {side} {qty} {sym} @ {limit_price} "
-            f"order_id={order_id[:8]}... "
+            f"order_id={order_id[:8] if order_id else '?'}... "
             + (f"SL={stop_loss} " if stop_loss else "")
             + (f"TP={take_profit}" if take_profit else "")
         )
@@ -108,7 +95,6 @@ class LimitOrderManager:
             await asyncio.sleep(POLL_INTERVAL_S)
 
             try:
-                # BUG 9 FIX: trader._client (nu trader._session)
                 r = await loop.run_in_executor(
                     None,
                     lambda: trader._client.get_order_history(
@@ -123,14 +109,13 @@ class LimitOrderManager:
                     avg_price = float(order.get("avgPrice", 0))
 
                     if status in ("Filled", "PartiallyFilled") and filled > 0:
-                        # BUG 9 FIX: fee_estimate(qty, price, order_type)
                         fee_data  = trader.fee_estimate(filled, avg_price, "Limit")
                         fee_saved = filled * avg_price * (0.00055 - 0.00020)
                         logger.info(
                             f"[LOM] \u2705 Limit fill: {side} {filled}/{qty} @ {avg_price:.4f} "
                             f"fee={fee_data:.6f} USDT saved={fee_saved:.4f} USDT vs Market"
                         )
-                        return True, filled, avg_price
+                        return True, filled, avg_price, order_id
 
                     if status in ("Cancelled", "Rejected", "Deactivated"):
                         break
@@ -146,7 +131,6 @@ class LimitOrderManager:
                 ticks_moved = abs(new_price - limit_price) / tick_size
                 if ticks_moved >= TICK_MOVE_THRESHOLD and amend_count < MAX_AMEND_ATTEMPTS:
                     new_limit = self._round_price(new_price)
-                    # BUG 9 FIX: amend_order fara symbol= (trader foloseste self._symbol)
                     amend_resp = await trader.amend_order(
                         order_id=order_id, price=new_limit
                     )
@@ -184,11 +168,10 @@ class LimitOrderManager:
         symbol: str,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-    ) -> tuple[bool, float, float]:
+    ) -> tuple[bool, float, float, str]:
         """Market fallback cu SL/TP intotdeauna atasat."""
         with state.lock:
             price = state.last_price
-        # BUG 9 FIX: fee_estimate(qty, price, order_type) conform trader.py
         fee = trader.fee_estimate(qty, price, "Market")
         logger.warning(
             f"[LOM] Market fallback: {side} {qty} {symbol} "
@@ -201,9 +184,10 @@ class LimitOrderManager:
             order_type="Market", post_only=False,
             stop_loss=stop_loss, take_profit=take_profit,
         )
-        if resp.get("retCode") == 0:
-            return True, qty, price
-        return False, 0.0, 0.0
+        order_id = resp.get("result", {}).get("orderId", "") if resp else ""
+        if resp and resp.get("retCode") == 0:
+            return True, qty, price, order_id
+        return False, 0.0, 0.0, ""
 
 
 lom = LimitOrderManager()
@@ -214,24 +198,30 @@ async def place_entry_order(
     qty: float,
     stop_loss: Optional[float] = None,
     take_profit: Optional[float] = None,
-) -> str | None:
-    """Wrapper pentru lom.place_entry() — BUG 8 FIX.
+) -> int:
+    """Wrapper pentru lom.place_entry() — returneaza int row_id pentru DB.
 
-    strategy.py face 'from .limit_order_manager import place_entry_order'.
-    Inainte: functia nu exista -> ImportError la prima intrare.
-    Acum: apeleaza lom.place_entry() si returneaza orderId sau None.
-
-    Returns:
-        orderId (str) daca fill confirmat, None altfel.
+    v0.8.7 BUG 32 FIX: inainte returna str sintetic (ex: 'Buy_65432_0.001')
+      -> close_trade_record(trade_id: int) facea trade_id > 0 -> TypeError
+      -> fallback record_trade() apelat mereu -> duplicate insert in DB.
+    Acum: apeleaza db.record_open_trade() dupa fill confirmat si returneaza
+      int row_id. close_trade_record() primeste int valid -> UPDATE corect.
+    Returneaza 0 daca fill a esuat (strategy verifica if trade_id).
     """
-    success, filled_qty, avg_price = await lom.place_entry(
+    from .persistence import db
+
+    success, filled_qty, avg_price, order_id = await lom.place_entry(
         side=side,
         qty=qty,
         stop_loss=stop_loss,
         take_profit=take_profit,
     )
     if success and filled_qty > 0:
-        # Returnam orderId-ul din ultimul resp stocat sau un ID sintetic
-        # pentru compatibilitate cu pm.on_open(trade_id=)
-        return f"{side}_{round(avg_price, 2)}_{qty}"
-    return None
+        row_id = db.record_open_trade(
+            symbol=config.symbol,
+            side="long" if side == "Buy" else "short",
+            entry=avg_price,
+            qty=filled_qty,
+        )
+        return row_id  # int > 0
+    return 0

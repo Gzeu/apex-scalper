@@ -1,10 +1,13 @@
-"""Strategy v0.8.1 — update_indicators semnaura corectata pentru feed.py.
+"""Strategy v0.8.7 — Bug 30+31 fix.
 
 Changelog:
-  v0.8.1 — BUG 7 FIX (partial):
-    update_indicators(price, kline_data: dict) — semnatura pastrata.
-    feed.py updatat sa trimita dict in loc de 4 scalari.
-    Intern: compute_all primeste price + dict (unchanged).
+  v0.8.7 — BUG 30 FIX: update_indicators() nu mai apeleaza asyncio.get_event_loop()
+    din thread-ul feed WS (deprecated Python 3.10+, returna loop gresit in 3.12+).
+    Fix: _main_loop capturat in set_main_loop() apelat din main.py la startup.
+    run_coroutine_threadsafe() foloseste acum loop-ul corect.
+  v0.8.7 — BUG 31 FIX: state.open_entry nu era setat la entry in evaluate().
+    Ambele ramuri (long + short) seteaza acum state.open_entry = price.
+  v0.8.1 — update_indicators semnaura corectata pentru feed.py.
   v0.8.0 — BUG 1+3+4 fix (on_open lock, risk.on_open, lazy Lock).
   v0.7.9 — score_snapshot() async helper pentru pulse.
 """
@@ -33,6 +36,17 @@ ATR_BASELINE     = 0.001
 
 # BUG 4 FIX: Lock creat lazy in running event loop, nu la import-time.
 _ind_lock: asyncio.Lock | None = None
+
+# BUG 30 FIX: main loop capturat la startup via set_main_loop()
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Apelat din main.py imediat dupa asyncio.run() / loop creat.
+    Salveaza referinta la loop-ul principal pentru update_indicators().
+    """
+    global _main_loop
+    _main_loop = loop
 
 
 def _get_ind_lock() -> asyncio.Lock:
@@ -184,6 +198,11 @@ def update_indicators(price: float, kline_data: dict) -> None:
     Semnatura: update_indicators(price: float, kline_data: dict)
     kline_data keys: 'high', 'low', 'volume'
 
+    v0.8.7 BUG 30 FIX: foloseste _main_loop in loc de asyncio.get_event_loop().
+      get_event_loop() e deprecated in Python 3.10+ si returna loop gresit
+      in Python 3.12+ cand apelat din thread-ul feed WebSocket.
+      Acum: _main_loop setat la startup via set_main_loop(loop) din main.py.
+      Fallback: _apply_ind_from_state direct daca loop nu e disponibil.
     v0.8.1: feed.py trimite dict corect: {high, low, volume}
     v0.8.0 BUG 4 FIX: _get_ind_lock() lazy pentru compatibilitate Python 3.12+.
     """
@@ -194,15 +213,19 @@ def update_indicators(price: float, kline_data: dict) -> None:
     volume = float(kline_data.get("volume", 0.0))
     update_all(s, price, high, low, volume)
 
-    # Copiem rezultatele din s (indicators.IndicatorState) in ind (strategy.IndicatorState)
-    loop = asyncio.get_event_loop()
-    future = asyncio.run_coroutine_threadsafe(
-        _update_ind_locked(s, price), loop
-    )
-    try:
-        future.result(timeout=1.0)
-    except Exception as e:
-        logger.warning(f"[strategy] update_indicators lock timeout: {e}")
+    # BUG 30 FIX: foloseste _main_loop capturat la startup, nu get_event_loop()
+    loop = _main_loop
+    if loop is not None and loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(
+            _update_ind_locked(s, price), loop
+        )
+        try:
+            future.result(timeout=1.0)
+        except Exception as e:
+            logger.warning(f"[strategy] update_indicators lock timeout: {e}")
+            _apply_ind_from_state(s, price)
+    else:
+        # Fallback: loop nu e disponibil (test sau startup inainte de set_main_loop)
         _apply_ind_from_state(s, price)
 
 
@@ -302,7 +325,6 @@ async def evaluate(price: float) -> None:
             return
         if price <= mtf.ema50:
             return
-        # BUG 8 FIX: place_entry_order wrapper din limit_order_manager
         from .limit_order_manager import place_entry_order
         sl = price * (1 - 0.0008)
         tp = price * (1 + 0.004)
@@ -323,7 +345,8 @@ async def evaluate(price: float) -> None:
             risk.on_open()
             with state.lock:
                 state.open_position = "long"
-                state.open_qty = qty
+                state.open_qty      = qty
+                state.open_entry    = price  # BUG 31 FIX
             logger.info(
                 f"LONG bp score={score_l:.3f}/{ENTRY_THRESHOLD} | "
                 f"price={price} qty={qty} sl={sl:.2f} tp={tp:.2f}"
@@ -354,7 +377,8 @@ async def evaluate(price: float) -> None:
             risk.on_open()
             with state.lock:
                 state.open_position = "short"
-                state.open_qty = qty
+                state.open_qty      = qty
+                state.open_entry    = price  # BUG 31 FIX
             logger.info(
                 f"SHORT bp score={score_s:.3f}/{ENTRY_THRESHOLD} | "
                 f"price={price} qty={qty} sl={sl:.2f} tp={tp:.2f}"

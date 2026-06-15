@@ -1,14 +1,11 @@
-"""Trader module v0.8.6 — Bug 25-26 fix.
+"""Trader module v0.8.7 — Bug 33 fix.
 
 Changelog:
-  v0.8.6 — BUG 25 FIX: close_position() trimite Market fallback DOAR daca
-    Limit-ul nu a fost filled (poll via _confirm_order_filled).
-    Inainte: Market era trimis MEREU dupa sleep(limit_timeout_s) -> dublu-close.
-    Fix: dupa sleep, poll fill status; Market fallback doar daca not filled.
-  v0.8.6 — BUG 26 FIX: amend_order() si amend_sl_tp() guard _client is None.
-    Inainte: amend_order() facea self._client.amend_order fara verificare
-    -> AttributeError daca SIGTERM venea inainte de setup().
-    Fix: guard identic cu cel din close_position().
+  v0.8.7 — BUG 33 FIX: get_balance() metoda inexistenta -> /balance crash AttributeError.
+    Adaugat get_balance() via get_wallet_balance(accountType='UNIFIED').
+    Returneaza float USDT disponibil sau 0.0 la eroare.
+  v0.8.6 — BUG 25 FIX: close_position() Market fallback DOAR daca Limit nu filled.
+  v0.8.6 — BUG 26 FIX: amend_order() + amend_sl_tp() guard _client is None.
   v0.8.1 — BUG 12 FIX: close_position guard client None.
   v0.7.1 — RateLimiter + sync_position_from_exchange.
 """
@@ -155,9 +152,33 @@ class Trader:
             logger.warning(f"get_instrument_info failed: {e}")
 
     def fee_estimate(self, qty: float, price: float, order_type: str) -> float:
-        """Estimeaza fee in USDT. Returneaza float (nu dict)."""
         rate = 0.00020 if order_type == "Limit" else 0.00055
         return round(qty * price * rate, 6)
+
+    async def get_balance(self) -> float:
+        """Returneaza balanta USDT disponibila din contul UNIFIED.
+
+        v0.8.7 BUG 33 FIX: metoda lipsea complet -> /balance in telegram_ui
+        crasha cu AttributeError la fiecare apel.
+        Implementat via get_wallet_balance(accountType='UNIFIED').
+        Returneaza 0.0 la eroare pentru a nu crasha handler-ul Telegram.
+        """
+        if self._client is None:
+            return 0.0
+        try:
+            result = await _api_call_with_retry(
+                self._client.get_wallet_balance,
+                accountType="UNIFIED",
+            )
+            if result.get("retCode") == 0:
+                accounts = result.get("result", {}).get("list", [])
+                for account in accounts:
+                    for coin in account.get("coin", []):
+                        if coin.get("coin") == "USDT":
+                            return float(coin.get("availableToWithdraw", 0.0))
+        except Exception as e:
+            logger.warning(f"get_balance failed: {e}")
+        return 0.0
 
     async def place_order(
         self,
@@ -203,7 +224,6 @@ class Trader:
         qty: float | None = None,
         price: float | None = None,
     ) -> dict:
-        # BUG 26 FIX: guard _client is None — identic cu close_position()
         if self._client is None:
             logger.debug("[trader] amend_order: client not initialized, skipping")
             return {"retCode": -1, "retMsg": "not initialized"}
@@ -221,7 +241,6 @@ class Trader:
         stop_loss: float | None = None,
         take_profit: float | None = None,
     ) -> dict:
-        # BUG 26 FIX: guard _client is None
         if self._client is None:
             logger.debug("[trader] amend_sl_tp: client not initialized, skipping")
             return {"retCode": -1}
@@ -239,14 +258,6 @@ class Trader:
         use_limit: bool = True,
         limit_timeout_s: float = 3.0,
     ) -> None:
-        """Close full position. Limit-first (maker fee), Market fallback ONLY if not filled.
-
-        v0.8.6 BUG 25 FIX: Market fallback trimis DOAR daca Limit nu a fost filled.
-          Inainte: Market era trimis MEREU dupa sleep -> dublu-close la fiecare TP/SL.
-          Fix: poll fill status dupa sleep; skip Market daca Limit s-a executat.
-        v0.8.1 BUG 12 FIX: guard client None pentru shutdown inainte de setup().
-        """
-        # BUG 12 FIX: daca setup() nu a fost apelat, nu avem client
         if self._client is None:
             logger.debug("[trader] close_position: client not initialized, skipping")
             return
@@ -262,7 +273,6 @@ class Trader:
 
         close_side = "Sell" if pos == "long" else "Buy"
 
-        # BUG 25 FIX: Market fallback DOAR daca Limit nu a fost filled
         limit_filled = False
         if use_limit:
             limit_px = best_ask if pos == "long" else best_bid
@@ -274,7 +284,6 @@ class Trader:
             if resp.get("retCode") == 0:
                 order_id = resp.get("result", {}).get("orderId", "")
                 await asyncio.sleep(limit_timeout_s)
-                # Poll fill status — skip Market daca Limit s-a executat
                 if order_id:
                     try:
                         fill_result = await _api_call_with_retry(
@@ -305,7 +314,6 @@ class Trader:
             state.trailing_stop = 0.0
 
     async def sync_position_from_exchange(self) -> None:
-        """Called at startup. Detect SL triggered while offline (ghost state)."""
         if self._client is None:
             return
         try:
@@ -332,8 +340,7 @@ class Trader:
             if bot_has_pos and not exchange_has_pos:
                 logger.warning(
                     f"Ghost position detected: bot={bot_side} qty={bot_qty} "
-                    f"entry={bot_entry} — exchange has NO open position. "
-                    f"SL was triggered while offline."
+                    f"entry={bot_entry} — exchange has NO open position."
                 )
                 if current_px > 0 and bot_entry > 0:
                     pnl_pct = (
@@ -357,8 +364,6 @@ class Trader:
                     pnl_usdt=pnl_usdt,
                     pnl_pct=pnl_pct,
                     reason="SL_OFFLINE",
-                    signal_score=0.0,
-                    funding_rate=0.0,
                 )
                 with state.lock:
                     state.open_position = ""
