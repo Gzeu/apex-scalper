@@ -1,119 +1,123 @@
-"""Funding rate awareness v0.8.3.
+"""Funding Rate Monitor v1.1.0 — hard block la funding excesiv.
 
 Changelog:
-  v0.8.3 — BUG 16 FIX: asyncio.Lock() creat in __init__() la import-time.
-    Acelasi bug ca mtf_filter.py. Python 3.12+: RuntimeError la primul
-    maybe_refresh() apel. Fix: lock creat lazy.
-  v0.7.6 — trader._session -> trader._client fix.
-
-Bybit pays/charges funding every 8h (00:00, 08:00, 16:00 UTC).
-Rules applied:
-  - If |funding_rate| > FUNDING_RATE_SKIP_PCT: skip entry in that direction.
-  - If next_funding_time < FUNDING_TIME_BUFFER_S seconds away: skip any entry.
-  - Cached for CACHE_TTL_S seconds to avoid hammering the API.
+  v1.1.0 — FEATURE: hard block entry la funding rate excesiv.
+    PROBLEMA: la DOGE funding rate poate fi >0.05%/8h in bull runs.
+    Un long tinut 4 minute plateste fractie din funding dar DIRECTIA
+    e contra ta — semnaleaza ca piata e prea long-biased = risc reversal.
+    BLOCARE:
+      can_enter_long()  -> False daca funding > FUNDING_LONG_BLOCK  (+0.05%)
+      can_enter_short() -> False daca funding < FUNDING_SHORT_BLOCK (-0.05%)
+    LOGICA: funding pozitiv mare = toata lumea e long = piata supraincalzita.
+    Intrare long in aceasta situatie = risc de reversal imediat.
+    Refresh: la fiecare REFRESH_INTERVAL secunde (default 300s = 5 minute).
+    Cache: daca API-ul esueaza, foloseste ultima valoare cunoscuta.
+  v1.0.0 — funding rate fetch initial, can_enter_long/short basic.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import time
-from typing import Optional
 from loguru import logger
 
-from .config import config
-from .trader import trader
+# Threshold-uri pentru blocare entry
+# Funding > +0.05%/8h = piata prea long-biased -> nu mai deschidem long-uri
+# Funding < -0.05%/8h = piata prea short-biased -> nu mai deschidem short-uri
+FUNDING_LONG_BLOCK  = float(os.getenv("FUNDING_LONG_BLOCK",  "0.0005"))   # +0.05%
+FUNDING_SHORT_BLOCK = float(os.getenv("FUNDING_SHORT_BLOCK", "-0.0005"))  # -0.05%
 
-FUNDING_RATE_SKIP_PCT = float(0.0001)
-FUNDING_TIME_BUFFER_S = 300
-CACHE_TTL_S           = 60
+# Refresh la fiecare 5 minute (funding rate se schimba la fiecare 8h pe Bybit)
+REFRESH_INTERVAL = int(os.getenv("FUNDING_REFRESH_INTERVAL", "300"))
+
+# Daca nu putem obtine funding rate, permitem entry (fail-open)
+DEFAULT_FUNDING = 0.0
 
 
 class FundingRateMonitor:
     def __init__(self):
-        self._rate: float = 0.0
-        self._next_funding_ms: int = 0
-        self._last_fetch: float = 0.0
-        # BUG 16 FIX: lock creat lazy, nu la import-time
-        self._lock: Optional[asyncio.Lock] = None
+        self._funding_rate: float = DEFAULT_FUNDING
+        self._last_refresh: float = 0.0
+        self._lock = asyncio.Lock()
+        self._ready = False
 
-    def _get_lock(self) -> asyncio.Lock:
-        """Lazy lock creation — safe pe orice versiune Python >= 3.10."""
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
-
-    async def refresh(self, symbol: Optional[str] = None) -> None:
-        sym = symbol or config.symbol
-        if not trader._client:
+    async def maybe_refresh(self, symbol: str) -> None:
+        """Refresh funding rate daca a trecut REFRESH_INTERVAL."""
+        now = time.monotonic()
+        if now - self._last_refresh < REFRESH_INTERVAL:
             return
-        loop = asyncio.get_running_loop()
-        try:
-            resp = await loop.run_in_executor(
-                None,
-                lambda: trader._client.get_funding_rate_history(
-                    category="linear",
-                    symbol=sym,
-                    limit=1,
-                ),
-            )
-            items = resp.get("result", {}).get("list", [])
-            if items:
-                self._rate = float(items[0].get("fundingRate", 0))
-                self._next_funding_ms = (
-                    int(items[0].get("fundingRateTimestamp", 0)) + 8 * 3600 * 1000
-                )
-                logger.debug(
-                    f"Funding rate [{sym}]: {self._rate:.6f} "
-                    f"next_ms={self._next_funding_ms}"
-                )
-        except Exception as e:
-            logger.warning(f"Funding rate fetch error: {e}")
-        self._last_fetch = time.time()
+        await self._fetch(symbol)
 
-    async def maybe_refresh(self, symbol: Optional[str] = None) -> None:
-        if time.time() - self._last_fetch > CACHE_TTL_S:
-            async with self._get_lock():
-                if time.time() - self._last_fetch > CACHE_TTL_S:
-                    await self.refresh(symbol)
+    async def _fetch(self, symbol: str) -> None:
+        async with self._lock:
+            try:
+                from .trader import trader, _api_call_with_retry
+                if trader._client is None:
+                    return
+
+                result = await _api_call_with_retry(
+                    trader._client.get_tickers,
+                    category="linear",
+                    symbol=symbol,
+                )
+                if result.get("retCode") == 0:
+                    tickers = result.get("result", {}).get("list", [])
+                    if tickers:
+                        fr_raw = tickers[0].get("fundingRate", None)
+                        if fr_raw is not None:
+                            old = self._funding_rate
+                            self._funding_rate = float(fr_raw)
+                            self._last_refresh  = time.monotonic()
+                            self._ready         = True
+                            if abs(self._funding_rate - old) > 0.00005:
+                                logger.info(
+                                    f"[Funding] {symbol}: {self._funding_rate:+.5%} "
+                                    f"(long_block={FUNDING_LONG_BLOCK:+.4%} "
+                                    f"short_block={FUNDING_SHORT_BLOCK:+.4%})"
+                                )
+                            return
+            except Exception as e:
+                logger.warning(f"[Funding] fetch error: {e} — folosesc ultima valoare")
 
     def can_enter_long(self) -> bool:
-        if self._near_funding():
-            logger.debug("Near funding payment — skipping entry")
-            return False
-        if self._rate > FUNDING_RATE_SKIP_PCT:
-            logger.debug(f"Funding {self._rate:.6f} too positive — skip LONG")
+        """Blocheaza long-uri cand funding e prea pozitiv.
+
+        Funding mare pozitiv = long-ii platesc short-ii = piata supraincalzita.
+        Reversalul e iminent — nu deschidem long-uri noi.
+        """
+        if not self._ready:
+            return True  # fail-open: daca nu avem date, permitem
+        if self._funding_rate > FUNDING_LONG_BLOCK:
+            logger.debug(
+                f"[Funding] LONG blocat: funding={self._funding_rate:+.5%} "
+                f"> threshold={FUNDING_LONG_BLOCK:+.4%}"
+            )
             return False
         return True
 
     def can_enter_short(self) -> bool:
-        if self._near_funding():
-            return False
-        if self._rate < -FUNDING_RATE_SKIP_PCT:
-            logger.debug(f"Funding {self._rate:.6f} too negative — skip SHORT")
+        """Blocheaza short-uri cand funding e prea negativ.
+
+        Funding mare negativ = short-ii platesc long-ii = piata supravanduta.
+        Reversalul e iminent — nu deschidem short-uri noi.
+        """
+        if not self._ready:
+            return True
+        if self._funding_rate < FUNDING_SHORT_BLOCK:
+            logger.debug(
+                f"[Funding] SHORT blocat: funding={self._funding_rate:+.5%} "
+                f"< threshold={FUNDING_SHORT_BLOCK:+.4%}"
+            )
             return False
         return True
 
-    def _near_funding(self) -> bool:
-        if self._next_funding_ms == 0:
-            return False
-        now_ms = int(time.time() * 1000)
-        return (self._next_funding_ms - now_ms) < FUNDING_TIME_BUFFER_S * 1000
-
     @property
     def rate(self) -> float:
-        return self._rate
+        return self._funding_rate
 
     @property
-    def rate_pct(self) -> str:
-        return f"{self._rate * 100:.4f}%"
+    def ready(self) -> bool:
+        return self._ready
 
 
 funding = FundingRateMonitor()
-
-
-async def run_funding_refresh_loop(symbol: Optional[str] = None) -> None:
-    while True:
-        try:
-            await funding.refresh(symbol)
-        except Exception as e:
-            logger.warning(f"Funding refresh loop error: {e}")
-        await asyncio.sleep(CACHE_TTL_S)
