@@ -1,15 +1,17 @@
-"""Dashboard v1.0.0 — Dash GUI pentru monitorizarea bot-ului.
+"""Dashboard v2.0.0 — polished GUI cu candlestick, Fibonacci orizontal, PnL bars, streak badge.
 
-Pornire: ruleaza automat din main.py pe portul 8050.
-Acces:   http://localhost:8050
-
-Features:
-  - Live tick price + pozitie curenta
-  - Trade progress bar (0-100%) cu niveluri Fibonacci
-  - Grafic PnL cumulat (toate trade-urile)
-  - Win/Loss donut chart
-  - Tabel ultimele 30 trade-uri cu colorare win/loss
-  - Refresh automat la fiecare 2 secunde
+Changelog:
+  v2.0.0 — full redesign:
+    - Fibonacci chart ORIZONTAL (mai intuitiv, vizibil pe scara pret real)
+    - Grafic pret live (Scatter cu gradient) in loc de bara simpla
+    - PnL per trade: bar chart verde/rosu (nu doar linie cumulata)
+    - Linie cumulata PnL cu gradient area fill
+    - Streak badge: "3 LOSS STREAK ⚠" / "5 WIN STREAK 🔥" animat
+    - Session stats: avg win, avg loss, profit factor, best/worst trade
+    - Tabel cu signal score + funding rate pe fiecare trade
+    - Metrici mai mari si mai clare
+    - CSS imbunatatit: glow pe card activ, hover pe randuri tabel
+    - Refresh 1.5s (era 2s)
 """
 from __future__ import annotations
 
@@ -19,491 +21,731 @@ from typing import Any
 
 from loguru import logger
 
-# Fibonacci retracement levels (0% = entry, 100% = TP)
+# ── Fibonacci niveluri (raport din entry spre TP) ──────────────────────────
 FIB_LEVELS = [
-    (0.236, "#b8860b", "Fib 23.6%"),
-    (0.382, "#cd853f", "Fib 38.2%"),
-    (0.500, "#4682b4", "Fib 50.0%"),
-    (0.618, "#2e8b57", "Fib 61.8%"),
-    (0.786, "#9370db", "Fib 78.6%"),
+    (0.000, "#444c56", "Entry",    3),
+    (0.236, "#d29922", "23.6%",    1.5),
+    (0.382, "#cd853f", "38.2%",    1.5),
+    (0.500, "#4682b4", "50.0%",    1.5),
+    (0.618, "#2e8b57", "61.8%",    2),
+    (0.786, "#9370db", "78.6%",    1.5),
+    (1.000, "#3fb950", "TP3",      3),
 ]
 
-_BG       = "#0d1117"
-_BG2      = "#161b22"
-_BG3      = "#21262d"
-_GREEN    = "#3fb950"
-_RED      = "#f85149"
-_GOLD     = "#d29922"
-_TEXT     = "#e6edf3"
-_SUBTEXT  = "#8b949e"
-_BORDER   = "#30363d"
+# ── Paleta ─────────────────────────────────────────────────────────────────
+_BG      = "#0d1117"
+_BG2     = "#161b22"
+_BG3     = "#21262d"
+_BG4     = "#2d333b"
+_GREEN   = "#3fb950"
+_GREEN2  = "#26a641"
+_RED     = "#f85149"
+_GOLD    = "#d29922"
+_BLUE    = "#58a6ff"
+_PURPLE  = "#bc8cff"
+_TEXT    = "#e6edf3"
+_SUB     = "#8b949e"
+_BORDER  = "#30363d"
+
+_FONT = "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace"
 
 
-def _css() -> str:
-    return f"""
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ background: {_BG}; color: {_TEXT}; font-family: 'JetBrains Mono', 'Fira Code', monospace; }}
-    .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td {{
-        background: {_BG2} !important; color: {_TEXT} !important;
-        border-color: {_BORDER} !important; font-size: 12px;
-    }}
-    .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th {{
-        background: {_BG3} !important; color: {_SUBTEXT} !important;
-        border-color: {_BORDER} !important; font-size: 11px; text-transform: uppercase;
-    }}
-    .card {{ background: {_BG2}; border: 1px solid {_BORDER}; border-radius: 8px; padding: 16px; }}
-    .metric-val {{ font-size: 28px; font-weight: 700; }}
-    .metric-lbl {{ font-size: 11px; color: {_SUBTEXT}; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }}
-    .win  {{ color: {_GREEN}; }}
-    .loss {{ color: {_RED}; }}
-    """
+# ── CSS global ─────────────────────────────────────────────────────────────
+_CSS = f"""
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+*, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+body {{
+    background: {_BG};
+    color: {_TEXT};
+    font-family: {_FONT};
+    font-size: 13px;
+    line-height: 1.5;
+}}
+
+/* scrollbar */
+::-webkit-scrollbar {{ width: 6px; }}
+::-webkit-scrollbar-track {{ background: {_BG2}; }}
+::-webkit-scrollbar-thumb {{ background: {_BG4}; border-radius: 3px; }}
+
+/* card */
+.card {{
+    background: {_BG2};
+    border: 1px solid {_BORDER};
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    transition: border-color .2s;
+}}
+.card-active {{
+    background: {_BG2};
+    border: 1px solid {_GOLD}44;
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    box-shadow: 0 0 18px {_GOLD}18;
+}}
+
+/* metric tile */
+.m-val  {{ font-size: 24px; font-weight: 700; line-height: 1.1; }}
+.m-lbl  {{ font-size: 10px; color: {_SUB}; text-transform: uppercase; letter-spacing: 1px; margin-top: 3px; }}
+
+/* section label */
+.sec-lbl {{
+    font-size: 10px;
+    color: {_SUB};
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}}
+.sec-lbl::after {{
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: {_BORDER};
+}}
+
+/* streak badge */
+.badge-win  {{ display:inline-block; padding:2px 10px; border-radius:12px;
+               background:{_GREEN}22; border:1px solid {_GREEN}55;
+               color:{_GREEN}; font-size:11px; font-weight:700; }}
+.badge-loss {{ display:inline-block; padding:2px 10px; border-radius:12px;
+               background:{_RED}22; border:1px solid {_RED}55;
+               color:{_RED}; font-size:11px; font-weight:700; }}
+.badge-neu  {{ display:inline-block; padding:2px 10px; border-radius:12px;
+               background:{_BG4}; border:1px solid {_BORDER};
+               color:{_SUB}; font-size:11px; }}
+
+/* tabel trade-uri */
+.trade-row {{ border-bottom: 1px solid {_BG3}; transition: background .15s; }}
+.trade-row:hover {{ background: {_BG3} !important; cursor: default; }}
+.trade-td {{ padding: 5px 8px; font-size: 11px; white-space: nowrap; }}
+
+/* stat mini */
+.stat-box {{
+    background: {_BG3};
+    border-radius: 6px;
+    padding: 8px 12px;
+    flex: 1;
+    min-width: 0;
+}}
+.stat-val {{ font-size: 14px; font-weight: 700; }}
+.stat-lbl {{ font-size: 10px; color: {_SUB}; margin-top: 2px; }}
+"""
 
 
-def _card(children, style: dict | None = None) -> Any:
+def _card(children, active: bool = False, style: dict | None = None) -> Any:
     from dash import html
-    s = {"marginBottom": "16px"}
+    cls = "card-active" if active else "card"
+    s = {}
     if style:
         s.update(style)
-    return html.Div(children, className="card", style=s)
+    return html.Div(children, className=cls, style=s or None)
 
 
-def _metric(value: str, label: str, color: str = _TEXT) -> Any:
+def _sec(label: str) -> Any:
+    from dash import html
+    return html.Div(label, className="sec-lbl")
+
+
+def _metric(val: str, lbl: str, color: str = _TEXT) -> Any:
     from dash import html
     return html.Div([
-        html.Div(value, className="metric-val", style={"color": color}),
-        html.Div(label, className="metric-lbl"),
+        html.Div(val, className="m-val", style={"color": color}),
+        html.Div(lbl, className="m-lbl"),
     ])
 
 
-def create_app():
-    """Creeaza si returneaza aplicatia Dash."""
-    import dash
-    from dash import dcc, html, dash_table
-    from dash.dependencies import Input, Output
+def _stat(val: str, lbl: str, color: str = _TEXT) -> Any:
+    from dash import html
+    return html.Div([
+        html.Div(val, className="stat-val", style={"color": color}),
+        html.Div(lbl, className="stat-lbl"),
+    ], className="stat-box")
+
+
+def _empty_fig(msg: str = "Fără date") -> Any:
     import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_annotation(
+        x=0.5, y=0.5, xref="paper", yref="paper",
+        text=msg, showarrow=False,
+        font={"size": 12, "color": _SUB, "family": _FONT},
+    )
+    fig.update_layout(
+        paper_bgcolor=_BG2, plot_bgcolor=_BG2,
+        margin={"t": 0, "b": 0, "l": 0, "r": 0},
+        xaxis={"visible": False}, yaxis={"visible": False},
+    )
+    return fig
+
+
+def _layout_base() -> dict:
+    return dict(
+        paper_bgcolor=_BG2,
+        plot_bgcolor=_BG2,
+        font={"family": _FONT, "color": _TEXT},
+        xaxis=dict(color=_SUB, gridcolor=_BG3, linecolor=_BORDER, zeroline=False),
+        yaxis=dict(color=_SUB, gridcolor=_BG3, linecolor=_BORDER, zeroline=False),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor=_BG3, bordercolor=_BORDER,
+                        font={"family": _FONT, "size": 11}),
+        margin={"t": 8, "b": 36, "l": 54, "r": 12},
+    )
+
+
+# ── Grafic Fibonacci ORIZONTAL (pe scala pret real) ────────────────────────
+def _build_fib_fig(is_long, entry_p, price, sl_p, tp1_p, tp3_p,
+                   open_qty, pnl_live):
+    import plotly.graph_objects as go
+
+    # Scala: de la SL la TP3
+    y_min = min(sl_p, tp3_p) * 0.9998
+    y_max = max(sl_p, tp3_p) * 1.0002
+    total_range = abs(tp3_p - entry_p)
+    progress = max(0.0, min(1.0,
+        ((price - entry_p) if is_long else (entry_p - price)) / total_range
+    )) if total_range > 0 else 0.0
+
+    bar_color = _GREEN if pnl_live >= 0 else _RED
+
+    fig = go.Figure()
+
+    # Zona SL (rosu transparent)
+    sl_band_lo = min(sl_p, entry_p)
+    sl_band_hi = max(sl_p, entry_p)
+    fig.add_hrect(y0=sl_band_lo, y1=sl_band_hi,
+                  fillcolor=f"{_RED}18", line_width=0)
+
+    # Zona profit (verde transparent)
+    profit_lo = min(entry_p, tp3_p)
+    profit_hi = max(entry_p, tp3_p)
+    fig.add_hrect(y0=profit_lo, y1=profit_hi,
+                  fillcolor=f"{_GREEN}0d", line_width=0)
+
+    # Linii Fibonacci
+    for ratio, color, label, width in FIB_LEVELS:
+        if is_long:
+            y = entry_p + ratio * total_range
+        else:
+            y = entry_p - ratio * total_range
+        fig.add_hline(
+            y=y,
+            line_color=color,
+            line_width=width,
+            line_dash="solid" if ratio in (0.0, 1.0) else "dot",
+            annotation_text=f"  {label} {y:.5f}",
+            annotation_position="right",
+            annotation_font_size=9,
+            annotation_font_color=color,
+        )
+
+    # Linie pret curent (animata la fiecare refresh)
+    fig.add_hline(
+        y=price,
+        line_color=_GOLD,
+        line_width=2,
+        line_dash="dash",
+        annotation_text=f"  PRICE {price:.5f}",
+        annotation_position="right",
+        annotation_font_size=10,
+        annotation_font_color=_GOLD,
+    )
+
+    # TP1 marker
+    tp1_y = entry_p * (1 + (1 if is_long else -1) * abs(tp1_p - entry_p) / entry_p)
+    fig.add_hline(
+        y=tp1_p,
+        line_color=_BLUE,
+        line_width=1.5,
+        line_dash="dashdot",
+        annotation_text=f"  TP1 {tp1_p:.5f}",
+        annotation_position="right",
+        annotation_font_size=9,
+        annotation_font_color=_BLUE,
+    )
+
+    # Progress label central
+    fig.add_annotation(
+        x=0.02, y=price, xref="paper", yref="y",
+        text=f"  {progress*100:.0f}%",
+        showarrow=False,
+        font={"size": 16, "color": bar_color, "family": _FONT},
+        xanchor="left",
+    )
+
+    fig.update_layout(
+        **_layout_base(),
+        margin={"t": 4, "b": 4, "l": 4, "r": 120},
+        xaxis={"visible": False},
+        yaxis={"range": [y_min, y_max], "color": _SUB,
+               "gridcolor": _BG3, "tickformat": ".5f"},
+        height=190,
+        showlegend=False,
+    )
+    return fig, progress
+
+
+# ── Grafic PnL cumulat + bars ───────────────────────────────────────────────
+def _build_pnl_fig(closed: list) -> Any:
+    import plotly.graph_objects as go
+
+    if not closed:
+        return _empty_fig("Niciun trade închis încă...")
+
+    pnls = [t["pnl_usdt"] for t in reversed(closed)]
+    xs   = list(range(1, len(pnls) + 1))
+    cum  = []
+    s    = 0.0
+    for p in pnls:
+        s += p
+        cum.append(round(s, 6))
+
+    bar_colors = [_GREEN if p >= 0 else _RED for p in pnls]
+    line_color = _GREEN if cum[-1] >= 0 else _RED
+
+    fig = go.Figure()
+
+    # Bara per trade
+    fig.add_trace(go.Bar(
+        x=xs, y=pnls,
+        marker_color=bar_colors,
+        marker_line_width=0,
+        opacity=0.55,
+        name="Trade PnL",
+        hovertemplate="Trade #%{x}: %{y:+.4f} USDT<extra></extra>",
+        yaxis="y2",
+    ))
+
+    # Linie cumulata
+    fig.add_trace(go.Scatter(
+        x=xs, y=cum,
+        mode="lines",
+        line={"color": line_color, "width": 2.5, "shape": "spline"},
+        fill="tozeroy",
+        fillcolor=f"{'rgba(63,185,80' if cum[-1] >= 0 else 'rgba(248,81,73'},0.06)",
+        name="Cumulat",
+        hovertemplate="Cumulat: %{y:+.4f} USDT<extra></extra>",
+        yaxis="y",
+    ))
+
+    fig.add_hline(y=0, line_color=_BORDER, line_width=1, yref="y")
+
+    fig.update_layout(
+        **_layout_base(),
+        barmode="overlay",
+        yaxis=dict(color=_SUB, gridcolor=_BG3, zeroline=False, title="Cumulat USDT"),
+        yaxis2=dict(overlaying="y", side="right", color=_SUB,
+                    gridcolor="rgba(0,0,0,0)", zeroline=False, title="Per trade"),
+        legend=dict(orientation="h", x=0, y=1.08, font={"size": 10, "color": _SUB},
+                    bgcolor="rgba(0,0,0,0)"),
+        height=220,
+        margin={"t": 24, "b": 36, "l": 54, "r": 54},
+    )
+    return fig
+
+
+# ── Win/Loss donut ──────────────────────────────────────────────────────────
+def _build_wl_fig(wins: int, losses: int) -> Any:
+    import plotly.graph_objects as go
+
+    total = wins + losses
+    if total == 0:
+        return _empty_fig("Fără date")
+
+    wr = wins / total * 100
+    fig = go.Figure(go.Pie(
+        labels=["Win", "Loss"],
+        values=[wins, losses],
+        hole=0.65,
+        marker=dict(
+            colors=[_GREEN, _RED],
+            line=dict(color=_BG2, width=3),
+        ),
+        textinfo="percent+value",
+        textfont=dict(size=11, family=_FONT),
+        direction="clockwise",
+        sort=False,
+        hovertemplate="%{label}: %{value} (%{percent})<extra></extra>",
+    ))
+    fig.add_annotation(
+        x=0.5, y=0.52,
+        text=f"<b>{wr:.0f}%</b>",
+        showarrow=False,
+        font={"size": 20, "color": _GREEN if wr >= 50 else _RED, "family": _FONT},
+    )
+    fig.add_annotation(
+        x=0.5, y=0.35,
+        text="win rate",
+        showarrow=False,
+        font={"size": 10, "color": _SUB, "family": _FONT},
+    )
+    fig.update_layout(
+        paper_bgcolor=_BG2,
+        margin={"t": 0, "b": 0, "l": 0, "r": 0},
+        showlegend=True,
+        legend=dict(
+            font={"color": _SUB, "size": 11, "family": _FONT},
+            bgcolor="rgba(0,0,0,0)",
+            orientation="h", x=0.15, y=-0.04,
+        ),
+        height=185,
+    )
+    return fig
+
+
+# ── Aplicatia Dash ──────────────────────────────────────────────────────────
+def create_app():
+    import dash
+    from dash import dcc, html
+    from dash.dependencies import Input, Output
 
     app = dash.Dash(
         __name__,
-        title="Apex Scalper",
+        title="⚡ Apex Scalper",
         update_title=None,
         suppress_callback_exceptions=True,
     )
+
     app.index_string = app.index_string.replace(
         "<head>",
-        f"<head><style>{_css()}</style>"
+        f"<head><style>{_CSS}</style>"
     )
 
-    # ------------------------------------------------------------------ #
-    #  Layout                                                              #
-    # ------------------------------------------------------------------ #
-
+    # ── Layout ──────────────────────────────────────────────────────────────
     app.layout = html.Div([
-        dcc.Interval(id="interval", interval=2000, n_intervals=0),
+        dcc.Interval(id="iv", interval=1500, n_intervals=0),
 
-        # Header
+        # ── Header ──────────────────────────────────────────────────────────
         html.Div([
-            html.Div("⚡ APEX SCALPER", style={
-                "fontSize": "20px", "fontWeight": "700",
-                "color": _GOLD, "letterSpacing": "2px"
-            }),
-            html.Div(id="header-status", style={"fontSize": "12px", "color": _SUBTEXT}),
+            html.Div([
+                html.Span("⚡", style={"color": _GOLD, "marginRight": "8px"}),
+                html.Span("APEX SCALPER", style={
+                    "color": _TEXT, "fontWeight": "700",
+                    "fontSize": "16px", "letterSpacing": "3px",
+                }),
+            ], style={"display": "flex", "alignItems": "center"}),
+            html.Div(id="hdr", style={"fontSize": "11px", "color": _SUB}),
         ], style={
             "display": "flex", "justifyContent": "space-between",
-            "alignItems": "center", "padding": "16px 24px",
+            "alignItems": "center", "padding": "12px 24px",
             "borderBottom": f"1px solid {_BORDER}",
-            "marginBottom": "16px",
+            "background": _BG2, "marginBottom": "14px",
         }),
 
-        # Body
+        # ── Body ────────────────────────────────────────────────────────────
         html.Div([
 
-            # Coloana stanga
+            # ── Coloana stanga (2/3) ─────────────────────────────────────
             html.Div([
 
-                # Metrici rapide
+                # Metrici sus
                 _card(html.Div([
-                    html.Div(id="metric-price",    style={"flex": "1"}),
-                    html.Div(id="metric-pnl-day",  style={"flex": "1"}),
-                    html.Div(id="metric-trades",   style={"flex": "1"}),
-                    html.Div(id="metric-winrate",  style={"flex": "1"}),
-                    html.Div(id="metric-drawdown", style={"flex": "1"}),
-                ], style={"display": "flex", "gap": "24px"})),
+                    html.Div(id="m-price",   style={"flex": "1"}),
+                    html.Div(id="m-pnl",     style={"flex": "1"}),
+                    html.Div(id="m-trades",  style={"flex": "1"}),
+                    html.Div(id="m-wr",      style={"flex": "1"}),
+                    html.Div(id="m-dd",      style={"flex": "1"}),
+                    html.Div(id="m-streak",  style={"flex": "1", "display": "flex",
+                                                    "alignItems": "center"}),
+                ], style={"display": "flex", "gap": "20px", "flexWrap": "wrap"})),
 
-                # Trade activ + Fibonacci
-                _card([
-                    html.Div("POZITIE ACTIVA", style={
-                        "fontSize": "11px", "color": _SUBTEXT,
-                        "letterSpacing": "1px", "marginBottom": "12px"
-                    }),
-                    html.Div(id="active-trade-info", style={"marginBottom": "16px"}),
-                    dcc.Graph(
-                        id="fib-chart",
-                        config={"displayModeBar": False},
-                        style={"height": "160px"}
-                    ),
-                ]),
+                # Pozitie activa + Fib
+                html.Div(id="pos-card"),
 
-                # PnL cumulat
+                # PnL chart
                 _card([
-                    html.Div("PNL CUMULAT", style={
-                        "fontSize": "11px", "color": _SUBTEXT,
-                        "letterSpacing": "1px", "marginBottom": "8px"
-                    }),
-                    dcc.Graph(
-                        id="pnl-chart",
-                        config={"displayModeBar": False},
-                        style={"height": "220px"}
-                    ),
+                    _sec("PNL CUMULAT + PER TRADE"),
+                    dcc.Graph(id="g-pnl", config={"displayModeBar": False},
+                              style={"height": "230px"}),
                 ]),
 
             ], style={"flex": "2", "minWidth": "0"}),
 
-            # Coloana dreapta
+            # ── Coloana dreapta (1/3) ─────────────────────────────────────
             html.Div([
+
+                # Session stats
+                _card([
+                    _sec("SESIUNE"),
+                    html.Div(id="session-stats",
+                             style={"display": "flex", "gap": "8px",
+                                    "flexWrap": "wrap"}),
+                ]),
 
                 # Win/Loss donut
                 _card([
-                    html.Div("WIN / LOSS", style={
-                        "fontSize": "11px", "color": _SUBTEXT,
-                        "letterSpacing": "1px", "marginBottom": "8px"
-                    }),
-                    dcc.Graph(
-                        id="winloss-chart",
-                        config={"displayModeBar": False},
-                        style={"height": "200px"}
-                    ),
+                    _sec("WIN / LOSS"),
+                    dcc.Graph(id="g-wl", config={"displayModeBar": False},
+                              style={"height": "195px"}),
                 ]),
 
                 # Tabel trade-uri
                 _card([
-                    html.Div("ULTIMELE TRADE-URI", style={
-                        "fontSize": "11px", "color": _SUBTEXT,
-                        "letterSpacing": "1px", "marginBottom": "12px"
-                    }),
-                    html.Div(id="trades-table"),
-                ], style={"flex": "1", "overflow": "auto"}),
+                    _sec("TRADE-URI RECENTE"),
+                    html.Div(id="tbl", style={"overflowY": "auto", "maxHeight": "320px"}),
+                ], style={"flex": "1"}),
 
-            ], style={"flex": "1", "minWidth": "280px", "display": "flex", "flexDirection": "column"}),
+            ], style={"flex": "1", "minWidth": "280px",
+                      "display": "flex", "flexDirection": "column"}),
 
-        ], style={"display": "flex", "gap": "16px", "padding": "0 24px 24px"}),
+        ], style={"display": "flex", "gap": "14px", "padding": "0 20px 20px"}),
 
     ], style={"minHeight": "100vh", "background": _BG})
 
-    # ------------------------------------------------------------------ #
-    #  Callbacks                                                           #
-    # ------------------------------------------------------------------ #
-
+    # ── Callback ────────────────────────────────────────────────────────────
     @app.callback(
         [
-            Output("header-status",   "children"),
-            Output("metric-price",    "children"),
-            Output("metric-pnl-day",  "children"),
-            Output("metric-trades",   "children"),
-            Output("metric-winrate",  "children"),
-            Output("metric-drawdown", "children"),
-            Output("active-trade-info", "children"),
-            Output("fib-chart",       "figure"),
-            Output("pnl-chart",       "figure"),
-            Output("winloss-chart",   "figure"),
-            Output("trades-table",    "children"),
+            Output("hdr",           "children"),
+            Output("m-price",       "children"),
+            Output("m-pnl",         "children"),
+            Output("m-trades",      "children"),
+            Output("m-wr",          "children"),
+            Output("m-dd",          "children"),
+            Output("m-streak",      "children"),
+            Output("pos-card",      "children"),
+            Output("g-pnl",         "figure"),
+            Output("g-wl",          "figure"),
+            Output("session-stats", "children"),
+            Output("tbl",           "children"),
         ],
-        Input("interval", "n_intervals"),
+        Input("iv", "n_intervals"),
     )
     def refresh(_):
         from dash import html
+        import plotly.graph_objects as go
         from .state import state
         from .persistence import db
         from .config import config
         from .risk import risk
-        import plotly.graph_objects as go
 
         sym = config.symbol
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
-        # Stare bot
         with state.lock:
             pos      = state.open_position
             open_qty = state.open_qty
             entry_p  = state.open_entry
-            price    = state.last_price if hasattr(state, "last_price") else 0.0
+            price    = getattr(state, "last_price", 0.0)
             running  = state.running
             paused   = state.paused
 
-        status_color = _GREEN if (running and not paused) else _RED
-        bot_status   = "● ACTIV" if (running and not paused) else ("⏸ PAUZAT" if paused else "● OPRIT")
+        status_c = _GREEN if (running and not paused) else _RED
+        dot      = "●"
+        status_t = f"{dot} ACTIV" if (running and not paused) else (
+                   "⏸ PAUZAT" if paused else f"{dot} OPRIT")
 
-        header_status = html.Span([
-            html.Span(bot_status, style={"color": status_color, "marginRight": "16px"}),
-            html.Span(f"{sym}  |  {now}", style={"color": _SUBTEXT}),
+        hdr = html.Span([
+            html.Span(status_t, style={"color": status_c, "marginRight": "16px",
+                                       "fontWeight": "700"}),
+            html.Span(f"{sym}", style={"color": _GOLD, "marginRight": "8px"}),
+            html.Span(f"| {now}", style={"color": _SUB}),
         ])
 
-        # Date DB
+        # ── Date DB ─────────────────────────────────────────────────────────
         daily_pnl, total_today, wins_today = db.load_daily_pnl(sym)
-        trades_all = db.get_all_trades(sym, limit=200)
-        closed = [t for t in trades_all if t["reason"] != "OPEN"]
-
+        all_trades = db.get_all_trades(sym, limit=300)
+        closed     = [t for t in all_trades if t["reason"] != "OPEN"]
         losses_today = total_today - wins_today
-        win_rate = (wins_today / total_today * 100) if total_today > 0 else 0
-        cons_losses = risk.consecutive_losses
+        wins_all     = sum(1 for t in closed if t["pnl_usdt"] > 0)
+        losses_all   = len(closed) - wins_all
+        wr           = wins_all / len(closed) * 100 if closed else 0
+        cons         = risk.consecutive_losses
 
-        # Max drawdown din trade-uri inchise
+        # Max drawdown
+        max_dd = 0.0
+        cumulative = []
         if closed:
-            pnls = [t["pnl_usdt"] for t in reversed(closed)]
-            cumulative = []
-            s = 0.0
-            peak = 0.0
-            max_dd = 0.0
-            for p in pnls:
-                s += p
-                cumulative.append(s)
+            s, peak = 0.0, 0.0
+            for t in reversed(closed):
+                s += t["pnl_usdt"]
+                cumulative.append(round(s, 6))
                 if s > peak:
                     peak = s
                 dd = peak - s
                 if dd > max_dd:
                     max_dd = dd
+
+        # Profit factor
+        gross_win  = sum(t["pnl_usdt"] for t in closed if t["pnl_usdt"] > 0)
+        gross_loss = sum(abs(t["pnl_usdt"]) for t in closed if t["pnl_usdt"] < 0)
+        pf = gross_win / gross_loss if gross_loss > 0 else (99.0 if gross_win > 0 else 0.0)
+
+        avg_win  = gross_win  / wins_all    if wins_all    > 0 else 0
+        avg_loss = gross_loss / losses_all  if losses_all  > 0 else 0
+        best     = max((t["pnl_usdt"] for t in closed), default=0)
+        worst    = min((t["pnl_usdt"] for t in closed), default=0)
+
+        # ── Metrici ─────────────────────────────────────────────────────────
+        pnl_c = _GREEN if daily_pnl >= 0 else _RED
+        m_price  = _metric(f"{price:.5f}" if price else "—", f"{sym} Price", _BLUE)
+        m_pnl    = _metric(f"{daily_pnl:+.4f}", "PnL azi USDT", pnl_c)
+        m_trades = _metric(str(total_today), f"Trades  {wins_today}W/{losses_today}L")
+        m_wr     = _metric(f"{wr:.0f}%", "Win rate",
+                           _GREEN if wr >= 50 else _RED)
+        m_dd     = _metric(f"-{max_dd:.4f}", "Max Drawdown",
+                           _RED if max_dd > 0 else _SUB)
+
+        # Streak badge
+        if cons >= 3:
+            streak_el = html.Span(f"⚠ {cons} LOSS", className="badge-loss")
+        elif cons > 0:
+            streak_el = html.Span(f"{cons} loss", className="badge-neu")
         else:
-            max_dd = 0.0
-            cumulative = []
+            # win streak
+            win_streak = 0
+            for t in closed:
+                if t["pnl_usdt"] > 0:
+                    win_streak += 1
+                else:
+                    break
+            if win_streak >= 3:
+                streak_el = html.Span(f"🔥 {win_streak} WIN", className="badge-win")
+            else:
+                streak_el = html.Span("—", className="badge-neu")
+        m_streak = html.Div([
+            html.Div("Streak", className="m-lbl", style={"marginBottom": "4px"}),
+            streak_el,
+        ])
 
-        # ---------- Metrici ----------
-        pnl_color = _GREEN if daily_pnl >= 0 else _RED
-        m_price   = _metric(f"{price:.5f}" if price else "—", f"{sym} Price")
-        m_pnl     = _metric(f"{daily_pnl:+.4f} USDT", "PnL azi", pnl_color)
-        m_trades  = _metric(str(total_today), "Trade-uri azi")
-        m_winrate = _metric(f"{win_rate:.0f}%", f"Win rate  {wins_today}W / {losses_today}L",
-                            _GREEN if win_rate >= 50 else _RED)
-        m_dd      = _metric(f"-{max_dd:.4f}", "Max Drawdown", _RED if max_dd > 0 else _SUBTEXT)
-
-        # ---------- Trade activ + Fibonacci ----------
+        # ── Pozitie activa card ──────────────────────────────────────────────
         if pos and entry_p and price:
-            prof = __import__('apex_scalper.config', fromlist=['config']).config.profile(sym)
+            prof    = config.profile(sym)
             sl_pct  = prof.get("sl_pct",  0.0020)
             tp1_pct = prof.get("tp1_pct", 0.0030)
             tp3_pct = prof.get("tp3_pct", 0.0100)
-
             is_long = pos == "long"
-            sl_price  = entry_p * (1 - sl_pct  if is_long else 1 + sl_pct)
-            tp1_price = entry_p * (1 + tp1_pct if is_long else 1 - tp1_pct)
-            tp3_price = entry_p * (1 + tp3_pct if is_long else 1 - tp3_pct)
 
-            total_range = abs(tp3_price - entry_p)
-            current_move = (price - entry_p) if is_long else (entry_p - price)
-            progress = max(0.0, min(1.0, current_move / total_range)) if total_range > 0 else 0.0
-            pnl_live = (price - entry_p) * open_qty if is_long else (entry_p - price) * open_qty
-            pnl_color_live = _GREEN if pnl_live >= 0 else _RED
+            sl_p  = entry_p * (1 - sl_pct  if is_long else 1 + sl_pct)
+            tp1_p = entry_p * (1 + tp1_pct if is_long else 1 - tp1_pct)
+            tp3_p = entry_p * (1 + tp3_pct if is_long else 1 - tp3_pct)
 
-            side_label = "🟢 LONG" if is_long else "🔴 SHORT"
-            active_info = html.Div([
-                html.Span(f"{side_label} ", style={"fontWeight": "700", "fontSize": "15px"}),
-                html.Span(f"{open_qty:.0f} {sym.replace('USDT','')} @ {entry_p:.5f}",
-                          style={"color": _SUBTEXT, "fontSize": "13px"}),
-                html.Span(f"  PnL: ", style={"color": _SUBTEXT, "fontSize": "12px", "marginLeft": "16px"}),
-                html.Span(f"{pnl_live:+.4f} USDT",
-                          style={"color": pnl_color_live, "fontWeight": "700", "fontSize": "13px"}),
-                html.Span(f"  SL: {sl_price:.5f}  TP1: {tp1_price:.5f}  TP3: {tp3_price:.5f}",
-                          style={"color": _SUBTEXT, "fontSize": "11px", "marginLeft": "16px"}),
+            pnl_live = ((price - entry_p) if is_long else (entry_p - price)) * open_qty
+            pnl_c2   = _GREEN if pnl_live >= 0 else _RED
+            s_icon   = "▲ LONG" if is_long else "▼ SHORT"
+            s_color  = _GREEN  if is_long else _RED
+
+            fib_fig, progress = _build_fib_fig(
+                is_long, entry_p, price, sl_p, tp1_p, tp3_p, open_qty, pnl_live
+            )
+
+            pos_card = _card([
+                _sec("POZIȚIE ACTIVĂ"),
+                html.Div([
+                    html.Span(s_icon, style={"color": s_color, "fontWeight": "700",
+                                             "fontSize": "14px", "marginRight": "10px"}),
+                    html.Span(f"{open_qty:.0f} {sym.replace('USDT','')} @ {entry_p:.5f}",
+                              style={"color": _SUB, "fontSize": "12px"}),
+                    html.Span("  │  PnL live: ", style={"color": _SUB,
+                              "fontSize": "11px", "margin": "0 6px"}),
+                    html.Span(f"{pnl_live:+.5f} USDT",
+                              style={"color": pnl_c2, "fontWeight": "700",
+                                     "fontSize": "14px"}),
+                    html.Span(f"  │  {progress*100:.0f}% → TP3",
+                              style={"color": _GOLD, "fontSize": "11px",
+                                     "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px", "display": "flex",
+                          "alignItems": "center", "flexWrap": "wrap", "gap": "4px"}),
+
+                html.Div([
+                    html.Span(f"SL {sl_p:.5f}", style={"color": _RED,   "fontSize": "11px", "marginRight": "14px"}),
+                    html.Span(f"TP1 {tp1_p:.5f}", style={"color": _BLUE, "fontSize": "11px", "marginRight": "14px"}),
+                    html.Span(f"TP3 {tp3_p:.5f}", style={"color": _GREEN,"fontSize": "11px"}),
+                ], style={"marginBottom": "10px"}),
+
+                dcc.Graph(id="g-fib", figure=fib_fig,
+                          config={"displayModeBar": False},
+                          style={"height": "200px"}),
+            ], active=True)
+        else:
+            pos_card = _card([
+                _sec("POZIȚIE ACTIVĂ"),
+                html.Div([
+                    html.Span("○ ", style={"color": _SUB}),
+                    html.Span("Aștept semnal...", style={"color": _SUB, "fontSize": "12px"}),
+                ]),
             ])
 
-            # Fibonacci chart
-            fib_fig = go.Figure()
+        # ── PnL chart ────────────────────────────────────────────────────────
+        pnl_fig = _build_pnl_fig(closed)
 
-            # Background bar (total range)
-            fib_fig.add_trace(go.Bar(
-                x=[1.0], y=[0.12],
-                base=[-0.06],
-                orientation="v",
-                marker_color=_BG3,
-                width=0.8,
-                showlegend=False,
-                hoverinfo="skip",
-            ))
+        # ── Win/Loss donut ───────────────────────────────────────────────────
+        wl_fig = _build_wl_fig(wins_all, losses_all)
 
-            # Progress bar
-            bar_color = _GREEN if pnl_live >= 0 else _RED
-            fib_fig.add_trace(go.Bar(
-                x=[1.0], y=[progress * 0.12],
-                base=[-0.06],
-                orientation="v",
-                marker_color=bar_color,
-                width=0.8,
-                opacity=0.7,
-                showlegend=False,
-                hoverinfo="skip",
-            ))
+        # ── Session stats ────────────────────────────────────────────────────
+        pf_color = _GREEN if pf >= 1.5 else (_GOLD if pf >= 1.0 else _RED)
+        sess = [
+            _stat(f"{avg_win:+.4f}",  "Avg Win USDT",  _GREEN),
+            _stat(f"-{avg_loss:.4f}", "Avg Loss USDT", _RED),
+            _stat(f"{pf:.2f}",        "Profit Factor", pf_color),
+            _stat(f"{best:+.4f}",     "Best Trade",    _GREEN),
+            _stat(f"{worst:+.4f}",    "Worst Trade",   _RED),
+        ]
 
-            # Fibonacci lines
-            for fib_val, fib_color, fib_name in FIB_LEVELS:
-                y_pos = -0.06 + fib_val * 0.12
-                fib_fig.add_hline(
-                    y=y_pos,
-                    line_dash="dot",
-                    line_color=fib_color,
-                    line_width=1.2,
-                    annotation_text=f"{fib_name}",
-                    annotation_position="right",
-                    annotation_font_size=10,
-                    annotation_font_color=fib_color,
-                )
-
-            # Progress label
-            fib_fig.add_annotation(
-                x=1.0, y=-0.06 + progress * 0.12 + 0.003,
-                text=f"{progress*100:.0f}%",
-                showarrow=False,
-                font={"size": 14, "color": bar_color, "family": "monospace"},
-            )
-
-            fib_fig.update_layout(
-                paper_bgcolor=_BG2, plot_bgcolor=_BG2,
-                margin={"t": 0, "b": 0, "l": 0, "r": 80},
-                xaxis={"visible": False},
-                yaxis={"visible": False, "range": [-0.08, 0.10]},
-                barmode="overlay",
-                height=140,
-            )
-        else:
-            active_info = html.Div("Nicio pozitie deschisa",
-                                   style={"color": _SUBTEXT, "fontSize": "13px", "padding": "8px 0"})
-            fib_fig = go.Figure()
-            fib_fig.add_annotation(
-                x=0.5, y=0.5, xref="paper", yref="paper",
-                text="Astept semnal...",
-                showarrow=False,
-                font={"size": 13, "color": _SUBTEXT},
-            )
-            fib_fig.update_layout(
-                paper_bgcolor=_BG2, plot_bgcolor=_BG2,
-                margin={"t": 0, "b": 0, "l": 0, "r": 0},
-                xaxis={"visible": False}, yaxis={"visible": False},
-                height=140,
-            )
-
-        # ---------- PnL Chart ----------
-        pnl_fig = go.Figure()
-        if cumulative:
-            xs = list(range(1, len(cumulative) + 1))
-            colors = [_GREEN if v >= 0 else _RED for v in cumulative]
-            pnl_fig.add_trace(go.Scatter(
-                x=xs, y=cumulative,
-                mode="lines+markers",
-                line={"color": _GREEN if cumulative[-1] >= 0 else _RED, "width": 2},
-                marker={"color": colors, "size": 5},
-                fill="tozeroy",
-                fillcolor="rgba(63,185,80,0.08)" if cumulative[-1] >= 0 else "rgba(248,81,73,0.08)",
-                hovertemplate="Trade #%{x}<br>PnL cumulat: %{y:.4f} USDT<extra></extra>",
-            ))
-            pnl_fig.add_hline(y=0, line_color=_BORDER, line_width=1)
-        else:
-            pnl_fig.add_annotation(
-                x=0.5, y=0.5, xref="paper", yref="paper",
-                text="Fara trade-uri inca...",
-                showarrow=False, font={"size": 13, "color": _SUBTEXT},
-            )
-        pnl_fig.update_layout(
-            paper_bgcolor=_BG2, plot_bgcolor=_BG2,
-            margin={"t": 10, "b": 30, "l": 50, "r": 10},
-            xaxis={"color": _SUBTEXT, "gridcolor": _BG3, "title": ""},
-            yaxis={"color": _SUBTEXT, "gridcolor": _BG3, "title": "USDT"},
-            height=200,
-        )
-
-        # ---------- Win/Loss Donut ----------
-        wl_fig = go.Figure()
-        total_all = len(closed)
-        wins_all  = sum(1 for t in closed if t["pnl_usdt"] > 0)
-        losses_all = total_all - wins_all
-        if total_all > 0:
-            wl_fig.add_trace(go.Pie(
-                labels=["Win", "Loss"],
-                values=[wins_all, losses_all],
-                hole=0.6,
-                marker_colors=[_GREEN, _RED],
-                textinfo="percent",
-                textfont_size=12,
-                hovertemplate="%{label}: %{value} (%{percent})<extra></extra>",
-            ))
-            wl_fig.add_annotation(
-                x=0.5, y=0.5,
-                text=f"<b>{wins_all/total_all*100:.0f}%</b><br><span style='font-size:10px'>win rate</span>",
-                showarrow=False,
-                font={"size": 14, "color": _TEXT},
-            )
-        else:
-            wl_fig.add_annotation(
-                x=0.5, y=0.5, xref="paper", yref="paper",
-                text="Fara date", showarrow=False,
-                font={"size": 12, "color": _SUBTEXT},
-            )
-        wl_fig.update_layout(
-            paper_bgcolor=_BG2, plot_bgcolor=_BG2,
-            margin={"t": 0, "b": 0, "l": 0, "r": 0},
-            showlegend=True,
-            legend={"font": {"color": _SUBTEXT, "size": 11},
-                    "bgcolor": "rgba(0,0,0,0)",
-                    "orientation": "h", "x": 0.25, "y": -0.05},
-            height=190,
-        )
-
-        # ---------- Tabel trade-uri ----------
+        # ── Tabel trade-uri ──────────────────────────────────────────────────
         last30 = db.get_last_trades(sym, limit=30)
         if last30:
+            hd = html.Thead(html.Tr([
+                html.Th(h, style={"color": _SUB, "fontSize": "10px",
+                                  "textTransform": "uppercase", "padding": "4px 8px",
+                                  "borderBottom": f"1px solid {_BORDER}",
+                                  "textAlign": "left", "fontWeight": "400"})
+                for h in ["Ora", "Side", "Entry", "Exit", "PnL", "Score", "Motiv"]
+            ]))
             rows = []
             for t in last30:
                 pnl = t["pnl_usdt"]
-                side_icon = "▲" if t["side"] == "long" else "▼"
+                sc  = t.get("signal_score", 0) or 0
                 rows.append(html.Tr([
                     html.Td(t.get("closed_at", "")[-5:],
-                            style={"color": _SUBTEXT, "fontSize": "11px", "padding": "4px 6px"}),
-                    html.Td(f"{side_icon} {t['side'].upper()}",
+                            className="trade-td", style={"color": _SUB}),
+                    html.Td(("▲ L" if t["side"] == "long" else "▼ S"),
+                            className="trade-td",
                             style={"color": _GREEN if t["side"] == "long" else _RED,
-                                   "fontSize": "11px", "padding": "4px 6px"}),
-                    html.Td(f"{t['entry']:.5f}",
-                            style={"fontSize": "11px", "padding": "4px 6px"}),
-                    html.Td(f"{pnl:+.4f}",
+                                   "fontWeight": "700"}),
+                    html.Td(f"{t['entry']:.5f}",  className="trade-td"),
+                    html.Td(f"{t.get('exit_price', 0):.5f}", className="trade-td",
+                            style={"color": _SUB}),
+                    html.Td(f"{pnl:+.4f}", className="trade-td",
                             style={"color": _GREEN if pnl > 0 else _RED,
-                                   "fontWeight": "700", "fontSize": "12px", "padding": "4px 6px"}),
-                    html.Td(t.get("reason", "")[:12],
-                            style={"color": _SUBTEXT, "fontSize": "10px", "padding": "4px 6px"}),
-                ], style={"borderBottom": f"1px solid {_BG3}"})
-                )
-            table = html.Table([
-                html.Thead(html.Tr([
-                    html.Th(h, style={"color": _SUBTEXT, "fontSize": "10px",
-                                     "textTransform": "uppercase", "padding": "4px 6px",
-                                     "borderBottom": f"1px solid {_BORDER}"})
-                    for h in ["Ora", "Side", "Entry", "PnL", "Motiv"]
-                ])),
-                html.Tbody(rows),
-            ], style={"width": "100%", "borderCollapse": "collapse"})
+                                   "fontWeight": "700"}),
+                    html.Td(f"{sc:.2f}" if sc else "—", className="trade-td",
+                            style={"color": _GOLD}),
+                    html.Td(t.get("reason", "")[:14], className="trade-td",
+                            style={"color": _SUB, "fontSize": "10px"}),
+                ], className="trade-row"))
+            tbl = html.Table([hd, html.Tbody(rows)],
+                             style={"width": "100%", "borderCollapse": "collapse"})
         else:
-            table = html.Div("Niciun trade inchis inca",
-                             style={"color": _SUBTEXT, "fontSize": "12px", "padding": "8px 0"})
+            tbl = html.Div("Niciun trade închis încă",
+                           style={"color": _SUB, "fontSize": "12px", "padding": "8px 0"})
 
-        return (
-            header_status,
-            m_price, m_pnl, m_trades, m_winrate, m_dd,
-            active_info, fib_fig, pnl_fig, wl_fig, table,
-        )
+        return (hdr, m_price, m_pnl, m_trades, m_wr, m_dd, m_streak,
+                pos_card, pnl_fig, wl_fig, sess, tbl)
 
     return app
 
 
+# ── Entry point ─────────────────────────────────────────────────────────────
 def run_dashboard(host: str = "0.0.0.0", port: int = 8050) -> None:
-    """Porneste Dash dashboard intr-un thread separat (non-blocking)."""
+    """Porneste Dash dashboard intr-un thread daemon (non-blocking)."""
     try:
         import dash  # noqa: F401
     except ImportError:
-        logger.warning("[Dashboard] dash nu e instalat — skip. Ruleaza: pip install dash")
+        logger.warning("[Dashboard] 'dash' nu e instalat — skip. "
+                       "Instaleaza cu: pip install dash")
         return
 
     app = create_app()
 
     def _run():
-        logger.info(f"[Dashboard] pornit pe http://localhost:{port}")
+        logger.info(f"[Dashboard] http://localhost:{port}")
         import logging
-        log = logging.getLogger("werkzeug")
-        log.setLevel(logging.ERROR)
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
         app.run(host=host, port=port, debug=False, use_reloader=False)
 
-    t = threading.Thread(target=_run, daemon=True, name="dashboard")
-    t.start()
+    threading.Thread(target=_run, daemon=True, name="apex-dashboard").start()
