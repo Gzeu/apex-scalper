@@ -1,20 +1,22 @@
-"""Health & metrics HTTP endpoint v0.8.5.
+"""Health & metrics HTTP endpoint v0.8.6.
 
 Changelog:
-  v0.8.5 — FIX: `type method doesn't define __round__ method`.
-    perf.win_rate / sharpe / profit_factor / max_drawdown pot returna None
-    sau un tip non-numeric cand nu exista trades inca. round() pe None crapa.
-    Fix: float(x or 0.0) inainte de round() pe toate campurile din /metrics.
-  v0.8.4 — BUG 20 FIX: last_tick_ts exista acum explicit in BotState.
+  v0.8.6 — FIX: `Infinity` in JSON output crapa browserul (JSON invalid).
+    profit_factor = inf cand nu exista trades cu loss (impartire la zero).
+    Fix: _fj() clameaza inf/-inf la None -> serializat ca null in JSON.
+    Prometheus foloseste in continuare +Inf (valid in text format).
+  v0.8.5 — FIX: __round__ error pe None/property din perf.
+  v0.8.4 — BUG 20 FIX: last_tick_ts explicit in BotState.
   v0.7.4 — /health, /metrics, /metrics/prometheus endpoints.
 
 Endpoints:
-  GET /health     JSON: {status, uptime_s, last_tick_age_s, feed_stale, open_position}
-  GET /metrics    JSON: {daily_pnl, win_rate, sharpe, trades_today, kelly_factor}
-  GET /metrics/prometheus   Prometheus plain-text format
+  GET /health              JSON: {status, uptime_s, last_tick_age_s, feed_stale, open_position}
+  GET /metrics             JSON: {daily_pnl, win_rate, sharpe, trades_today, kelly_factor}
+  GET /metrics/prometheus  Prometheus plain-text format
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 import threading
@@ -29,11 +31,19 @@ _start_time = time.time()
 
 
 def _f(val, fallback: float = 0.0) -> float:
-    """Conversie sigura la float — evita __round__ errors pe None/property."""
+    """Conversie sigura la float — fallback pe None/TypeError."""
     try:
         return float(val)
     except (TypeError, ValueError):
         return fallback
+
+
+def _fj(val, fallback: float = 0.0):
+    """Float pentru JSON — inf/-inf -> None (serializat ca null, JSON valid)."""
+    v = _f(val, fallback)
+    if math.isinf(v) or math.isnan(v):
+        return None
+    return round(v, 4)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -87,7 +97,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self._send_json({
             "status":          status,
             "uptime_s":        round(_f(uptime), 1),
-            "last_tick_age_s": round(_f(tick_age), 3),
+            "last_tick_age_s": round(_f(min(tick_age, 9999999)), 3),
             "feed_stale":      feed_stale,
             "open_position":   open_position or "none",
             "trading_active":  running and not paused,
@@ -97,12 +107,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from .performance import perf
         from .risk import risk
         self._send_json({
-            "daily_pnl_usdt":      round(_f(getattr(risk,  "_daily_loss",       0.0)), 4),
-            "win_rate":            round(_f(getattr(perf,  "win_rate",          0.0)), 4),
-            "sharpe":              round(_f(getattr(perf,  "sharpe",            0.0)), 4),
-            "profit_factor":       round(_f(getattr(perf,  "profit_factor",     0.0)), 4),
-            "max_drawdown":        round(_f(getattr(perf,  "max_drawdown",      0.0)), 4),
-            "kelly_factor":        round(_f(getattr(risk,  "_kelly_factor",     0.0)), 4),
+            "daily_pnl_usdt":      _fj(getattr(risk,  "_daily_loss",   0.0)),
+            "win_rate":            _fj(getattr(perf,  "win_rate",      0.0)),
+            "sharpe":              _fj(getattr(perf,  "sharpe",        0.0)),
+            "profit_factor":       _fj(getattr(perf,  "profit_factor", 0.0)),
+            "max_drawdown":        _fj(getattr(perf,  "max_drawdown",  0.0)),
+            "kelly_factor":        _fj(getattr(risk,  "_kelly_factor", 0.0)),
             "consecutive_losses":  int(getattr(risk, "_consecutive_losses", 0) or 0),
         })
 
@@ -113,19 +123,27 @@ class _HealthHandler(BaseHTTPRequestHandler):
         with state.lock:
             tick_age = time.time() - state.last_tick_ts if state.last_tick_ts else float("inf")
 
+        def _pf(val, fb=0.0):
+            """Float pentru Prometheus — inf e valid in text format."""
+            v = _f(val, fb)
+            return v if not math.isnan(v) else 0.0
+
         lines = [
             "# HELP apex_win_rate Trading win rate",
             "# TYPE apex_win_rate gauge",
-            f"apex_win_rate {_f(getattr(perf, 'win_rate', 0.0)):.6f}",
+            f"apex_win_rate {_pf(getattr(perf, 'win_rate', 0.0)):.6f}",
             "# HELP apex_sharpe Sharpe ratio (Welford streaming)",
             "# TYPE apex_sharpe gauge",
-            f"apex_sharpe {_f(getattr(perf, 'sharpe', 0.0)):.6f}",
+            f"apex_sharpe {_pf(getattr(perf, 'sharpe', 0.0)):.6f}",
+            "# HELP apex_profit_factor Profit factor",
+            "# TYPE apex_profit_factor gauge",
+            f"apex_profit_factor {_pf(getattr(perf, 'profit_factor', 0.0)):.6f}",
             "# HELP apex_feed_tick_age_seconds Age of last OB tick",
             "# TYPE apex_feed_tick_age_seconds gauge",
-            f"apex_feed_tick_age_seconds {_f(tick_age):.3f}",
+            f"apex_feed_tick_age_seconds {_pf(tick_age):.3f}",
             "# HELP apex_kelly_factor Current Kelly sizing factor",
             "# TYPE apex_kelly_factor gauge",
-            f"apex_kelly_factor {_f(getattr(risk, '_kelly_factor', 0.0)):.6f}",
+            f"apex_kelly_factor {_pf(getattr(risk, '_kelly_factor', 0.0)):.6f}",
             "# HELP apex_consecutive_losses Consecutive losing trades",
             "# TYPE apex_consecutive_losses gauge",
             f"apex_consecutive_losses {int(getattr(risk, '_consecutive_losses', 0) or 0)}",
