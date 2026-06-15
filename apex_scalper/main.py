@@ -1,13 +1,11 @@
-"""Entrypoint v0.8.8.
+"""Entrypoint v0.9.3.
 
 Changelog:
-  v0.8.8 — BUG 35 FIX: set_main_loop() nu era apelat niciodata -> Bug 30 fix
-    din v0.8.7 era complet nefunctional. update_indicators() folosea loop gresit
-    (get_event_loop() din thread WS) -> indicatorii nu se actualizau in strategy.ind.
-    Fix: set_main_loop(loop) apelat imediat dupa asyncio.get_running_loop().
-  v0.8.8 — BUG 36 FIX: version string v0.8.6 hardcodat in logger si state.running
-    log dupa push v0.8.7 -> confuzie la debugging.
-    Fix: actualizat la v0.8.8 in toate locurile.
+  v0.9.3 — config.validate() apelat inainte de orice altceva in main().
+    Improvement #7: botul nu mai porneste cu BYBIT_API_KEY/SECRET lipsa
+    sau parametri invalizi. Mesaj clar + sys.exit(1) la startup.
+  v0.8.8 — BUG 35: set_main_loop() apelat dupa get_running_loop().
+  v0.8.8 — BUG 36: version string actualizat.
   v0.8.6 — Bug 25-29 fix.
   v0.8.2 — BUG 13 FIX: _midnight_reset_loop() reset total_trades/win_trades.
   v0.7.8 — log_sink.py: structured JSON logs.
@@ -35,7 +33,7 @@ from .book_pressure import bp
 from .pulse import run_pulse_loop
 from .health import start_health_server
 from .log_sink import setup_json_sink
-from .strategy import set_main_loop  # BUG 35 FIX
+from .strategy import set_main_loop
 
 
 def setup_logging() -> None:
@@ -123,10 +121,6 @@ def inject_profile(symbol: str) -> None:
 
 
 async def _midnight_reset_loop() -> None:
-    """Reset daily counters la UTC midnight.
-
-    v0.8.2 BUG 13 FIX: adaugat reset state.total_trades si state.win_trades.
-    """
     from datetime import datetime, timezone, timedelta
     while True:
         now    = datetime.now(timezone.utc)
@@ -166,11 +160,16 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
 
 async def main() -> None:
     setup_logging()
-    env_label = "TESTNET" if config.testnet else "\u26a0\ufe0f  MAINNET"
-    # BUG 36 FIX: version string actualizat la v0.8.8
+
+    # Improvement #7: fail-fast — verifica config inainte de orice altceva.
+    # Daca BYBIT_API_KEY/SECRET lipsesc sau parametrii sunt invalizi,
+    # botul se opreste imediat cu mesaj clar in loc sa crape dupa 30s.
+    config.validate()
+
     logger.info(
-        f"\u26a1 Apex Scalper v0.8.8 | {config.symbol} | "
-        f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
+        f"\u26a1 Apex Scalper v0.9.3 | {config.symbol} | "
+        f"{'TESTNET' if config.testnet else chr(9888)+' MAINNET'} | "
+        f"lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
     inject_profile(config.symbol)
@@ -198,10 +197,6 @@ async def main() -> None:
     start_health_server()
 
     loop   = asyncio.get_running_loop()
-    # BUG 35 FIX: inregistreaza loop-ul principal pentru strategy.update_indicators()
-    # Fara aceasta linie, set_main_loop() din v0.8.7 nu era niciodata apelat
-    # -> update_indicators() folosea get_event_loop() (deprecated, loop gresit in Py3.12+)
-    # -> strategy.ind ramanea cu valorile initiale -> bot orbeste la intrari.
     set_main_loop(loop)
     tg_app = None
 
@@ -230,9 +225,8 @@ async def main() -> None:
 
     with state.lock:
         state.running = True
-    # BUG 36 FIX: version string actualizat
     logger.info(
-        f"state.running = True — strategy v0.8.8 active\n"
+        f"state.running = True — strategy v0.9.3 active\n"
         f"  JSON logs:   logs/apex_structured.jsonl (jq parsabil)\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"
