@@ -1,11 +1,13 @@
-"""Risk manager v0.8.1 — kelly_f property adaugat (Bug 10 fix).
+"""Risk manager v0.8.6 — Bug 29 fix.
 
 Changelog:
-  v0.8.1 — BUG 10 FIX: adaugat kelly_f property pentru acces extern curat.
-    pulse.py facea getattr(risk, '_kelly_factor', 0.5) — returna obiect metoda
-    -> TypeError: unsupported format character la f-string in pulse.
-    Fix: @property kelly_f apeleaza _kelly_factor() sub lock si returneaza float.
-    pulse.py updatat sa foloseasca risk.kelly_f (fara paranteze).
+  v0.8.6 — BUG 29 FIX: reset_daily() reseteaza acum si _consecutive_losses=0.
+    Inainte: la UTC midnight _daily_loss si _open_count se resetau dar
+    _consecutive_losses ramanea acumulat din ziua precedenta.
+    Daca botul avea 4 pierderi consecutive seara, a doua zi dupa prima
+    pierdere ajungea la 5 si se bloca automat — desi e o noua sesiune.
+    Fix: self._consecutive_losses = 0 adaugat in reset_daily().
+  v0.8.1 — kelly_f property adaugat (Bug 10 fix).
   v0.8.0 — Kelly formula corecta (Bug 6).
   v0.7.1 — reset_daily fix, MAX_CONSECUTIVE_LOSSES, partial close tracking.
 """
@@ -144,9 +146,18 @@ class RiskManager:
         return round(qty, 6)
 
     def reset_daily(self) -> None:
+        """Reset contoare zilnice la UTC midnight.
+
+        v0.8.6 BUG 29 FIX: adaugat reset _consecutive_losses=0.
+          Inainte: _daily_loss si _open_count se resetau dar _consecutive_losses
+          ramanea acumulat -> bot blocat fals a doua zi dupa pierderi serale.
+        """
         with self._lock:
-            self._daily_loss = 0.0
-            self._open_count = 0
+            self._daily_loss         = 0.0
+            self._open_count         = 0
+            # BUG 29 FIX: reseteaza si streak-ul de pierderi consecutive
+            self._consecutive_losses = 0
+        logger.info("RiskManager: daily reset (loss + open_count + consecutive_losses)")
 
     @property
     def consecutive_losses(self) -> int:

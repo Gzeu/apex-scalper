@@ -1,6 +1,10 @@
-"""Entrypoint v0.8.2.
+"""Entrypoint v0.8.6.
 
 Changelog:
+  v0.8.6 — Bug 25-29 fix (trader double-close, amend guard, PM software SL,
+    _close_full state reset, risk reset_daily consecutive_losses).
+  v0.8.5 — Bug 21-24 fix (TP1 fee, Sharpe sample std, optimizer constraint,
+    walk_forward empiric candles_per_day).
   v0.8.2 — BUG 13 FIX: _midnight_reset_loop() nu reseta state.total_trades/win_trades.
     La UTC midnight daily_pnl era resetat dar total_trades si win_trades ramaneau
     cumulate din ziua precedenta -> pulse afisa win rate incorect dupa mai multe zile.
@@ -140,7 +144,7 @@ async def _midnight_reset_loop() -> None:
 
 
 async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
-    logger.warning("🛑 Shutdown — closing position if open...")
+    logger.warning("\U0001f6d1 Shutdown — closing position if open...")
     state.running = False
     try:
         await trader.close_position(use_limit=False)
@@ -162,9 +166,9 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
 
 async def main() -> None:
     setup_logging()
-    env_label = "TESTNET" if config.testnet else "⚠️  MAINNET"
+    env_label = "TESTNET" if config.testnet else "\u26a0\ufe0f  MAINNET"
     logger.info(
-        f"⚡ Apex Scalper v0.8.2 | {config.symbol} | "
+        f"\u26a1 Apex Scalper v0.8.6 | {config.symbol} | "
         f"{env_label} | lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
 
@@ -221,7 +225,7 @@ async def main() -> None:
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.8.2 active\n"
+        f"state.running = True — strategy v0.8.6 active\n"
         f"  JSON logs:   logs/apex_structured.jsonl (jq parsabil)\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"

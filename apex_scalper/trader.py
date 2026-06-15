@@ -1,10 +1,15 @@
-"""Trader module v0.8.1 — Bug 12 fix: close_position guard client None.
+"""Trader module v0.8.6 — Bug 25-26 fix.
 
 Changelog:
-  v0.8.1 — BUG 12 FIX: close_position() nu verifica trader._client is None.
-    Daca SIGTERM vine inainte de trader.setup(), _client=None si
-    close_position() arunca AttributeError in _shutdown() blocand cleanup.
-    Fix: guard 'if self._client is None: return' la intrarea in close_position().
+  v0.8.6 — BUG 25 FIX: close_position() trimite Market fallback DOAR daca
+    Limit-ul nu a fost filled (poll via _confirm_order_filled).
+    Inainte: Market era trimis MEREU dupa sleep(limit_timeout_s) -> dublu-close.
+    Fix: dupa sleep, poll fill status; Market fallback doar daca not filled.
+  v0.8.6 — BUG 26 FIX: amend_order() si amend_sl_tp() guard _client is None.
+    Inainte: amend_order() facea self._client.amend_order fara verificare
+    -> AttributeError daca SIGTERM venea inainte de setup().
+    Fix: guard identic cu cel din close_position().
+  v0.8.1 — BUG 12 FIX: close_position guard client None.
   v0.7.1 — RateLimiter + sync_position_from_exchange.
 """
 from __future__ import annotations
@@ -198,6 +203,10 @@ class Trader:
         qty: float | None = None,
         price: float | None = None,
     ) -> dict:
+        # BUG 26 FIX: guard _client is None — identic cu close_position()
+        if self._client is None:
+            logger.debug("[trader] amend_order: client not initialized, skipping")
+            return {"retCode": -1, "retMsg": "not initialized"}
         params: dict = dict(
             category="linear",
             symbol=self._symbol,
@@ -212,7 +221,9 @@ class Trader:
         stop_loss: float | None = None,
         take_profit: float | None = None,
     ) -> dict:
+        # BUG 26 FIX: guard _client is None
         if self._client is None:
+            logger.debug("[trader] amend_sl_tp: client not initialized, skipping")
             return {"retCode": -1}
         params: dict = dict(
             category="linear",
@@ -228,8 +239,11 @@ class Trader:
         use_limit: bool = True,
         limit_timeout_s: float = 3.0,
     ) -> None:
-        """Close full position. Limit-first (maker fee), Market fallback.
+        """Close full position. Limit-first (maker fee), Market fallback ONLY if not filled.
 
+        v0.8.6 BUG 25 FIX: Market fallback trimis DOAR daca Limit nu a fost filled.
+          Inainte: Market era trimis MEREU dupa sleep -> dublu-close la fiecare TP/SL.
+          Fix: poll fill status dupa sleep; skip Market daca Limit s-a executat.
         v0.8.1 BUG 12 FIX: guard client None pentru shutdown inainte de setup().
         """
         # BUG 12 FIX: daca setup() nu a fost apelat, nu avem client
@@ -248,6 +262,8 @@ class Trader:
 
         close_side = "Sell" if pos == "long" else "Buy"
 
+        # BUG 25 FIX: Market fallback DOAR daca Limit nu a fost filled
+        limit_filled = False
         if use_limit:
             limit_px = best_ask if pos == "long" else best_bid
             resp = await self.place_order(
@@ -256,13 +272,32 @@ class Trader:
                 price=limit_px, reduce_only=True,
             )
             if resp.get("retCode") == 0:
+                order_id = resp.get("result", {}).get("orderId", "")
                 await asyncio.sleep(limit_timeout_s)
+                # Poll fill status — skip Market daca Limit s-a executat
+                if order_id:
+                    try:
+                        fill_result = await _api_call_with_retry(
+                            self._client.get_order_history,
+                            category="linear",
+                            symbol=self._symbol,
+                            orderId=order_id,
+                            limit=1,
+                        )
+                        orders = fill_result.get("result", {}).get("list", [])
+                        if orders and orders[0].get("orderStatus") == "Filled":
+                            limit_filled = True
+                            logger.debug("[trader] close_position: Limit filled, skipping Market fallback")
+                    except Exception as e:
+                        logger.warning(f"[trader] close_position fill poll error: {e}")
 
-        await self.place_order(
-            side=close_side, qty=qty,
-            order_type="Market", post_only=False,
-            reduce_only=True,
-        )
+        if not limit_filled:
+            await self.place_order(
+                side=close_side, qty=qty,
+                order_type="Market", post_only=False,
+                reduce_only=True,
+            )
+
         with state.lock:
             state.open_position = ""
             state.open_qty      = 0.0

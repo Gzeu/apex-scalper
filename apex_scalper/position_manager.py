@@ -1,16 +1,20 @@
-"""Position Manager v0.8.0 — 3 bug-uri critice fixate.
+"""Position Manager v0.8.6 — Bug 27-28 fix.
 
 Changelog:
+  v0.8.6 — BUG 27 FIX: SL software adaugat in evaluate().
+    evaluate() verifica TP1/TP2/TP3/trail/timeout dar NICAIERI nu era:
+      if pnl_pct <= -SL_PCT: await _close_full('SL', pnl_pct)
+    Singura protectie SL era parametrul stopLoss la place_order() pe exchange.
+    Daca exchange SL nu era setat corect (ex. pyramid add cu stop_loss=0),
+    pozitia se tinea la pierdere nelimitata pana la TIMEOUT.
+    Fix: check pnl_pct <= -SL_PCT la INCEPUTUL evaluate(), inainte de TP checks.
+  v0.8.6 — BUG 28 FIX: _close_full() reseteaza explicit state.open_qty=0 si
+    state.open_entry=0. Daca close_position() esua partial si Market pica,
+    state.open_qty > 0 ramanea in state cu open_position=None -> bloca intrari noi.
   v0.8.0 — BUG FIXES:
     BUG 1: on_open() acum async + achizitioneaza _snapshot_lock la scriere.
-      Elimina race window intre strategy.py (A: pm.on_open) si
-      (B: state.open_position=) unde pulse citea entry_price=0 / side=''.
     BUG 2: TP3 reset() mutat DUPA calculul pnl_usdt.
-      Inainte: reset() -> _entry_price=0 -> _pnl_usdt()=0 -> risk.on_close(0)
-      Acum: entry_price salvat local -> _pnl_usdt(entry_price_local) -> reset()
-      _daily_loss si _consecutive_losses se actualizeaza corect la TP3.
     BUG 5: pnl_pct calculat o singura data, consistent, fara double-read.
-      hold_candles incrementat sub lock, pnl_pct calculat o data dupa.
   v0.7.9 — race-condition fix pentru pulse snapshot (PositionSnapshot + lock).
   v0.7.3 — Interface alignment (all AttributeErrors eliminated).
   v0.7.2 — _api_call_with_retry import fix.
@@ -285,6 +289,13 @@ class PositionManager:
         return filled, qty if filled else 0.0
 
     async def _close_full(self, reason: str, pnl_pct: float) -> None:
+        """Close full remaining position and clean up state.
+
+        v0.8.6 BUG 28 FIX: reseteaza explicit state.open_qty=0 si state.open_entry=0.
+          trader.close_position() face reset intern, dar daca Market pica si
+          close_position() esueaza partial, state.open_qty ramanea > 0 cu
+          open_position=None -> bloca intrari noi (MAX_OPEN_POSITIONS check).
+        """
         with state.lock:
             remaining_qty = state.open_qty
         pnl_usdt = self._pnl_usdt(pnl_pct, remaining_qty)
@@ -294,8 +305,12 @@ class PositionManager:
             f"[PM] Full close ({reason}): "
             f"pnl={pnl_pct:.4%} ({pnl_usdt:+.4f} USDT)"
         )
+        # BUG 28 FIX: reset explicit — nu ne bazam exclusiv pe trader.close_position()
         with state.lock:
             state.open_position = None
+            state.open_qty      = 0.0
+            state.open_entry    = 0.0
+            state.trailing_stop = 0.0
         async with self._snapshot_lock:
             self._reset_fields()
 
@@ -304,11 +319,16 @@ class PositionManager:
     # ------------------------------------------------------------------ #
 
     async def evaluate(self, current_price: float) -> bool:
-        """Check TP levels, trailing SL, and timeout every candle.
+        """Check SL, TP levels, trailing SL, and timeout every candle.
 
+        v0.8.6 BUG 27 FIX: SL software adaugat la INCEPUTUL evaluate().
+          Inainte: evaluate() nu verifica niciodata pnl_pct <= -SL_PCT.
+          Singura protectie SL era stopLoss pe exchange — daca acesta pica
+          (ex. pyramid add cu stop_loss=0), pozitia se tinea la pierdere
+          nelimitata pana la TIMEOUT (max_hold_candles).
+          Fix: check SL inainte de TP checks, inainte de trailing.
         v0.8.0 BUG 5 FIX: pnl_pct calculat O SINGURA DATA dupa lock.
           hold_candles incrementat sub lock atomic.
-          Elimina double-read inconsistent (sub lock + fara lock).
         v0.7.9: toate scrierile pe campuri interne sub _snapshot_lock.
         Returns True if position was fully closed.
         """
@@ -323,6 +343,15 @@ class PositionManager:
 
         # Un singur calcul pnl_pct, consistent pentru toate ramurile de mai jos
         pnl_pct = self._unrealised_pnl_pct(current_price)
+
+        # --- BUG 27 FIX: Software SL — primul check, inainte de orice TP ---
+        if pnl_pct <= -SL_PCT:
+            logger.warning(
+                f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{SL_PCT:.4%} "
+                f"— exchange SL may have failed or pyramid had no SL set"
+            )
+            await self._close_full("SL_SOFTWARE", pnl_pct)
+            return True
 
         # --- TP1 ---
         if not self._tp1_hit and pnl_pct >= TP1_PCT:
@@ -347,7 +376,6 @@ class PositionManager:
             filled, qty_closed = await self._close_partial(TP3_FRACTION, "TP3")
             if filled:
                 # BUG 2 FIX: salveaza entry_price INAINTE de reset()
-                # Altfel _pnl_usdt() primeste entry_price=0 -> risk.on_close(0)
                 saved_entry = self._entry_price
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, saved_entry)
                 async with self._snapshot_lock:
@@ -357,6 +385,9 @@ class PositionManager:
                 logger.info(f"[PM] TP3 @ {pnl_pct:.4%} pnl={partial_pnl:+.4f} — trade complete")
                 with state.lock:
                     state.open_position = None
+                    state.open_qty      = 0.0
+                    state.open_entry    = 0.0
+                    state.trailing_stop = 0.0
                 return True
 
         # --- Trailing stop ---
