@@ -1,11 +1,15 @@
-"""Strategy v1.1.3 — calc_qty primeste qty_step din trader (fix DOGE Qty invalid).
+"""Strategy v1.1.4 — fix #1 #2 #3 #5 (entry fill confirm, SL unic, state dupa fill, circuit_breaker).
 
 Changelog:
-  v1.1.3 — BUG FIX: _enter() trecea tick_size la calc_qty care acum
-    asteapta qty_step. Fara qty_step corect, DOGE qty=563.761 in loc
-    de 563.0 -> Bybit ErrCode 10001 'Qty invalid'.
-    Fix: _enter() paseaza qty_step=trader._qty_step la risk.calc_qty().
-    Totodata ORDER_SIZE_USDT resetat la 5 in .env (5.5 era workaround).
+  v1.1.4 —
+    FIX #1: place_entry_order() returneaza (trade_id, filled_qty, avg_price).
+      on_open() primeste avg_price real (nu price de la tick) si filled_qty real.
+      Daca filled_qty=0 -> skip, nu se seteaza state.
+    FIX #2: SL calculat O SINGURA DATA in _enter() si pasat la on_open().
+      on_open() nu mai recalculeaza SL — scoatem dubla suprasciere.
+    FIX #3: state.open_position setat DUPA confirmarea fill (filled_qty > 0).
+    FIX #5: circuit_breaker integrat in _enter() — daca e OPEN, skip entry.
+  v1.1.3 — calc_qty primeste qty_step din trader (fix DOGE Qty invalid).
   v1.1.2 — leverage din profil consistent, ROUND_TRIP_FEE unificat.
   v1.1.1 — _enter() SL/TP din profil + comision inclus in TP.
   v1.1.0 — 5 features noi: GATE0/9/10, divergence, breakout.
@@ -337,6 +341,12 @@ async def evaluate(price: float) -> None:
         logger.debug("[evaluate] GATE1 RISK blocat")
         return
 
+    # FIX #5: circuit_breaker gate
+    from .circuit_breaker import circuit_breaker, CircuitOpenError
+    if circuit_breaker.is_open:
+        logger.debug(f"[evaluate] GATE_CB CIRCUIT OPEN — skip entry")
+        return
+
     from .regime_filter import regime
     if not regime.allow_entry():
         logger.debug(f"[evaluate] GATE2 REGIME blocat: {regime.label}")
@@ -417,9 +427,11 @@ async def _enter(
     from .risk import risk
     from .regime_filter import regime
     from .position_manager import position_manager as pm
-    from .limit_order_manager import place_entry_order
+    from .limit_order_manager import lom
     from .telegram_ui import notify_open
     from .trader import trader
+    from .circuit_breaker import circuit_breaker, CircuitOpenError
+    from .persistence import db
 
     is_long  = side == "long"
     sl_pct   = prof.get("sl_pct",          0.0020)
@@ -437,11 +449,10 @@ async def _enter(
         )
         return
 
+    # FIX #2: SL calculat O SINGURA DATA aici — pasat la place_entry SI la on_open
     sl = price * (1.0 - sl_pct  if is_long else 1.0 + sl_pct)
     tp = price * (1.0 + tp3_pct if is_long else 1.0 - tp3_pct)
 
-    # FIX v1.1.3: paseaza qty_step din trader (ex: 1.0 pe DOGE, 0.001 pe BTC)
-    # Inainte: calc_qty primea tick_size=0.001 implicit -> qty cu zecimale
     qty = risk.calc_qty(
         price,
         order_size_usdt=order_sz,
@@ -460,19 +471,48 @@ async def _enter(
         f"qty_step={trader._qty_step}"
     )
 
-    trade_id = await place_entry_order(
-        side=bybit_side, qty=qty, stop_loss=sl, take_profit=tp
-    )
-    if not trade_id:
-        logger.error(f"[{side.upper()}] place_entry_order failed")
+    # FIX #5: place_entry prin circuit_breaker
+    try:
+        success, filled_qty, avg_price, order_id = await circuit_breaker.call(
+            lom.place_entry,
+            side=bybit_side,
+            qty=qty,
+            stop_loss=sl,
+            take_profit=tp,
+        )
+    except CircuitOpenError as e:
+        logger.warning(f"[{side.upper()}] Circuit OPEN la place_entry: {e}")
+        return
+    except Exception as e:
+        logger.error(f"[{side.upper()}] place_entry exceptie: {e}")
         return
 
-    await pm.on_open(side, qty, price, trade_id)
+    # FIX #1 + #3: verifica fill REAL inainte de a seta orice stare
+    if not success or filled_qty <= 0:
+        logger.error(f"[{side.upper()}] place_entry_order failed sau qty=0 — nu setam stare")
+        return
+
+    # Inregistreaza trade in DB cu avg_price real
+    trade_id = db.record_open_trade(
+        symbol=config.symbol,
+        side=side,
+        entry=avg_price,
+        qty=filled_qty,
+    )
+
+    # FIX #2: on_open primeste sl_price gata calculat — nu recalculeaza
+    await pm.on_open(side, filled_qty, avg_price, trade_id, sl_price=sl)
     risk.on_open()
+
+    # FIX #3: state setat DUPA confirmarea fill
     with state.lock:
         state.open_position = side
-        state.open_qty      = qty
-        state.open_entry    = price
+        state.open_qty      = filled_qty
+        state.open_entry    = avg_price
 
-    logger.info(f"[{side.upper()}] OPENED trade_id={trade_id} qty={qty} @ {price}")
-    await notify_open(side, qty, price, sl, tp)
+    logger.info(
+        f"[{side.upper()}] OPENED trade_id={trade_id} "
+        f"filled_qty={filled_qty} avg_price={avg_price:.6f} "
+        f"(requested qty={qty} @ tick={price:.6f})"
+    )
+    await notify_open(side, filled_qty, avg_price, sl, tp)

@@ -1,9 +1,11 @@
-"""Main entry point v1.4.2 — toate metodele trader corecte.
+"""Main entry point v1.4.3 — indicator_warmup la startup (fix #4).
 
 Changelog:
-  v1.4.2 — inlocuit trader.get_open_position() (inexistent) cu
-    trader.sync_position_from_exchange() care exista si gestioneaza
-    intern restaurarea starii la restart.
+  v1.4.3 — FIX #4: indicator_warmup.run() apelat inainte de pornirea
+    task-urilor asyncio. Inainte indicatorii nu erau warm la startup
+    -> primele candle-uri aveau rsi_ready=False, atr_ready=False
+    -> GATE4 (ATR) si scoring partial puteau genera semnale false.
+  v1.4.2 — inlocuit get_open_position() cu sync_position_from_exchange().
   v1.4.1 — inject_wall_params via config.wall_ratio + trader.setup().
   v1.4.0 — dashboard GUI integrat.
 """
@@ -47,6 +49,7 @@ async def main() -> None:
     from .watchdog import run_watchdog
     from .pulse import run_pulse_loop
     from .dashboard import run_dashboard
+    from .indicator_warmup import run_warmup  # FIX #4
 
     _setup_logging()
     config.validate()
@@ -57,7 +60,15 @@ async def main() -> None:
 
     await trader.setup()
 
-    # Sincronizeaza pozitia existenta la restart (gestioneaza intern starea)
+    # FIX #4: warm up indicatori cu date istorice inainte de pornirea loop-ului
+    logger.info("[warmup] Pornire indicator warmup...")
+    try:
+        await run_warmup(config.symbol)
+        logger.info("[warmup] Indicatori ready — RSI/ATR/EMA incalziti")
+    except Exception as e:
+        logger.warning(f"[warmup] Warmup esuat (continuam fara): {e}")
+
+    # Sincronizeaza pozitia existenta la restart
     await trader.sync_position_from_exchange()
 
     logger.info("Watchdog started (timeout=120s, max_restarts=5)")
@@ -91,7 +102,7 @@ async def main() -> None:
     )
 
     def _shutdown(sig, frame):
-        logger.info(f"Semnal {sig} primit \u2014 oprire...")
+        logger.info(f"Semnal {sig} primit — oprire...")
         for t in tasks:
             t.cancel()
 

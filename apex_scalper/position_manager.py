@@ -1,12 +1,15 @@
-"""Position Manager v1.3.2 — SL pe exchange setat la entry.
+"""Position Manager v1.3.3 — on_open primeste sl_price din strategy (SL unic).
 
 Changelog:
-  v1.3.2 — on_open() seteaza acum SL pe exchange (Bybit) imediat la entry.
-    Inainte: SL exista doar software (evaluate() per candle).
-    Riscul: daca botul crapa intre candle-uri, pozitia ramanea fara SL activ
-    pe exchange -> la 50x leverage -> lichidare totala posibila.
-    Fix: trader.amend_sl_tp(stop_loss=sl_price) in on_open(), imediat dupa
-    setarea entry_price. SL calculat dinamic pe ATR (acelasi _dynamic_sl_pct).
+  v1.3.3 —
+    FIX #2: on_open() primeste sl_price: float | None ca parametru optional.
+      Daca sl_price e furnizat (din strategy._enter), il foloseste direct.
+      Daca nu e furnizat (restart/sync), il calculeaza dinamic ca fallback.
+      Elimina dubla suprasciere SL (strategy calcula unul, on_open alt unul).
+    FIX #7: try_pyramid() apeleaza amend_sl_tp() cu noul SL dupa adaugare,
+      recalculat din entry_price original (nu din price curent) pentru
+      a mentine protectia corecta la qty total.
+  v1.3.2 — on_open() seteaza SL pe exchange la entry.
   v1.3.1 — pyramid qty_step fix + close_partial floor.
   v1.3.0 — SL + Trailing dinamic pe ATR (50x safe).
   v1.2.1 — BUG CRITIC: _close_full() verifica retur + state guard.
@@ -102,11 +105,7 @@ def _dynamic_trail_delta() -> float:
 
 
 def _floor_to_qty_step(raw_qty: float) -> float:
-    """Rotunjeste qty la floor de qty_step al instrumentului.
-
-    FIX v1.3.1: folosit atat in _close_partial cat si in try_pyramid.
-    Previne ErrCode 10001 'Qty invalid' de la Bybit.
-    """
+    """Rotunjeste qty la floor de qty_step al instrumentului."""
     qty_step = trader._qty_step
     if qty_step <= 0:
         return raw_qty
@@ -219,9 +218,9 @@ class PositionManager:
         qty: float,
         entry_price: float,
         trade_id: int | None = None,
+        sl_price: float | None = None,  # FIX #2: SL gata calculat din strategy
     ) -> None:
         prof    = _get_profile()
-        sl_pct  = _dynamic_sl_pct()
         atr_pct = _get_current_atr_pct()
 
         async with self._snapshot_lock:
@@ -231,32 +230,33 @@ class PositionManager:
             self._entry_price = entry_price
             self._trade_id    = trade_id
 
+        # FIX #2: folosim sl_price din strategy daca e furnizat
+        # altfel calcul dinamic ca fallback (ex: restart/sync)
+        if sl_price is None:
+            sl_pct   = _dynamic_sl_pct()
+            sl_price = entry_price * (1.0 - sl_pct if side == "long" else 1.0 + sl_pct)
+            logger.debug(f"[PM] sl_price calculat dinamic (fallback): {sl_price:.6f}")
+        else:
+            sl_pct = abs(entry_price - sl_price) / entry_price if entry_price > 0 else _dynamic_sl_pct()
+
         logger.info(
-            f"[PM] Entry: side={side} qty={qty} price={entry_price} "
-            f"| sl_dynamic={sl_pct:.4%} (ATR={atr_pct:.4%} x{_SL_ATR_MULT}) "
-            f"| lev={prof.get('leverage', '?')}x"
+            f"[PM] Entry: side={side} qty={qty} avg_price={entry_price} "
+            f"| sl={sl_price:.6f} ({sl_pct:.4%}) "
+            f"| ATR={atr_pct:.4%} | lev={prof.get('leverage', '?')}x"
         )
 
-        # --- SL pe exchange la entry (protectie crash bot) ---
-        if side == "long":
-            sl_price = entry_price * (1.0 - sl_pct)
-        else:
-            sl_price = entry_price * (1.0 + sl_pct)
-
+        # SL pe exchange — protectie crash bot
         try:
             resp = await trader.amend_sl_tp(stop_loss=sl_price)
             if resp and resp.get("retCode") == 0:
-                logger.info(
-                    f"[PM] SL exchange setat: {sl_price:.6f} "
-                    f"({sl_pct:.4%} de la entry={entry_price:.6f})"
-                )
+                logger.info(f"[PM] SL exchange confirmat: {sl_price:.6f}")
             else:
                 logger.warning(
-                    f"[PM] SL exchange ESUAT la entry: {resp} "
+                    f"[PM] SL exchange ESUAT: {resp} "
                     f"| sl_price={sl_price:.6f} — only software SL active!"
                 )
         except Exception as e:
-            logger.warning(f"[PM] SL exchange exceptie la entry: {e} — only software SL active!")
+            logger.warning(f"[PM] SL exchange exceptie: {e} — only software SL active!")
 
     def _unrealised_pnl_pct(self, current_price: float) -> float:
         if self._entry_price <= 0:
@@ -303,12 +303,6 @@ class PositionManager:
             logger.warning(f"[PM] Breakeven SL exceptie: {e}")
 
     async def _close_partial(self, fraction: float, label: str) -> tuple[bool, float]:
-        """Inchide partial pozitia.
-
-        FIX v1.3.1: qty rotunjit cu floor la qty_step (nu round 6 decimale).
-        Ex DOGE: open_qty=2808, fraction=0.40 -> raw=1123.2 -> floor(1123.2/1)*1 = 1123
-        Previne ErrCode 10001 la close partial.
-        """
         sym = self._sym()
         with state.lock:
             open_qty   = state.open_qty
@@ -553,8 +547,9 @@ class PositionManager:
     ) -> None:
         """Adauga la pozitie existenta (pyramid).
 
-        FIX v1.3.1: paseaza qty_step=trader._qty_step la risk.calc_qty().
-        Inainte: qty_step implicit 0.001 -> zecimale pe DOGE -> ErrCode 10001.
+        FIX #7 v1.3.3: dupa adaugare, apeleaza amend_sl_tp() cu SL recalculat
+        din entry_price original. Inainte SL pe exchange ramanea la entry
+        initial, neactualizat pentru qty total.
         """
         max_pyramid = _p("max_pyramid_adds", _DEFAULT_MAX_PYRAMID)
         async with self._snapshot_lock:
@@ -565,6 +560,8 @@ class PositionManager:
                 return
             if not self._tp1_hit:
                 return
+            original_entry = self._entry_price
+            original_side  = self._entry_side
 
         from .config import config
         add_qty = risk.calc_qty(
@@ -603,6 +600,25 @@ class PositionManager:
                 f"qty={add_qty} qty_step={trader._qty_step} "
                 f"pnl={pnl_pct:.4%} score={score:.3f}"
             )
+
+            # FIX #7: actualizeaza SL pe exchange dupa adaugare
+            # recalculat din entry_price original pentru consistenta
+            sl_pct = _dynamic_sl_pct()
+            if original_side == "long":
+                new_sl = original_entry * (1.0 - sl_pct)
+            else:
+                new_sl = original_entry * (1.0 + sl_pct)
+            try:
+                sl_resp = await trader.amend_sl_tp(stop_loss=new_sl)
+                if sl_resp and sl_resp.get("retCode") == 0:
+                    logger.info(
+                        f"[PM] Pyramid SL actualizat: {new_sl:.6f} "
+                        f"({sl_pct:.4%} din entry={original_entry:.6f})"
+                    )
+                else:
+                    logger.warning(f"[PM] Pyramid SL amend esuat: {sl_resp}")
+            except Exception as e:
+                logger.warning(f"[PM] Pyramid SL exceptie: {e}")
 
 
 position_manager = PositionManager()
