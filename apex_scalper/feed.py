@@ -1,15 +1,15 @@
-"""Public WebSocket feed v0.8.1: orderbook (L2-50) + klines (1m).
+"""Public WebSocket feed v0.9.7: orderbook (L2-50) + klines (1m).
 
 Changelog:
-  v0.8.1 — BUG 7 FIX:
-    'from .strategy import strategy' -> AttributeError (strategy e modul, nu obiect)
-    update_indicators(close, high, low, volume) -> semnatura gresita (asteapta dict)
-    Fix: import evaluate, update_indicators direct din strategy
-    update_indicators(close, {"high": high, "low": low, "volume": volume})
-    asyncio.run_coroutine_threadsafe(evaluate(close), _loop)
-  v0.7.4 — Feed latency guard, staleness check inainte de evaluate.
-  v0.7.2 — bp.on_tick() cu level lists (deep wall spoof detection).
-  v0.7.1 — bp.on_tick() wired up.
+  v0.9.7 — BUG FIX: record_heartbeat() si record_kline() nu erau apelate
+    niciodata din feed.py -> watchdog expira la 120s de la startup garantat,
+    restartand botul la nesfarsit. Indicatorii ramanaeau in warmup permanent.
+    Fix: record_heartbeat() apelat in _handle_kline() la orice mesaj WS
+    (inclusiv candle neclosed), record_kline() apelat la candle confirmat.
+    Astfel watchdog stie ca feed-ul e viu si nu mai face restart inutil.
+  v0.8.1 — BUG 7 FIX: semnatura corecta update_indicators + evaluate.
+  v0.7.4 — Feed latency guard.
+  v0.7.2 — bp.on_tick() cu level lists.
   v0.3.1 — Full reconnect loop cu watchdog integration.
 """
 from __future__ import annotations
@@ -36,6 +36,10 @@ def _handle_orderbook(msg: dict) -> None:
     if not data:
         return
     try:
+        # Orderbook activ = feed viu = heartbeat reset
+        from .watchdog import record_heartbeat
+        record_heartbeat()
+
         with state.lock:
             state.last_tick_ts = time.time()
             if msg_type == "snapshot":
@@ -66,16 +70,24 @@ def _handle_orderbook(msg: dict) -> None:
 def _handle_kline(msg: dict) -> None:
     """Process confirmed (closed) 1m candles only.
 
-    v0.8.1 BUG 7 FIX:
-      - Importam evaluate si update_indicators direct (nu 'strategy.evaluate()')
-      - update_indicators(close, kline_dict) conform semnaturii corecte
-      - asyncio.run_coroutine_threadsafe(evaluate(close), _loop)
+    v0.9.7 FIX: record_heartbeat() la orice mesaj kline (confirmat sau nu)
+      si record_kline() la candle confirmat. Fara aceste apeluri, watchdog
+      nu stia ca feed-ul e viu si restartat botul la fiecare 120s.
+    v0.8.1 BUG 7 FIX: semnatura corecta.
     v0.7.4: Feed staleness guard.
     """
+    from .watchdog import record_heartbeat, record_kline
+
+    # Orice mesaj kline = WS activ = heartbeat viu
+    record_heartbeat()
+
     try:
         data = msg.get("data", [])
         if not data or not data[0].get("confirm", False):
             return
+
+        # Candle confirmat (closed)
+        record_kline()
 
         # Feed staleness guard
         with state.lock:
@@ -97,11 +109,9 @@ def _handle_kline(msg: dict) -> None:
         with state.lock:
             state.last_price = close
 
-        # BUG 7 FIX: semnatura corecta update_indicators(price, kline_data: dict)
         from .strategy import update_indicators, evaluate
         update_indicators(close, {"high": high, "low": low, "volume": volume})
 
-        # BUG 7 FIX: evaluate(close) corect, nu strategy.evaluate()
         if _loop and _loop.is_running():
             asyncio.run_coroutine_threadsafe(evaluate(close), _loop)
 
