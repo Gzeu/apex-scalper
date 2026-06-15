@@ -1,7 +1,11 @@
-"""Strategy v0.9.9 — notificari automate open/TP/SL.
+"""Strategy v1.0.0 — debug logging la fiecare gate blocat.
 
 Changelog:
-  v0.9.9 — notify_open() apelata la deschidere long/short via telegram_ui.
+  v1.0.0 — Fiecare gate din evaluate() logheaza motivul blocarii cu
+    logger.debug(). La scor aproape de prag (>= ENTRY_THRESHOLD * 0.85)
+    dar blocat de alt filtru, trimite notificare Telegram.
+    Ajuta diagnosticarea: de ce nu intra bot-ul cand scorul pare bun.
+  v0.9.9 — notify_open() apelata la deschidere.
   v0.8.7 — BUG 30+31 fix.
 """
 from __future__ import annotations
@@ -86,18 +90,19 @@ def _get_ind_state():
 def _score_long(snapshot: IndicatorState, ob, price: float) -> float:
     score = 0.0
     from .book_pressure import bp
-    if bp.pressure_long():                                          score += 0.24
+    if bp.pressure_long():                                           score += 0.24
     if snapshot.rsi_ready:
-        if RSI_LONG_MIN <= snapshot.rsi_value <= RSI_OB_PENALTY:   score += 0.16
-        elif snapshot.rsi_value < RSI_LONG_MIN:                     score += 0.08
-    if ob.imbalance >= IMBALANCE_LONG:                              score += 0.14
-    if price > snapshot.ema_trend > 0:                              score += 0.12
-    if snapshot.ema_fast > snapshot.ema_slow > 0:                   score += 0.10
+        if RSI_LONG_MIN <= snapshot.rsi_value <= RSI_OB_PENALTY:    score += 0.16
+        elif snapshot.rsi_value < RSI_LONG_MIN:                      score += 0.08
+    if ob.imbalance >= IMBALANCE_LONG:                               score += 0.14
+    if price > snapshot.ema_trend > 0:                               score += 0.12
+    if snapshot.ema_fast > snapshot.ema_slow > 0:                    score += 0.10
     if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN: score += 0.08
-    if snapshot.macd_ready and snapshot.macd_histogram > 0:         score += 0.04
-    if snapshot.stoch_ready and snapshot.stoch_k > snapshot.stoch_d and snapshot.stoch_k < 80: score += 0.04
-    if snapshot.bb_ready and price > snapshot.bb_mid:               score += 0.04
-    if snapshot.vwap > 0 and price > snapshot.vwap:                 score += 0.04
+    if snapshot.macd_ready and snapshot.macd_histogram > 0:          score += 0.04
+    if snapshot.stoch_ready and snapshot.stoch_k > snapshot.stoch_d and snapshot.stoch_k < 80:
+        score += 0.04
+    if snapshot.bb_ready and price > snapshot.bb_mid:                score += 0.04
+    if snapshot.vwap > 0 and price > snapshot.vwap:                  score += 0.04
     return min(score, 1.0)
 
 
@@ -108,13 +113,14 @@ def _score_short(snapshot: IndicatorState, ob, price: float) -> float:
     if snapshot.rsi_ready:
         if RSI_OS_PENALTY <= snapshot.rsi_value <= RSI_SHORT_MAX:   score += 0.16
         elif snapshot.rsi_value > RSI_SHORT_MAX:                     score += 0.08
-        elif snapshot.rsi_value > RSI_SHORT_MAX:                     score += 0.08
     if ob.imbalance <= IMBALANCE_SHORT:                              score += 0.14
-    if 0 < snapshot.ema_trend and price < snapshot.ema_trend:        score += 0.12
-    if snapshot.ema_fast < snapshot.ema_slow and snapshot.ema_slow > 0: score += 0.10
+    if 0 < snapshot.ema_trend and price < snapshot.ema_trend:       score += 0.12
+    if snapshot.ema_fast < snapshot.ema_slow and snapshot.ema_slow > 0:
+        score += 0.10
     if snapshot.vol_ready and snapshot.vol_zscore >= VOL_ZSCORE_MIN: score += 0.08
     if snapshot.macd_ready and snapshot.macd_histogram < 0:          score += 0.04
-    if snapshot.stoch_ready and snapshot.stoch_k < snapshot.stoch_d and snapshot.stoch_k > 20: score += 0.04
+    if snapshot.stoch_ready and snapshot.stoch_k < snapshot.stoch_d and snapshot.stoch_k > 20:
+        score += 0.04
     if snapshot.bb_ready and price < snapshot.bb_mid:                score += 0.04
     if snapshot.vwap > 0 and price < snapshot.vwap:                  score += 0.04
     return min(score, 1.0)
@@ -180,6 +186,10 @@ def _apply_ind_from_state(s, price: float) -> None:
     ind.stoch_ready     = s.stoch_ready
 
 
+# --------------------------------------------------------------------------- #
+#  Evaluate — cu debug logging la FIECARE gate blocat
+# --------------------------------------------------------------------------- #
+
 async def evaluate(price: float) -> None:
     from .regime_filter import regime
     from .risk import risk
@@ -195,6 +205,7 @@ async def evaluate(price: float) -> None:
         pos      = state.open_position
         open_qty = state.open_qty
 
+    # --- pozitie deschisa: gestioneaza TP/SL si eventual pyramid
     if pos:
         closed = await pm.evaluate(price)
         if not closed:
@@ -207,86 +218,167 @@ async def evaluate(price: float) -> None:
                 )
         return
 
+    # --- fara pozitie deschisa: verifica toate gate-urile
     if not state.running or state.paused:
-        return
-    if not risk.can_open():
-        return
-    if not regime.allow_entry():
+        logger.debug(f"[evaluate] SKIP: running={state.running} paused={state.paused}")
         return
 
+    # GATE 1: Risk
+    if not risk.can_open():
+        logger.debug(
+            f"[evaluate] GATE1 RISK blocat: daily_loss={risk._daily_loss:.2f} "
+            f"consec={risk.consecutive_losses} open={risk._open_count}"
+        )
+        return
+
+    # GATE 2: Regime
+    if not regime.allow_entry():
+        logger.debug(
+            f"[evaluate] GATE2 REGIME blocat: label={regime.label} ADX={regime.adx}"
+        )
+        return
+
+    # Calculeaza score inainte de filtrele de price action
     ob = compute_ob()
     score_l, score_s = await score_snapshot(price, ob)
+    best_score = max(score_l, score_s)
+    near_threshold = best_score >= ENTRY_THRESHOLD * 0.85  # 85% din prag
 
+    # GATE 3: Spread
     spread_bps = state.orderbook.spread / price * 10_000 if price > 0 else 999
     atr_ratio  = ind.atr_value / (ATR_BASELINE * price) if price > 0 else 1.0
     max_spread = BASE_SPREAD_BPS * (1 + ATR_SPREAD_MULT * atr_ratio)
     if spread_bps > max_spread:
+        logger.debug(
+            f"[evaluate] GATE3 SPREAD blocat: "
+            f"spread={spread_bps:.2f}bps > max={max_spread:.2f}bps "
+            f"(score_l={score_l:.3f} score_s={score_s:.3f})"
+        )
         return
 
+    # GATE 4: ATR volatility window
     if ind.atr_ready:
         atr_pct = ind.atr_value / price if price > 0 else 0
         if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
+            logger.debug(
+                f"[evaluate] GATE4 ATR blocat: atr_pct={atr_pct:.6f} "
+                f"window=[{ATR_MIN_PCT},{ATR_MAX_PCT}] "
+                f"(score_l={score_l:.3f} score_s={score_s:.3f})"
+            )
             return
 
+    # GATE 5: Anti-manipulation
     if anti_manipulation.is_suspicious():
-        return
-    if not mtf.ready:
+        logger.debug(
+            f"[evaluate] GATE5 ANTI-MANIP blocat "
+            f"(score_l={score_l:.3f} score_s={score_s:.3f})"
+        )
         return
 
+    # GATE 6: MTF ready
+    if not mtf.ready:
+        logger.debug(
+            f"[evaluate] GATE6 MTF not ready: ema50={mtf.ema50:.2f} "
+            f"(score_l={score_l:.3f} score_s={score_s:.3f})"
+        )
+        return
+
+    # Refresh funding (async, non-blocking)
     await funding.maybe_refresh(config.symbol)
 
+    # --- LONG path ---
     if score_l >= ENTRY_THRESHOLD:
+        # GATE 7L: funding
         if not funding.can_enter_long():
+            logger.warning(
+                f"[evaluate] GATE7 FUNDING blocheaza LONG: rate={funding.rate_pct} "
+                f"score_l={score_l:.3f}"
+            )
             return
+        # GATE 8L: MTF direction
         if price <= mtf.ema50:
+            logger.debug(
+                f"[evaluate] GATE8 MTF dir blocheaza LONG: "
+                f"price={price} <= ema50={mtf.ema50:.2f} score_l={score_l:.3f}"
+            )
             return
-        from .limit_order_manager import place_entry_order
-        from .telegram_ui import notify_open
-        sl = price * (1 - 0.0008)
-        tp = price * (1 + 0.004)
-        qty = risk.calc_qty(
-            price,
-            order_size_usdt=config.order_size_usdt,
-            leverage=config.leverage,
-            regime_factor=regime.size_factor(),
-        )
-        if qty <= 0:
-            return
-        trade_id = await place_entry_order(side="Buy", qty=qty, stop_loss=sl, take_profit=tp)
-        if trade_id:
-            await pm.on_open("long", qty, price, trade_id)
-            risk.on_open()
-            with state.lock:
-                state.open_position = "long"
-                state.open_qty      = qty
-                state.open_entry    = price
-            logger.info(f"LONG score={score_l:.3f} price={price} qty={qty} sl={sl:.2f} tp={tp:.2f}")
-            await notify_open("long", qty, price, sl, tp)
+        # INTRA LONG
+        await _enter("long", "Buy", price, score_l, config)
 
+    # --- SHORT path ---
     elif score_s >= ENTRY_THRESHOLD:
+        # GATE 7S: funding
         if not funding.can_enter_short():
+            logger.warning(
+                f"[evaluate] GATE7 FUNDING blocheaza SHORT: rate={funding.rate_pct} "
+                f"score_s={score_s:.3f}"
+            )
             return
+        # GATE 8S: MTF direction
         if price >= mtf.ema50:
+            logger.debug(
+                f"[evaluate] GATE8 MTF dir blocheaza SHORT: "
+                f"price={price} >= ema50={mtf.ema50:.2f} score_s={score_s:.3f}"
+            )
             return
-        from .limit_order_manager import place_entry_order
-        from .telegram_ui import notify_open
-        sl = price * (1 + 0.0008)
-        tp = price * (1 - 0.004)
-        qty = risk.calc_qty(
-            price,
-            order_size_usdt=config.order_size_usdt,
-            leverage=config.leverage,
-            regime_factor=regime.size_factor(),
-        )
-        if qty <= 0:
-            return
-        trade_id = await place_entry_order(side="Sell", qty=qty, stop_loss=sl, take_profit=tp)
-        if trade_id:
-            await pm.on_open("short", qty, price, trade_id)
-            risk.on_open()
-            with state.lock:
-                state.open_position = "short"
-                state.open_qty      = qty
-                state.open_entry    = price
-            logger.info(f"SHORT score={score_s:.3f} price={price} qty={qty} sl={sl:.2f} tp={tp:.2f}")
-            await notify_open("short", qty, price, sl, tp)
+        # INTRA SHORT
+        await _enter("short", "Sell", price, score_s, config)
+
+    else:
+        # Scor sub prag — log doar daca e aproape
+        if near_threshold:
+            logger.debug(
+                f"[evaluate] SCORE sub prag: L={score_l:.4f} S={score_s:.4f} "
+                f"prag={ENTRY_THRESHOLD} lipsa={ENTRY_THRESHOLD - best_score:.4f}"
+            )
+
+
+async def _enter(
+    side: str,
+    bybit_side: str,
+    price: float,
+    score: float,
+    config,
+) -> None:
+    """Plasare ordin + actualizare state + notificare Telegram."""
+    from .risk import risk
+    from .regime_filter import regime
+    from .position_manager import position_manager as pm
+    from .limit_order_manager import place_entry_order
+    from .telegram_ui import notify_open
+
+    is_long = side == "long"
+    sl = price * (1 - 0.0008 if is_long else 1 + 0.0008)
+    tp = price * (1 + 0.004  if is_long else 1 - 0.004)
+
+    qty = risk.calc_qty(
+        price,
+        order_size_usdt=config.order_size_usdt,
+        leverage=config.leverage,
+        regime_factor=regime.size_factor(),
+    )
+    if qty <= 0:
+        logger.warning(f"[{side.upper()}] calc_qty=0 — skip entry (price={price})")
+        return
+
+    logger.info(
+        f"[{side.upper()}] ENTRY score={score:.4f} price={price} "
+        f"qty={qty} sl={sl:.2f} tp={tp:.2f}"
+    )
+
+    trade_id = await place_entry_order(
+        side=bybit_side, qty=qty, stop_loss=sl, take_profit=tp
+    )
+    if not trade_id:
+        logger.error(f"[{side.upper()}] place_entry_order failed — no trade_id")
+        return
+
+    await pm.on_open(side, qty, price, trade_id)
+    risk.on_open()
+    with state.lock:
+        state.open_position = side
+        state.open_qty      = qty
+        state.open_entry    = price
+
+    logger.info(f"[{side.upper()}] OPENED trade_id={trade_id} qty={qty} @ {price}")
+    await notify_open(side, qty, price, sl, tp)
