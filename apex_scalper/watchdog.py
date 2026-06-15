@@ -1,22 +1,10 @@
-"""Watchdog v0.9.0 — heartbeat monitor + feed_restart_needed export.
+"""Watchdog v0.9.1 — adaugat get_last_kline_ts() getter public.
 
 Changelog:
-  v0.9.0 — BUG 39 FIX: os.execv() la restart cauza ImportError guaranteed.
-    os.execv([sys.executable] + sys.argv) inlocuia procesul curent cu unul
-    fresh care nu mostena contextul de modul -> 'attempted relative import
-    with no known parent package' la orice import relativ din pachet.
-    Probleme suplimentare:
-      - sys.argv[0] = '-m' cand pornit cu python -m apex_scalper -> crash
-      - socket-uri WS, lock-uri threading mostenite de OS in procesul nou
-      - asyncio event loop corupt dupa execv
-    Fix (Docker-first):
-      1. sys.exit(1) — Docker --restart=always / systemd RestartSec face
-         restart curat al intregului proces, fara mostenire de stare.
-      2. Fallback non-Docker: subprocess.Popen cu -m apex_scalper explicit
-         inainte de sys.exit(0) pentru a garanta context de modul corect.
-    Pattern recomandat: lasa orchestratorul (Docker/systemd) sa gestioneze
-    restart-ul, nu procesul insusi.
-
+  v0.9.1 — adaugat get_last_kline_ts() -> float pentru a permite
+    telegram_ui.py sa acceseze timestamp-ul fara import direct de variabila
+    privata. Elimina ImportError 'cannot import name get_last_kline_ts'.
+  v0.9.0 — BUG 39 FIX: os.execv() inlocuit cu sys.exit(1) + subprocess fallback.
   v0.7.6 — feed_restart_needed() added. Also exposes _last_kline_ts.
   v0.6.1 — run_watchdog() alias added for main.py.
 """
@@ -56,6 +44,16 @@ def record_kline() -> None:
     """Called by feed.py on every confirmed kline."""
     global _last_kline_ts
     _last_kline_ts = time.monotonic()
+
+
+def get_last_kline_ts() -> float:
+    """Getter public pentru _last_kline_ts.
+
+    Folosit de telegram_ui.py si orice alt modul care vrea sa verifice
+    varsta ultimului kline fara import direct de variabila privata.
+    Returneaza 0.0 daca nu a venit niciun kline de la pornire.
+    """
+    return _last_kline_ts
 
 
 def feed_restart_needed() -> bool:
@@ -108,15 +106,9 @@ async def _restart_bot(reason: str) -> None:
     logger.warning(f"Watchdog restart: {reason} | managed={_MANAGED}")
 
     if _MANAGED:
-        # Docker --restart=always sau systemd RestartSec gestioneaza restart-ul.
-        # sys.exit(1) = exit code non-zero -> orchestratorul reporneste containerul
-        # curat, fara mostenire de socket-uri / lock-uri / event loop corupt.
         logger.info("Watchdog: sys.exit(1) — Docker/systemd will restart.")
         sys.exit(1)
     else:
-        # Fallback non-Docker: spawn proces nou cu -m explicit inainte de exit.
-        # subprocess.Popen nu mosteneste event loop-ul asyncio si garanteaza
-        # contextul de modul corect (spre deosebire de os.execv).
         cmd = [sys.executable, "-m", "apex_scalper"] + sys.argv[1:]
         logger.info(f"Watchdog: subprocess.Popen({cmd}) + sys.exit(0)")
         try:
