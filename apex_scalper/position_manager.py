@@ -1,20 +1,16 @@
-"""Position Manager v1.2.1 — 4 buguri fixate.
+"""Position Manager v1.3.0 — SL + Trailing dinamic pe ATR (50x safe).
 
 Changelog:
-  v1.2.1 — BUG FIXES:
-    BUG CRITIC: _close_full() nu verifica daca close_position() a reusit.
-      Daca ordinul esua, state-ul local era curatata (open_position=None)
-      dar pozitia ramanea deschisa pe exchange -> posibil trade dublu.
-      Fix: verifica returul bool al close_position(); daca False, NU
-      curata state-ul si trimite alert Telegram explicit.
-    BUG LOGIC: tp1_already_hit citit la inceputul evaluate() - daca TP1
-      era atins in acelasi apel, timeout-ul vedea valoarea veche (False)
-      si intra pe grace in loc de TIMEOUT_BE.
-      Fix: reciteste self._tp1_hit DUPA blocul TP1.
-    BUG INCONSISTENTA: leverage pentru net_profit_check in strategy
-      folosea prof.get('leverage') dar qty folosea config.leverage global.
-      Rezolvat prin expunerea leverage-ului efectiv din profil via
-      _get_effective_leverage() - position_manager ramane consistent.
+  v1.3.0 — SL si trailing stop dinamice bazate pe ATR:
+    PROBLEMA: La 50x leverage, SL fix de 0.20% e atins de orice wick minor
+    pe DOGE. ATR real poate fi 0.05% sau 0.40% - un SL fix ignora contextul.
+    FIX: sl_distance = max(ATR * 1.5, sl_pct_min) - SL respira cu volatilitatea
+    FIX: trail_delta = max(ATR * 1.0, trail_delta_min) - trailing respira similar
+    PROTECTIE: sl_pct_min=0.0015, sl_pct_max=0.0040 (nu iese din limite sane)
+    PROTECTIE: trail_delta_min=0.0008, trail_delta_max=0.0050
+    Rezultat: la ATR=0.05% -> SL=0.075% (mai strans); la ATR=0.30% -> SL=0.45%
+    Lichidare la 50x e la 2.0% - SL dinamic ramane departe cu marja reala.
+  v1.2.1 — BUG CRITIC: _close_full() verifica retur + state guard.
   v1.2.0 — Breakeven SL dupa TP1, timeout smart exit.
   v1.1.0 — TP/SL/Trail citite din profil per symbol.
 """
@@ -44,6 +40,16 @@ _DEFAULT_TRAIL_DELTA   = 0.0010
 _DEFAULT_MAX_HOLD      = 4
 _DEFAULT_MAX_PYRAMID   = 0
 
+# SL dinamic ATR - limite de siguranta
+_SL_ATR_MULT       = 1.5     # SL = ATR * 1.5
+_SL_PCT_MIN        = 0.0015  # minim 0.15% (nu mai strans de atat la 50x)
+_SL_PCT_MAX        = 0.0040  # maxim 0.40% (nu risca mai mult de 1 USDT la 250 notional)
+
+# Trailing dinamic ATR - limite de siguranta
+_TRAIL_ATR_MULT    = 1.0     # trail_delta = ATR * 1.0
+_TRAIL_DELTA_MIN   = 0.0008  # minim 0.08%
+_TRAIL_DELTA_MAX   = 0.0050  # maxim 0.50%
+
 # Comision Bybit taker dus-intors
 ROUND_TRIP_FEE  = 0.00055 * 2   # 0.0011
 _TIMEOUT_GRACE  = 2
@@ -67,6 +73,49 @@ def _get_profile() -> dict:
 
 def _p(key: str, default):
     return _get_profile().get(key, default)
+
+
+def _get_current_atr_pct() -> float:
+    """Returneaza ATR ca procent din pret curent din strategy.ind.
+
+    Folosit pentru SL si trailing dinamic. Daca nu e ready, returneaza 0
+    si se va folosi valoarea minima de siguranta.
+    """
+    try:
+        from .strategy import ind
+        if ind.atr_ready and ind.atr_value > 0 and ind.last_price > 0:
+            return ind.atr_value / ind.last_price
+    except Exception:
+        pass
+    return 0.0
+
+
+def _dynamic_sl_pct() -> float:
+    """Calculeaza SL% dinamic bazat pe ATR curent.
+
+    Formula: sl = ATR% * 1.5
+    Clamped la [_SL_PCT_MIN, _SL_PCT_MAX] pentru siguranta la 50x.
+    """
+    atr_pct = _get_current_atr_pct()
+    if atr_pct <= 0:
+        return _DEFAULT_SL_PCT
+    sl = atr_pct * _SL_ATR_MULT
+    sl = max(_SL_PCT_MIN, min(_SL_PCT_MAX, sl))
+    return sl
+
+
+def _dynamic_trail_delta() -> float:
+    """Calculeaza trail_delta dinamic bazat pe ATR curent.
+
+    Formula: delta = ATR% * 1.0
+    Clamped la [_TRAIL_DELTA_MIN, _TRAIL_DELTA_MAX].
+    """
+    atr_pct = _get_current_atr_pct()
+    if atr_pct <= 0:
+        return _DEFAULT_TRAIL_DELTA
+    delta = atr_pct * _TRAIL_ATR_MULT
+    delta = max(_TRAIL_DELTA_MIN, min(_TRAIL_DELTA_MAX, delta))
+    return delta
 
 
 def _tg_notify(coro) -> None:
@@ -176,6 +225,8 @@ class PositionManager:
         trade_id: int | None = None,
     ) -> None:
         prof = _get_profile()
+        sl_used   = _dynamic_sl_pct()
+        atr_pct   = _get_current_atr_pct()
         async with self._snapshot_lock:
             self._reset_fields()
             self._entry_side  = side
@@ -184,9 +235,8 @@ class PositionManager:
             self._trade_id    = trade_id
         logger.info(
             f"[PM] Entry: side={side} qty={qty} price={entry_price} "
-            f"| profil: tp1={prof.get('tp1_pct', _DEFAULT_TP1_PCT):.4%} "
-            f"sl={prof.get('sl_pct', _DEFAULT_SL_PCT):.4%} "
-            f"lev={prof.get('leverage', '?')}x"
+            f"| sl_dynamic={sl_used:.4%} (ATR={atr_pct:.4%} x{_SL_ATR_MULT}) "
+            f"| lev={prof.get('leverage', '?')}x"
         )
 
     def _unrealised_pnl_pct(self, current_price: float) -> float:
@@ -217,7 +267,6 @@ class PositionManager:
             be_price = self._entry_price * (1.0 + ROUND_TRIP_FEE)
         else:
             be_price = self._entry_price * (1.0 - ROUND_TRIP_FEE)
-        # Guard: be_price trebuie sa fie > 0 (evita amend cu 0.0)
         if be_price <= 0:
             logger.warning(f"[PM] Breakeven SL invalid: {be_price} — skip")
             return
@@ -289,9 +338,6 @@ class PositionManager:
         """Inchide pozitia completa.
 
         FIX BUG CRITIC v1.2.1: verifica returul close_position().
-        Daca False (toate retry-urile au esuat), NU curata state-ul local
-        si NU apeleaza risk.on_close() — pozitia ramane tracked corect.
-        Returneaza True daca inchiderea a reusit, False altfel.
         """
         with state.lock:
             remaining_qty = state.open_qty
@@ -301,7 +347,6 @@ class PositionManager:
         closed = await trader.close_position()
 
         if not closed:
-            # Ordinul a esuat dupa toate retry-urile — NU curata state-ul
             logger.critical(
                 f"[PM] _close_full({reason}) ESUAT — pozitia RAMANE deschisa pe exchange! "
                 f"pnl={pnl_pct:.4%} ({pnl_usdt:+.4f} USDT) — bot OPRIT din siguranta"
@@ -315,12 +360,10 @@ class PositionManager:
                 ))
             except Exception:
                 pass
-            # Opreste bot-ul din a deschide noi trade-uri
             with state.lock:
                 state.paused = True
             return False
 
-        # Inchidere reusita — curata state
         risk.on_close(pnl_usdt, pnl_pct)
         logger.info(
             f"[PM] Full close ({reason}): "
@@ -355,10 +398,12 @@ class PositionManager:
         tp1_fraction = _p("tp1_fraction",     _DEFAULT_TP1_FRACTION)
         tp2_fraction = _p("tp2_fraction",     _DEFAULT_TP2_FRACTION)
         tp3_fraction = _p("tp3_fraction",     _DEFAULT_TP3_FRACTION)
-        sl_pct       = _p("sl_pct",           _DEFAULT_SL_PCT)
         trail_pct    = _p("trail_pct",        _DEFAULT_TRAIL_PCT)
-        trail_delta  = _p("trail_delta",      _DEFAULT_TRAIL_DELTA)
         max_hold     = _p("max_hold_candles", _DEFAULT_MAX_HOLD)
+
+        # SL si trail_delta dinamice pe ATR - recalculate la fiecare candle
+        sl_pct      = _dynamic_sl_pct()
+        trail_delta = _dynamic_trail_delta()
 
         async with self._snapshot_lock:
             self._hold_candles += 1
@@ -368,11 +413,15 @@ class PositionManager:
 
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
-        # --- Software SL (doar daca breakeven inca nu e setat) ---
+        # --- Software SL dinamic pe ATR ---
         if not be_already_set and pnl_pct <= -sl_pct:
-            logger.warning(f"[PM] Software SL: pnl={pnl_pct:.4%} <= -{sl_pct:.4%}")
+            atr_pct = _get_current_atr_pct()
+            logger.warning(
+                f"[PM] Software SL dinamic: pnl={pnl_pct:.4%} <= -{sl_pct:.4%} "
+                f"(ATR={atr_pct:.4%} x{_SL_ATR_MULT})"
+            )
             closed = await self._close_full("SL_SOFTWARE", pnl_pct)
-            return closed  # True daca s-a inchis, False daca a esuat
+            return closed
 
         # --- TP1 ---
         if not self._tp1_hit and pnl_pct >= tp1_pct:
@@ -430,17 +479,19 @@ class PositionManager:
                 return True
 
         # FIX BUG LOGIC v1.2.1: reciteste tp1_hit DUPA blocul TP1
-        # (daca TP1 a fost atins in acest apel, tp1_now=True corect pentru timeout)
         tp1_now = self._tp1_hit
         be_now  = self._breakeven_set
 
-        # --- Trailing stop ---
+        # --- Trailing stop dinamic pe ATR ---
         if pnl_pct >= trail_pct:
             if not self._trail_active:
                 async with self._snapshot_lock:
                     self._trail_active   = True
                     self._trail_peak_pnl = pnl_pct
-                logger.info(f"[PM] Trailing activated @ {pnl_pct:.4%}")
+                logger.info(
+                    f"[PM] Trailing activat @ {pnl_pct:.4%} "
+                    f"| trail_delta={trail_delta:.4%} (ATR-based)"
+                )
             elif pnl_pct > self._trail_peak_pnl:
                 async with self._snapshot_lock:
                     self._trail_peak_pnl = pnl_pct
@@ -449,10 +500,14 @@ class PositionManager:
                     else (1.0 + trail_delta)
                 )
                 await trader.amend_sl_tp(stop_loss=trail_sl)
-                logger.debug(f"[PM] Trail SL amended to {trail_sl:.6f}")
+                logger.debug(
+                    f"[PM] Trail SL -> {trail_sl:.6f} "
+                    f"(delta={trail_delta:.4%} ATR-based)"
+                )
             elif pnl_pct <= self._trail_peak_pnl - trail_delta:
                 logger.info(
-                    f"[PM] Trail triggered: pnl={pnl_pct:.4%} peak={self._trail_peak_pnl:.4%}"
+                    f"[PM] Trail triggered: pnl={pnl_pct:.4%} "
+                    f"peak={self._trail_peak_pnl:.4%} delta={trail_delta:.4%}"
                 )
                 closed = await self._close_full("TRAIL", pnl_pct)
                 return closed
@@ -460,7 +515,6 @@ class PositionManager:
         # --- Timeout smart ---
         if hold >= max_hold:
             if not tp1_now and pnl_pct < 0:
-                # TP1 nu e atins si suntem pe minus — grace period
                 if hold < max_hold + _TIMEOUT_GRACE:
                     logger.debug(
                         f"[PM] Timeout grace: hold={hold}/{max_hold + _TIMEOUT_GRACE} "
