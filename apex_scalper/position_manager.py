@@ -1,15 +1,14 @@
-"""Position Manager v1.0.2 — notify_tp/notify_sl/notify_close integrate.
+"""Position Manager v1.1.0 — TP/SL/Trail citite din profil per symbol.
 
 Changelog:
-  v1.0.2 — Telegram notificari complete:
-    - notify_sl()    apelata la Software SL si Trail triggered
-    - notify_tp(1/2) apelata la TP1/TP2 partial close
-    - notify_close() apelata la TP3 (trade complet), TRAIL, TIMEOUT
-    Toate apelurile sunt fire-and-forget (asyncio.ensure_future) ca sa nu
-    blocheze logica critica de close in caz ca Telegram e lent.
-  v0.9.4 — Improvement #2: pyramid margin check.
-  v0.8.6 — BUG 27+28 FIX.
-  v0.8.0 — BUG 1/2/5 FIX.
+  v1.1.0 — BUG CRITIC FIX:
+    TP1/TP2/TP3/SL/TRAIL_PCT/TRAIL_DELTA/MAX_HOLD_CANDLES/MAX_PYRAMID_ADDS
+    erau hardcodate cu valorile BTCUSDT. Acum sunt citite din
+    config.profile(config.symbol) la fiecare evaluate() si on_open().
+    Fara acest fix, DOGEUSDT iesea pe SL la 0.08% (BTC) in loc de 0.20%
+    si lua TP1 la 0.12% in loc de 0.30% -> trade-uri pierdute pe comision.
+  v1.0.2 — Telegram notificari complete.
+  v0.9.4 — pyramid margin check.
 """
 from __future__ import annotations
 
@@ -23,19 +22,19 @@ from .risk import risk
 from .persistence import db
 
 # --------------------------------------------------------------------------- #
-#  Parameters
+#  Parametri fallback (folositi daca profilul lipseste)
 # --------------------------------------------------------------------------- #
-TP1_PCT          = 0.0012
-TP2_PCT          = 0.0025
-TP3_PCT          = 0.0040
-TP1_FRACTION     = 0.25
-TP2_FRACTION     = 0.25
-TP3_FRACTION     = 0.50
-SL_PCT           = 0.0008
-TRAIL_PCT        = 0.0015
-TRAIL_DELTA      = 0.0006
-MAX_HOLD_CANDLES = 5
-MAX_PYRAMID_ADDS = 2
+_DEFAULT_TP1_PCT       = 0.0030
+_DEFAULT_TP2_PCT       = 0.0060
+_DEFAULT_TP3_PCT       = 0.0100
+_DEFAULT_TP1_FRACTION  = 0.40
+_DEFAULT_TP2_FRACTION  = 0.30
+_DEFAULT_TP3_FRACTION  = 0.30
+_DEFAULT_SL_PCT        = 0.0020
+_DEFAULT_TRAIL_PCT     = 0.0030
+_DEFAULT_TRAIL_DELTA   = 0.0010
+_DEFAULT_MAX_HOLD      = 4
+_DEFAULT_MAX_PYRAMID   = 0
 
 PYRAMID_SCORE_MIN      = 0.70
 PYRAMID_PNL_MIN        = 0.0010
@@ -43,9 +42,25 @@ PYRAMID_MARGIN_BUFFER  = 1.5
 CONFIRM_POLL_INTERVAL  = 0.5
 CONFIRM_POLL_MAX       = 8
 
+# Expus pentru import in strategy.py
+MAX_HOLD_CANDLES = _DEFAULT_MAX_HOLD
+
+
+def _get_profile() -> dict:
+    """Returneaza profilul activ pentru symbolul curent."""
+    try:
+        from .config import config
+        return config.profile(config.symbol)
+    except Exception:
+        return {}
+
+
+def _p(key: str, default):
+    """Citeste o valoare din profilul activ cu fallback la default."""
+    return _get_profile().get(key, default)
+
 
 def _tg_notify(coro) -> None:
-    """Fire-and-forget Telegram notify — nu blocheaza logica critica."""
     try:
         asyncio.ensure_future(coro)
     except Exception as e:
@@ -147,13 +162,19 @@ class PositionManager:
         entry_price: float,
         trade_id: int | None = None,
     ) -> None:
+        prof = _get_profile()
         async with self._snapshot_lock:
             self._reset_fields()
             self._entry_side  = side
             self._entry_qty   = qty
             self._entry_price = entry_price
             self._trade_id    = trade_id
-        logger.info(f"[PM] Entry: side={side} qty={qty} price={entry_price}")
+        logger.info(
+            f"[PM] Entry: side={side} qty={qty} price={entry_price} "
+            f"| profil: tp1={prof.get('tp1_pct', _DEFAULT_TP1_PCT):.4%} "
+            f"sl={prof.get('sl_pct', _DEFAULT_SL_PCT):.4%} "
+            f"lev={prof.get('leverage', '?')}x"
+        )
 
     def _unrealised_pnl_pct(self, current_price: float) -> float:
         if self._entry_price <= 0:
@@ -244,7 +265,6 @@ class PositionManager:
         async with self._snapshot_lock:
             self._reset_fields()
 
-        # Notificari Telegram fire-and-forget
         try:
             from .telegram_ui import notify_sl, notify_close
             if reason in ("SL_SOFTWARE", "SL_EXCHANGE"):
@@ -258,6 +278,18 @@ class PositionManager:
         if not state.open_position:
             return True
 
+        # Citeste parametri DIN PROFIL la fiecare evaluate
+        tp1_pct      = _p("tp1_pct",      _DEFAULT_TP1_PCT)
+        tp2_pct      = _p("tp2_pct",      _DEFAULT_TP2_PCT)
+        tp3_pct      = _p("tp3_pct",      _DEFAULT_TP3_PCT)
+        tp1_fraction = _p("tp1_fraction",  _DEFAULT_TP1_FRACTION)
+        tp2_fraction = _p("tp2_fraction",  _DEFAULT_TP2_FRACTION)
+        tp3_fraction = _p("tp3_fraction",  _DEFAULT_TP3_FRACTION)
+        sl_pct       = _p("sl_pct",        _DEFAULT_SL_PCT)
+        trail_pct    = _p("trail_pct",     _DEFAULT_TRAIL_PCT)
+        trail_delta  = _p("trail_delta",   _DEFAULT_TRAIL_DELTA)
+        max_hold     = _p("max_hold_candles", _DEFAULT_MAX_HOLD)
+
         async with self._snapshot_lock:
             self._hold_candles += 1
             hold = self._hold_candles
@@ -266,16 +298,16 @@ class PositionManager:
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
         # --- Software SL ---
-        if pnl_pct <= -SL_PCT:
+        if pnl_pct <= -sl_pct:
             logger.warning(
-                f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{SL_PCT:.4%}"
+                f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{sl_pct:.4%}"
             )
             await self._close_full("SL_SOFTWARE", pnl_pct)
             return True
 
         # --- TP1 ---
-        if not self._tp1_hit and pnl_pct >= TP1_PCT:
-            filled, qty_closed = await self._close_partial(TP1_FRACTION, "TP1")
+        if not self._tp1_hit and pnl_pct >= tp1_pct:
+            filled, qty_closed = await self._close_partial(tp1_fraction, "TP1")
             if filled:
                 async with self._snapshot_lock:
                     self._tp1_hit = True
@@ -289,8 +321,8 @@ class PositionManager:
                     logger.debug(f"[PM] tg notify_tp1 error: {e}")
 
         # --- TP2 ---
-        elif self._tp1_hit and not self._tp2_hit and pnl_pct >= TP2_PCT:
-            filled, qty_closed = await self._close_partial(TP2_FRACTION, "TP2")
+        elif self._tp1_hit and not self._tp2_hit and pnl_pct >= tp2_pct:
+            filled, qty_closed = await self._close_partial(tp2_fraction, "TP2")
             if filled:
                 async with self._snapshot_lock:
                     self._tp2_hit = True
@@ -303,9 +335,9 @@ class PositionManager:
                 except Exception as e:
                     logger.debug(f"[PM] tg notify_tp2 error: {e}")
 
-        # --- TP3 (trade complet) ---
-        elif self._tp2_hit and not self._tp3_hit and pnl_pct >= TP3_PCT:
-            filled, qty_closed = await self._close_partial(TP3_FRACTION, "TP3")
+        # --- TP3 ---
+        elif self._tp2_hit and not self._tp3_hit and pnl_pct >= tp3_pct:
+            filled, qty_closed = await self._close_partial(tp3_fraction, "TP3")
             if filled:
                 saved_entry = self._entry_price
                 saved_side  = self._entry_side
@@ -328,7 +360,7 @@ class PositionManager:
                 return True
 
         # --- Trailing stop ---
-        if pnl_pct >= TRAIL_PCT:
+        if pnl_pct >= trail_pct:
             if not self._trail_active:
                 async with self._snapshot_lock:
                     self._trail_active   = True
@@ -338,12 +370,12 @@ class PositionManager:
                 async with self._snapshot_lock:
                     self._trail_peak_pnl = pnl_pct
                 trail_sl = current_price * (
-                    (1 - TRAIL_DELTA) if self._entry_side == "long"
-                    else (1 + TRAIL_DELTA)
+                    (1 - trail_delta) if self._entry_side == "long"
+                    else (1 + trail_delta)
                 )
                 await trader.amend_sl_tp(stop_loss=trail_sl)
                 logger.debug(f"[PM] Trail SL amended to {trail_sl:.4f}")
-            elif pnl_pct <= self._trail_peak_pnl - TRAIL_DELTA:
+            elif pnl_pct <= self._trail_peak_pnl - trail_delta:
                 logger.info(
                     f"[PM] Trail triggered: pnl={pnl_pct:.4%} "
                     f"peak={self._trail_peak_pnl:.4%}"
@@ -352,8 +384,8 @@ class PositionManager:
                 return True
 
         # --- Timeout ---
-        if hold >= MAX_HOLD_CANDLES:
-            logger.info(f"[PM] Timeout ({MAX_HOLD_CANDLES} candles) — closing")
+        if hold >= max_hold:
+            logger.info(f"[PM] Timeout ({max_hold} candles) — closing")
             await self._close_full("TIMEOUT", pnl_pct)
             return True
 
@@ -367,8 +399,9 @@ class PositionManager:
         stop_loss: float,
         take_profit: float,
     ) -> None:
+        max_pyramid = _p("max_pyramid_adds", _DEFAULT_MAX_PYRAMID)
         async with self._snapshot_lock:
-            if self._pyramid_adds >= MAX_PYRAMID_ADDS:
+            if self._pyramid_adds >= max_pyramid:
                 return
             pnl_pct = self._unrealised_pnl_pct(price)
             if pnl_pct < PYRAMID_PNL_MIN:
@@ -390,20 +423,10 @@ class PositionManager:
         available_balance = await trader.get_balance()
 
         if available_balance < required_margin:
-            msg = (
-                f"\u26a0\ufe0f *Pyramid sarit — margin insuficient*\n"
-                f"Disponibil: `{available_balance:.2f} USDT`\n"
-                f"Necesar (1.5x): `{required_margin:.2f} USDT`"
-            )
             logger.warning(
                 f"[PM] Pyramid skipped — balance={available_balance:.2f} "
                 f"< required={required_margin:.2f} USDT"
             )
-            try:
-                from .telegram_ui import send_message
-                _tg_notify(send_message(msg))
-            except Exception:
-                pass
             return
 
         bybit_side = self._bybit_side(side, closing=False)
