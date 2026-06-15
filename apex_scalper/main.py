@@ -1,12 +1,13 @@
-"""Entrypoint v0.9.6.
+"""Entrypoint v0.9.8.
 
 Changelog:
-  v0.9.6 — db.run_maintenance() apelat in _midnight_reset_loop.
-    Improvement #6 complet: VACUUM complet + cleanup records vechi
-    ruleaza automat la UTC midnight, o data pe zi.
+  v0.9.8 — warmup_indicators() la startup: descarca 60 candle-uri istorice
+    via Bybit REST si populeaza toti indicatorii inainte de pornirea feed-ului.
+    Fix: botul era in warmup ~50 minute dupa fiecare restart (EMA50 = 50 candle).
+    Acum: indicatorii sunt ready in <1s de la startup, intrari posibile imediat.
+  v0.9.6 — db.run_maintenance() in midnight reset loop.
   v0.9.4 — Improvement #10: graceful shutdown cu confirmare.
   v0.9.3 — config.validate() fail-fast la startup.
-  v0.8.8 — BUG 35/36 fix.
 """
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ from .pulse import run_pulse_loop
 from .health import start_health_server
 from .log_sink import setup_json_sink
 from .strategy import set_main_loop
+from .indicator_warmup import warmup_indicators
 
 SHUTDOWN_CLOSE_TIMEOUT = 15.0
 
@@ -137,9 +139,6 @@ async def _midnight_reset_loop() -> None:
             state.win_trades   = 0
         logger.info("Daily counters reset at UTC midnight (pnl + trades + wins)")
 
-        # Improvement #6: DB maintenance o data pe zi la midnight.
-        # VACUUM complet + stergere records mai vechi de 90 zile (trades)
-        # si 30 zile (metrics_snapshot). Rulat in executor pentru a nu bloca event loop-ul.
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, db.run_maintenance)
@@ -224,7 +223,7 @@ async def main() -> None:
     config.validate()
 
     logger.info(
-        f"\u26a1 Apex Scalper v0.9.6 | {config.symbol} | "
+        f"\u26a1 Apex Scalper v0.9.8 | {config.symbol} | "
         f"{'TESTNET' if config.testnet else chr(9888)+' MAINNET'} | "
         f"lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
@@ -250,6 +249,9 @@ async def main() -> None:
         logger.info(f"MTF ready: EMA50(15m)={mtf.ema50:.4f}")
     else:
         logger.warning("MTF fetch failed \u2014 entries BLOCKED until first successful refresh.")
+
+    # v0.9.8: Pre-incarca indicatorii din date istorice — ready imediat la startup
+    await warmup_indicators(config.symbol)
 
     start_health_server()
 
@@ -283,7 +285,7 @@ async def main() -> None:
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True \u2014 strategy v0.9.6 active\n"
+        f"state.running = True \u2014 strategy v0.9.8 active\n"
         f"  JSON logs:   logs/apex_structured.jsonl\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"
