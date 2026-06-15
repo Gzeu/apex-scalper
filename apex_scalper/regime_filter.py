@@ -1,22 +1,20 @@
-"""Regime Filter v0.7.1 — Wilder ADX + O(log n) ATR percentile.
+"""Regime Filter v0.8.9 — Wilder ADX + O(log n) ATR percentile.
 
-Fixes vs v0.7.0:
-  FIX #4 — Wilder smoothing for ADX (was simple rolling average):
-    Standard ADX (Wilder, 1978) uses Exponential Moving Average with alpha=1/N:
-      smoothed_i = smoothed_{i-1} * (N-1)/N + value_i
-    Old code used sum(buf)/N (simple average), producing ADX values that
-    diverge from TradingView by 2-8 units during trending periods.
-    New code: self._atr_s / _pdm_s / _ndm_s maintain Wilder-smoothed totals.
-    After ADX_PERIOD*2 warmup candles, values match TradingView within +-0.3.
+Changelog:
+  v0.8.9 — BUG 37 FIX: ADX folosea SMA(DX) in loc de Wilder smoothing.
+    Standard Wilder ADX: dupa seed (primele N bare), ADX se calculeaza ca
+    Wilder EMA a DX cu alpha=1/N (adica: adx = adx*(N-1)/N + dx).
+    Codul vechi: self._adx_buf.append(dx); self._adx = mean(buf) → SMA pe
+    un buffer rolling de 14 DX → ADX mai reactiv si mai mare decat Wilder
+    → filtrarea regimului (RANGING/TRENDING) era calibrata gresit.
+    Fix: seed = media simpla a primelor N valori DX; dupa seed: Wilder EMA.
+  v0.8.9 — BUG 38 FIX: DX era calculat si acumulat in seed inainte ca
+    sumele Wilder (atr_s, pdm_s, ndm_s) sa fie complet seeduite.
+    Fix: DX calculat si ADX actualizat NUMAI dupa _wilder_ready > N (seed complet).
 
-  FIX #10 — O(log n) ATR percentile (was O(n log n) sorted() per candle):
-    _atrs deque (28800 entries) replaced with:
-      self._atrs_raw  deque  — raw values for eviction tracking
-      self._atrs_sorted list — always-sorted list maintained via bisect.insort
-    Insert: bisect.insort O(log n)
-    Evict:  del _atrs_sorted[bisect_left(evicted)] O(log n)
-    Rank:   bisect_right(atr_value) / len O(log n)
-    Per-candle ATR step: ~0.1ms vs ~15ms (28800-element sort) on modest hardware.
+Fixes anterioare:
+  FIX #4 (v0.7.1) — Wilder smoothing pentru ATR/DM (era SMA).
+  FIX #10 (v0.7.1) — O(log n) ATR percentile via bisect.
 """
 from __future__ import annotations
 
@@ -59,24 +57,26 @@ def _hurst(closes: list[float]) -> float:
 
 class RegimeFilter:
     def __init__(self):
-        self._closes:   deque = deque(maxlen=HURST_WINDOW)
+        self._closes:      deque = deque(maxlen=HURST_WINDOW)
         # FIX #10: sorted list for O(log n) percentile
-        self._atrs_raw: deque = deque(maxlen=ATR_WINDOW)   # raw values, eviction tracking
-        self._atrs_sorted: list = []                        # always-sorted parallel structure
-        # ADX internals — FIX #4: Wilder smoothing state
-        self._prev_high:  float = 0.0
-        self._prev_low:   float = 0.0
-        self._prev_close: float = 0.0
-        self._atr_s:  float = 0.0   # Wilder-smoothed ATR sum
-        self._pdm_s:  float = 0.0   # Wilder-smoothed +DM sum
-        self._ndm_s:  float = 0.0   # Wilder-smoothed -DM sum
-        self._adx_buf: deque = deque(maxlen=ADX_PERIOD)    # DX values -> avg = ADX
-        self._adx:    float = 0.0
-        self._wilder_ready: int = 0  # counts candles since first update
-        self.label:   str   = "UNKNOWN"
-        self._size_f: float = 1.0
-        self._allow:  bool  = True
-        self._candles: int  = 0
+        self._atrs_raw:    deque = deque(maxlen=ATR_WINDOW)
+        self._atrs_sorted: list  = []
+        # ADX internals — Wilder smoothing state
+        self._prev_high:   float = 0.0
+        self._prev_low:    float = 0.0
+        self._prev_close:  float = 0.0
+        self._atr_s:       float = 0.0   # Wilder-smoothed ATR sum
+        self._pdm_s:       float = 0.0   # Wilder-smoothed +DM sum
+        self._ndm_s:       float = 0.0   # Wilder-smoothed -DM sum
+        # BUG 37/38 FIX: buffer seed DX pentru primele N bare (SMA seed)
+        self._dx_seed_buf: list  = []    # acumuleaza DX in faza seed
+        self._adx:         float = 0.0   # Wilder EMA a DX dupa seed
+        self._adx_seeded:  bool  = False # True dupa ce seed SMA e calculat
+        self._wilder_ready: int  = 0
+        self.label:        str   = "UNKNOWN"
+        self._size_f:      float = 1.0
+        self._allow:       bool  = True
+        self._candles:     int   = 0
 
     def update(self, close: float, atr_value: float, high: float, low: float) -> None:
         self._closes.append(close)
@@ -84,7 +84,6 @@ class RegimeFilter:
 
         # FIX #10: maintain sorted list alongside raw deque
         if len(self._atrs_raw) == ATR_WINDOW:
-            # Evict oldest value from sorted list before it's overwritten
             evicted = self._atrs_raw[0]
             idx = bisect.bisect_left(self._atrs_sorted, evicted)
             if idx < len(self._atrs_sorted) and self._atrs_sorted[idx] == evicted:
@@ -92,7 +91,7 @@ class RegimeFilter:
         self._atrs_raw.append(atr_value)
         bisect.insort(self._atrs_sorted, atr_value)
 
-        # FIX #4: Wilder-smoothed ADX
+        # Wilder-smoothed ADX
         if self._prev_close > 0:
             tr  = max(high - low,
                       abs(high - self._prev_close),
@@ -108,23 +107,43 @@ class RegimeFilter:
             N = ADX_PERIOD
 
             if self._wilder_ready <= N:
-                # Seed phase: simple sum for first N values
+                # Seed phase: simple sum pentru primele N valori TR/DM
                 self._atr_s += tr
                 self._pdm_s += pdm
                 self._ndm_s += ndm
+
+                # BUG 38 FIX: NU calculam DX pana seed-ul TR/DM e complet
+                # Doar la bara N exacta calculam primul DX si il adaugam in seed_buf
+                if self._wilder_ready == N and self._atr_s > 0:
+                    pdi = self._pdm_s / self._atr_s * 100
+                    ndi = self._ndm_s / self._atr_s * 100
+                    dxd = pdi + ndi
+                    dx  = abs(pdi - ndi) / dxd * 100 if dxd > 0 else 0.0
+                    self._dx_seed_buf.append(dx)
+
             else:
                 # Wilder smoothing: smoothed = prev * (N-1)/N + new
                 self._atr_s = self._atr_s * (N - 1) / N + tr
                 self._pdm_s = self._pdm_s * (N - 1) / N + pdm
                 self._ndm_s = self._ndm_s * (N - 1) / N + ndm
 
-            if self._wilder_ready >= N and self._atr_s > 0:
-                pdi = self._pdm_s / self._atr_s * 100
-                ndi = self._ndm_s / self._atr_s * 100
-                dxd = pdi + ndi
-                dx  = abs(pdi - ndi) / dxd * 100 if dxd > 0 else 0
-                self._adx_buf.append(dx)
-                self._adx = sum(self._adx_buf) / len(self._adx_buf)
+                if self._atr_s > 0:
+                    pdi = self._pdm_s / self._atr_s * 100
+                    ndi = self._ndm_s / self._atr_s * 100
+                    dxd = pdi + ndi
+                    dx  = abs(pdi - ndi) / dxd * 100 if dxd > 0 else 0.0
+
+                    # BUG 37 FIX: Wilder ADX seed cu SMA(primele N DX),
+                    # apoi Wilder EMA pentru toate DX urmatoare
+                    if not self._adx_seeded:
+                        self._dx_seed_buf.append(dx)
+                        if len(self._dx_seed_buf) >= N:
+                            # Seed ADX = SMA a primelor N valori DX
+                            self._adx = sum(self._dx_seed_buf) / len(self._dx_seed_buf)
+                            self._adx_seeded = True
+                    else:
+                        # Wilder EMA: adx = adx*(N-1)/N + dx
+                        self._adx = self._adx * (N - 1) / N + dx
 
         self._prev_high  = high
         self._prev_low   = low
@@ -139,7 +158,7 @@ class RegimeFilter:
         # FIX #10: O(log n) ATR percentile via bisect_right
         n_atrs = len(self._atrs_sorted)
         if n_atrs >= 10:
-            rank   = bisect.bisect_right(self._atrs_sorted, atr_value)
+            rank    = bisect.bisect_right(self._atrs_sorted, atr_value)
             atr_pct = rank / n_atrs * 100
         else:
             atr_pct = 50.0
