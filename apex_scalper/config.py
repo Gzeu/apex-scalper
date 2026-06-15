@@ -1,15 +1,19 @@
-"""Settings loader v0.9.2 — Improvement #7: fail-fast validation la startup.
+"""Settings loader v0.9.3 — DOGEUSDT recalibrat pentru cont mic.
 
 Changelog:
-  v0.9.2 — Improvement #7: Config.validate() adaugat.
-    Vechi: daca BYBIT_API_KEY / BYBIT_API_SECRET lipseau, botul pornea normal
-    si crasha abia la primul apel API cu KeyError sau AuthenticationError.
-    Nou: Config.validate() apelat in main() inainte de orice altceva.
-    La validare esuata: mesaj clar cu variabilele lipsa + sys.exit(1).
-    Valideaza si: TELEGRAM_TOKEN format, LEVERAGE range, ORDER_SIZE_USDT > 0,
-    BYBIT_TESTNET valoare recunoscuta.
-
-v0.7.1: All profiles updated with tp3_pct, TP1/2/3 fractions, MAX_PYRAMID_ADDS.
+  v0.9.3 — DOGEUSDT profil recalibrat:
+    - leverage: 5→10 (safe pentru cont 5-10$, lichidare la ~10% move)
+    - order_size_usdt: 10→5 (50 USDT notional, ~560 DOGE qty, peste minim Bybit)
+    - daily_loss_limit_usdt: 25→2 (max 40% din cont/zi)
+    - tp1_pct: 0.0018→0.0030 (0.30% - acoperit comision 0.11% + profit net)
+    - tp2_pct: 0.0040→0.0060
+    - tp3_pct: 0.0065→0.0100
+    - sl_pct: 0.0012→0.0020 (mai putin sens, DOGE face 0.5% intr-un minut)
+    - entry_threshold: 0.68→0.62 (realist cu indicatori in warmup)
+    - vol_zscore_min: 0.5→0.0 (nu bloca pe volum scazut)
+    - bp_base_threshold: 5000→3000 (mai usor de atins pe DOGE)
+    - max_pyramid_adds: 0 (nu adauga la pozitie cu cont mic)
+  v0.9.2 — Config.validate() adaugat.
 """
 from __future__ import annotations
 
@@ -150,37 +154,43 @@ SYMBOL_PROFILES: dict[str, dict] = {
         "wall_distance_ticks":  3,
     },
     "DOGEUSDT": {
-        "leverage":             5,
-        "order_size_usdt":      10,
-        "daily_loss_limit_usdt": 25.0,
-        "tp1_pct":              0.0018,
-        "tp2_pct":              0.0040,
-        "tp3_pct":              0.0065,
-        "tp1_fraction":         0.25,
-        "tp2_fraction":         0.25,
-        "tp3_fraction":         0.50,
-        "sl_pct":               0.0012,
-        "trail_pct":            0.0020,
-        "trail_delta":          0.0008,
+        # --- Calibrat pentru cont mic (5-10 USDT disponibil) ---
+        # 5 USDT x 10x = 50 USDT notional / 0.089 = ~560 DOGE (peste minim Bybit)
+        # Comision dus-intors: 0.11% = 0.055 USDT
+        # TP1 la 0.30% = 0.15 USDT brut -> 0.095 USDT net dupa comision
+        # SL la 0.20% = 0.10 USDT risc per trade = 2% din cont
+        # daily_loss_limit = 2 USDT = max 2 SL consecutive
+        "leverage":             10,
+        "order_size_usdt":      5,
+        "daily_loss_limit_usdt": 2.0,
+        "tp1_pct":              0.0030,
+        "tp2_pct":              0.0060,
+        "tp3_pct":              0.0100,
+        "tp1_fraction":         0.40,
+        "tp2_fraction":         0.30,
+        "tp3_fraction":         0.30,
+        "sl_pct":               0.0020,
+        "trail_pct":            0.0030,
+        "trail_delta":          0.0010,
         "max_hold_candles":     4,
         "max_pyramid_adds":     0,
         "max_spread_bps":       6.0,
         "base_spread_bps":      6.0,
         "atr_spread_mult":      2.5,
         "atr_baseline":         0.0015,
-        "min_bid_depth":        5000.0,
-        "min_ask_depth":        5000.0,
+        "min_bid_depth":        1000.0,
+        "min_ask_depth":        1000.0,
         "atr_min_pct":          0.0004,
-        "atr_max_pct":          0.008,
+        "atr_max_pct":          0.010,
         "rsi_long_min":         54.0,
         "rsi_short_max":        46.0,
         "rsi_ob_penalty":       68.0,
         "rsi_os_penalty":       32.0,
-        "imbalance_long":       0.15,
-        "imbalance_short":      -0.15,
-        "entry_threshold":      0.68,
-        "vol_zscore_min":       0.5,
-        "bp_base_threshold":    5_000.0,
+        "imbalance_long":       0.10,
+        "imbalance_short":      -0.10,
+        "entry_threshold":      0.62,
+        "vol_zscore_min":       0.0,
+        "bp_base_threshold":    3_000.0,
         "bp_absorption_ratio":  2.0,
         "adx_trending_min":     20.0,
         "adx_ranging_max":      15.0,
@@ -255,62 +265,36 @@ class Config:
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
     def validate(self) -> None:
-        """Fail-fast validation la startup. Apeleaza inainte de orice altceva in main().
-
-        Improvement #7: botul nu mai porneste cu config invalida si nu mai
-        crasha dupa 10-30s cu erori criptice la primul apel API.
-        """
         errors: list[str] = []
-
-        # Credentiale obligatorii
         if not self.api_key:
             errors.append("BYBIT_API_KEY lipseste sau e goala")
         elif len(self.api_key) < 10:
             errors.append(f"BYBIT_API_KEY pare invalida (prea scurta: {len(self.api_key)} chars)")
-
         if not self.api_secret:
             errors.append("BYBIT_API_SECRET lipseste sau e goala")
         elif len(self.api_secret) < 10:
             errors.append(f"BYBIT_API_SECRET pare invalida (prea scurta: {len(self.api_secret)} chars)")
-
-        # Leverage sanity check
         if not (1 <= self.leverage <= 100):
             errors.append(f"LEVERAGE={self.leverage} invalid (trebuie 1-100)")
-
-        # Order size
         if self.order_size_usdt <= 0:
             errors.append(f"ORDER_SIZE_USDT={self.order_size_usdt} invalid (trebuie > 0)")
-
-        # Symbol valid
         all_symbols = self.active_symbols()
         for sym in all_symbols:
             if not sym.endswith("USDT"):
                 errors.append(f"Symbol '{sym}' pare invalid (trebuie sa se termine in USDT)")
-
-        # Telegram partial config (avertisment, nu eroare fatala)
         if self.telegram_token and not self.telegram_chat_id:
             logger.warning(
                 "TELEGRAM_TOKEN setat dar TELEGRAM_CHAT_ID lipseste — "
                 "comenzile Telegram nu vor functiona corect."
             )
-
-        # BYBIT_TESTNET valoare recunoscuta
         raw_testnet = os.getenv("BYBIT_TESTNET", "true").lower()
         if raw_testnet not in ("true", "false", "1", "0", "yes", "no"):
-            errors.append(
-                f"BYBIT_TESTNET='{raw_testnet}' necunoscut (foloseste: true/false)"
-            )
-
+            errors.append(f"BYBIT_TESTNET='{raw_testnet}' necunoscut (foloseste: true/false)")
         if errors:
             logger.error("\u274c Config invalida — bot-ul nu poate porni:")
             for err in errors:
-                logger.error(f"  • {err}")
-            logger.error(
-                "Seteaza variabilele lipsa in .env sau ca environment variables "
-                "si reporneste botul."
-            )
+                logger.error(f"  \u2022 {err}")
             sys.exit(1)
-
         env_label = "TESTNET" if self.testnet else "\u26a0\ufe0f  MAINNET"
         logger.info(
             f"\u2705 Config valid: symbol={'/'.join(all_symbols)} "
