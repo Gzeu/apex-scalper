@@ -1,14 +1,14 @@
-"""Entrypoint v0.9.3.
+"""Entrypoint v0.9.4.
 
 Changelog:
-  v0.9.3 — config.validate() apelat inainte de orice altceva in main().
-    Improvement #7: botul nu mai porneste cu BYBIT_API_KEY/SECRET lipsa
-    sau parametri invalizi. Mesaj clar + sys.exit(1) la startup.
-  v0.8.8 — BUG 35: set_main_loop() apelat dupa get_running_loop().
-  v0.8.8 — BUG 36: version string actualizat.
-  v0.8.6 — Bug 25-29 fix.
-  v0.8.2 — BUG 13 FIX: _midnight_reset_loop() reset total_trades/win_trades.
-  v0.7.8 — log_sink.py: structured JSON logs.
+  v0.9.4 — Improvement #10: graceful shutdown confirma inchiderea pozitiei
+    inainte de loop.stop(). Vechi: _shutdown() apela trader.close_position()
+    dar nu astepta confirmarea de la exchange -> la SIGTERM rapid, pozitia
+    putea ramane deschisa. Nou: close_position() returneaza bool (v0.9.2);
+    _shutdown() asteapta True sau logeaza CRITICAL cu alerta Telegram.
+    Timeout de 15s pentru inchidere, dupa care forteaza oprirea.
+  v0.9.3 — config.validate() fail-fast la startup.
+  v0.8.8 — BUG 35/36 fix.
 """
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ from .pulse import run_pulse_loop
 from .health import start_health_server
 from .log_sink import setup_json_sink
 from .strategy import set_main_loop
+
+SHUTDOWN_CLOSE_TIMEOUT = 15.0  # secunde max asteptare confirmare inchidere pozitie
 
 
 def setup_logging() -> None:
@@ -138,12 +140,48 @@ async def _midnight_reset_loop() -> None:
 
 
 async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
-    logger.warning("\U0001f6d1 Shutdown — closing position if open...")
+    """Graceful shutdown cu confirmare inchidere pozitie.
+
+    Improvement #10: asteapta confirmarea ca pozitia a fost inchisa pe exchange
+    inainte de loop.stop(). Daca close_position() returneaza False sau
+    timeout-ul de SHUTDOWN_CLOSE_TIMEOUT secunde e depasit, logeaza CRITICAL
+    si trimite alert Telegram — pozitia poate fi inca deschisa pe exchange.
+    """
+    logger.warning("\U0001f6d1 Shutdown initiata — astept inchiderea pozitiei...")
     state.running = False
-    try:
-        await trader.close_position(use_limit=False)
-    except Exception as e:
-        logger.error(f"Shutdown close_position error: {e}")
+
+    with state.lock:
+        has_position = bool(state.open_position)
+        pos_side     = state.open_position
+        pos_qty      = state.open_qty
+        pos_entry    = state.open_entry
+
+    if has_position:
+        logger.warning(
+            f"Shutdown: pozitie activa detectata — "
+            f"{pos_side} qty={pos_qty} entry={pos_entry} — inchidere fortata..."
+        )
+        try:
+            closed = await asyncio.wait_for(
+                trader.close_position(use_limit=False),
+                timeout=SHUTDOWN_CLOSE_TIMEOUT,
+            )
+            if closed:
+                logger.info("Shutdown: pozitia inchisa cu succes \u2705")
+            else:
+                _alert_shutdown_failure(pos_side, pos_qty, pos_entry)
+        except asyncio.TimeoutError:
+            logger.critical(
+                f"Shutdown: TIMEOUT {SHUTDOWN_CLOSE_TIMEOUT}s depasit — "
+                f"pozitia {pos_side} qty={pos_qty} POATE FI INCA DESCHISA!"
+            )
+            _alert_shutdown_failure(pos_side, pos_qty, pos_entry, timeout=True)
+        except Exception as e:
+            logger.error(f"Shutdown close_position error: {e}")
+            _alert_shutdown_failure(pos_side, pos_qty, pos_entry)
+    else:
+        logger.info("Shutdown: fara pozitie activa — oprire curata.")
+
     if tg_app:
         try:
             await tg_app.updater.stop()
@@ -151,6 +189,7 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
             await tg_app.shutdown()
         except Exception:
             pass
+
     tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
     for t in tasks:
         t.cancel()
@@ -158,16 +197,33 @@ async def _shutdown(loop: asyncio.AbstractEventLoop, tg_app=None) -> None:
     loop.stop()
 
 
+def _alert_shutdown_failure(
+    side: str, qty: float, entry: float, timeout: bool = False
+) -> None:
+    reason = f"TIMEOUT {SHUTDOWN_CLOSE_TIMEOUT}s" if timeout else "close_position ESUAT"
+    msg = (
+        f"\U0001f6a8 *CRITIC — Shutdown incomplet!*\n"
+        f"Reason: `{reason}`\n"
+        f"Pozitie: `{side} qty={qty} entry={entry}`\n"
+        f"Verifica manual pe Bybit — pozitia poate fi INCA DESCHISA!"
+    )
+    logger.critical(msg)
+    try:
+        import asyncio as _asyncio
+        from .telegram_ui import send_message
+        loop = _asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(send_message(msg))
+    except Exception:
+        pass
+
+
 async def main() -> None:
     setup_logging()
-
-    # Improvement #7: fail-fast — verifica config inainte de orice altceva.
-    # Daca BYBIT_API_KEY/SECRET lipsesc sau parametrii sunt invalizi,
-    # botul se opreste imediat cu mesaj clar in loc sa crape dupa 30s.
     config.validate()
 
     logger.info(
-        f"\u26a1 Apex Scalper v0.9.3 | {config.symbol} | "
+        f"\u26a1 Apex Scalper v0.9.4 | {config.symbol} | "
         f"{'TESTNET' if config.testnet else chr(9888)+' MAINNET'} | "
         f"lev={config.leverage}x size={config.order_size_usdt}USDT"
     )
@@ -226,8 +282,8 @@ async def main() -> None:
     with state.lock:
         state.running = True
     logger.info(
-        f"state.running = True — strategy v0.9.3 active\n"
-        f"  JSON logs:   logs/apex_structured.jsonl (jq parsabil)\n"
+        f"state.running = True — strategy v0.9.4 active\n"
+        f"  JSON logs:   logs/apex_structured.jsonl\n"
         f"  Pulse:       fiecare {__import__('os').getenv('PULSE_INTERVAL_S', '60')}s pe Telegram\n"
         f"  Health:      http://localhost:8080/health\n"
         f"  Scale-out:   TP1={pm_info()} | Kelly active after 20 trades"

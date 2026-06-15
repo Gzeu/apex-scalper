@@ -1,33 +1,19 @@
-"""Position Manager v0.8.6 — Bug 27-28 fix.
+"""Position Manager v0.9.4 — Improvement #2: pyramid margin check.
 
 Changelog:
-  v0.8.6 — BUG 27 FIX: SL software adaugat in evaluate().
-    evaluate() verifica TP1/TP2/TP3/trail/timeout dar NICAIERI nu era:
-      if pnl_pct <= -SL_PCT: await _close_full('SL', pnl_pct)
-    Singura protectie SL era parametrul stopLoss la place_order() pe exchange.
-    Daca exchange SL nu era setat corect (ex. pyramid add cu stop_loss=0),
-    pozitia se tinea la pierdere nelimitata pana la TIMEOUT.
-    Fix: check pnl_pct <= -SL_PCT la INCEPUTUL evaluate(), inainte de TP checks.
-  v0.8.6 — BUG 28 FIX: _close_full() reseteaza explicit state.open_qty=0 si
-    state.open_entry=0. Daca close_position() esua partial si Market pica,
-    state.open_qty > 0 ramanea in state cu open_position=None -> bloca intrari noi.
-  v0.8.0 — BUG FIXES:
-    BUG 1: on_open() acum async + achizitioneaza _snapshot_lock la scriere.
-    BUG 2: TP3 reset() mutat DUPA calculul pnl_usdt.
-    BUG 5: pnl_pct calculat o singura data, consistent, fara double-read.
-  v0.7.9 — race-condition fix pentru pulse snapshot (PositionSnapshot + lock).
-  v0.7.3 — Interface alignment (all AttributeErrors eliminated).
-  v0.7.2 — _api_call_with_retry import fix.
-  v0.7.1 — fill confirmation via get_order_history poll.
-
-Interfaces consumed (verified against source):
-  trader.place_order(side, qty, order_type, post_only, price, reduce_only)
-  trader.amend_sl_tp(sym, stop_loss)
-  trader.close_position()
-  risk.calc_qty(price, order_size_usdt, leverage, regime_factor)
-  risk.on_close(pnl_usdt, pnl_pct)
-  strategy.py calls: await on_open(side, qty, price), evaluate(price) -> bool,
-                     try_pyramid(side, price, score, sl, tp)
+  v0.9.4 — Improvement #2: try_pyramid() verifica margin disponibil inainte
+    de a plasa al doilea ordin.
+    Vechi: MAX_PYRAMID_ADDS limita numarul de adaugiri dar nu verifica daca
+    exista margin suficient. La 100x leverage, un al doilea ordin de 20 USDT
+    necesita cel putin 20 USDT margin liber; daca nu exista, exchange-ul
+    respinge ordinul cu 'insufficient balance' sau mai rau: margin call instant.
+    Nou: inainte de place_order(), get_balance() e apelat.
+    Daca balance < order_size_usdt * PYRAMID_MARGIN_BUFFER (1.5x safety),
+    pyramid-ul e sarit cu log WARNING si mesaj Telegram.
+  v0.8.6 — BUG 27 FIX: Software SL in evaluate().
+  v0.8.6 — BUG 28 FIX: _close_full() reseteaza explicit state.open_qty.
+  v0.8.0 — BUG 1/2/5 FIX.
+  v0.7.9 — race-condition fix (PositionSnapshot + lock).
 """
 from __future__ import annotations
 
@@ -41,7 +27,7 @@ from .risk import risk
 from .persistence import db
 
 # --------------------------------------------------------------------------- #
-#  Parameters (all overrideable via /setparam or ENV)                         #
+#  Parameters                                                                  #
 # --------------------------------------------------------------------------- #
 TP1_PCT          = 0.0012
 TP2_PCT          = 0.0025
@@ -57,16 +43,13 @@ MAX_PYRAMID_ADDS = 2
 
 PYRAMID_SCORE_MIN      = 0.70
 PYRAMID_PNL_MIN        = 0.0010
+PYRAMID_MARGIN_BUFFER  = 1.5   # safety factor: balance trebuie sa fie >= cost * 1.5
 CONFIRM_POLL_INTERVAL  = 0.5
 CONFIRM_POLL_MAX       = 8
 
 
 @dataclass
 class PositionSnapshot:
-    """Immutable snapshot al starii PositionManager, citit atomic sub lock.
-
-    Consumat de pulse.py si telegram_ui /tp pentru a evita race conditions.
-    """
     entry_price:  float
     entry_side:   str
     entry_qty:    float
@@ -80,7 +63,6 @@ class PositionSnapshot:
     trade_id:     int | None
 
     def unrealised_pnl_pct(self, current_price: float) -> float:
-        """Calculeaza PnL% din snapshot — safe, entry_price verificat."""
         if self.entry_price <= 0:
             return 0.0
         if self.entry_side == "long":
@@ -89,11 +71,6 @@ class PositionSnapshot:
 
 
 async def _confirm_order_filled(order_id: str, sym: str) -> bool:
-    """Poll get_order_history until Filled or poll limit exceeded.
-
-    v0.7.2 fix: uses module-level _api_call_with_retry (not trader._api_call).
-    v0.7.1 fix: never assumes fill from retCode==0 alone.
-    """
     for _ in range(CONFIRM_POLL_MAX):
         await asyncio.sleep(CONFIRM_POLL_INTERVAL)
         try:
@@ -113,15 +90,6 @@ async def _confirm_order_filled(order_id: str, sym: str) -> bool:
 
 
 class PositionManager:
-    """Manages an open position: TP scale-out, trailing SL, timeout, pyramid.
-
-    Public interface (matches strategy.py calls exactly):
-      await on_open(side, qty, entry_price, trade_id=None)  <- called at entry
-      evaluate(price) -> bool                               <- called every candle
-      try_pyramid(side, price, score, sl, tp)               <- called by strategy
-      snapshot() -> PositionSnapshot                        <- atomic read for pulse
-    """
-
     def __init__(self):
         self._tp1_hit        = False
         self._tp2_hit        = False
@@ -137,7 +105,6 @@ class PositionManager:
         self._snapshot_lock  = asyncio.Lock()
 
     def _reset_fields(self) -> None:
-        """Reset intern — apelat NUMAI sub _snapshot_lock."""
         self._tp1_hit        = False
         self._tp2_hit        = False
         self._tp3_hit        = False
@@ -150,15 +117,10 @@ class PositionManager:
         self._entry_side     = ""
         self._trade_id       = None
 
-    # v0.7.x legacy alias — intern, sub lock
     def reset(self) -> None:
         self._reset_fields()
 
     async def snapshot(self) -> PositionSnapshot:
-        """Returneaza un snapshot imutabil al starii curente, atomic sub lock.
-
-        Singura interfata publica pentru citire din afara clasei (pulse, /tp).
-        """
         async with self._snapshot_lock:
             return PositionSnapshot(
                 entry_price  = self._entry_price,
@@ -181,26 +143,13 @@ class PositionManager:
         entry_price: float,
         trade_id: int | None = None,
     ) -> None:
-        """Record entry. Called by strategy.py after fill confirmed.
-
-        v0.8.0 BUG 1 FIX: acum async + achizitioneaza _snapshot_lock.
-          Elimina race window unde pulse vedea entry_price=0 / side=''
-          intre (A: on_open apelat) si (B: state.open_position setat).
-        v0.7.3: renamed from on_entry() to on_open().
-        """
         async with self._snapshot_lock:
             self._reset_fields()
             self._entry_side  = side
             self._entry_qty   = qty
             self._entry_price = entry_price
             self._trade_id    = trade_id
-        logger.info(
-            f"[PM] Entry: side={side} qty={qty} price={entry_price}"
-        )
-
-    # ------------------------------------------------------------------ #
-    #  Internal helpers                                                    #
-    # ------------------------------------------------------------------ #
+        logger.info(f"[PM] Entry: side={side} qty={qty} price={entry_price}")
 
     def _unrealised_pnl_pct(self, current_price: float) -> float:
         if self._entry_price <= 0:
@@ -210,11 +159,6 @@ class PositionManager:
         return (self._entry_price - current_price) / self._entry_price
 
     def _pnl_usdt(self, pnl_pct: float, qty: float, entry_price: float | None = None) -> float:
-        """Calculeaza PnL in USDT.
-
-        v0.8.0 BUG 2 FIX: accepta entry_price optional pentru a evita
-          situatia in care self._entry_price=0 dupa reset() la TP3.
-        """
         ep = entry_price if entry_price is not None else self._entry_price
         return pnl_pct * qty * ep
 
@@ -227,11 +171,7 @@ class PositionManager:
         from .config import config
         return config.symbol
 
-    async def _close_partial(
-        self,
-        fraction: float,
-        label: str,
-    ) -> tuple[bool, float]:
+    async def _close_partial(self, fraction: float, label: str) -> tuple[bool, float]:
         sym = self._sym()
         with state.lock:
             open_qty   = state.open_qty
@@ -289,13 +229,6 @@ class PositionManager:
         return filled, qty if filled else 0.0
 
     async def _close_full(self, reason: str, pnl_pct: float) -> None:
-        """Close full remaining position and clean up state.
-
-        v0.8.6 BUG 28 FIX: reseteaza explicit state.open_qty=0 si state.open_entry=0.
-          trader.close_position() face reset intern, dar daca Market pica si
-          close_position() esueaza partial, state.open_qty ramanea > 0 cu
-          open_position=None -> bloca intrari noi (MAX_OPEN_POSITIONS check).
-        """
         with state.lock:
             remaining_qty = state.open_qty
         pnl_usdt = self._pnl_usdt(pnl_pct, remaining_qty)
@@ -305,7 +238,6 @@ class PositionManager:
             f"[PM] Full close ({reason}): "
             f"pnl={pnl_pct:.4%} ({pnl_usdt:+.4f} USDT)"
         )
-        # BUG 28 FIX: reset explicit — nu ne bazam exclusiv pe trader.close_position()
         with state.lock:
             state.open_position = None
             state.open_qty      = 0.0
@@ -314,46 +246,26 @@ class PositionManager:
         async with self._snapshot_lock:
             self._reset_fields()
 
-    # ------------------------------------------------------------------ #
-    #  Main evaluate loop — called every candle by strategy.py            #
-    # ------------------------------------------------------------------ #
-
     async def evaluate(self, current_price: float) -> bool:
-        """Check SL, TP levels, trailing SL, and timeout every candle.
-
-        v0.8.6 BUG 27 FIX: SL software adaugat la INCEPUTUL evaluate().
-          Inainte: evaluate() nu verifica niciodata pnl_pct <= -SL_PCT.
-          Singura protectie SL era stopLoss pe exchange — daca acesta pica
-          (ex. pyramid add cu stop_loss=0), pozitia se tinea la pierdere
-          nelimitata pana la TIMEOUT (max_hold_candles).
-          Fix: check SL inainte de TP checks, inainte de trailing.
-        v0.8.0 BUG 5 FIX: pnl_pct calculat O SINGURA DATA dupa lock.
-          hold_candles incrementat sub lock atomic.
-        v0.7.9: toate scrierile pe campuri interne sub _snapshot_lock.
-        Returns True if position was fully closed.
-        """
         if not state.open_position:
             return True
 
-        # Incrementeaza hold_candles atomic sub lock, citeste entry_price stabil
         async with self._snapshot_lock:
             self._hold_candles += 1
             hold = self._hold_candles
             entry_price_now = self._entry_price
 
-        # Un singur calcul pnl_pct, consistent pentru toate ramurile de mai jos
         pnl_pct = self._unrealised_pnl_pct(current_price)
 
-        # --- BUG 27 FIX: Software SL — primul check, inainte de orice TP ---
+        # Software SL
         if pnl_pct <= -SL_PCT:
             logger.warning(
-                f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{SL_PCT:.4%} "
-                f"— exchange SL may have failed or pyramid had no SL set"
+                f"[PM] Software SL triggered: pnl={pnl_pct:.4%} <= -{SL_PCT:.4%}"
             )
             await self._close_full("SL_SOFTWARE", pnl_pct)
             return True
 
-        # --- TP1 ---
+        # TP1
         if not self._tp1_hit and pnl_pct >= TP1_PCT:
             filled, qty_closed = await self._close_partial(TP1_FRACTION, "TP1")
             if filled:
@@ -375,7 +287,6 @@ class PositionManager:
         elif self._tp2_hit and not self._tp3_hit and pnl_pct >= TP3_PCT:
             filled, qty_closed = await self._close_partial(TP3_FRACTION, "TP3")
             if filled:
-                # BUG 2 FIX: salveaza entry_price INAINTE de reset()
                 saved_entry = self._entry_price
                 partial_pnl = self._pnl_usdt(pnl_pct, qty_closed, saved_entry)
                 async with self._snapshot_lock:
@@ -390,7 +301,7 @@ class PositionManager:
                     state.trailing_stop = 0.0
                 return True
 
-        # --- Trailing stop ---
+        # Trailing stop
         if pnl_pct >= TRAIL_PCT:
             if not self._trail_active:
                 async with self._snapshot_lock:
@@ -414,17 +325,13 @@ class PositionManager:
                 await self._close_full("TRAIL", pnl_pct)
                 return True
 
-        # --- Timeout ---
+        # Timeout
         if hold >= MAX_HOLD_CANDLES:
             logger.info(f"[PM] Timeout ({MAX_HOLD_CANDLES} candles) — closing")
             await self._close_full("TIMEOUT", pnl_pct)
             return True
 
         return False
-
-    # ------------------------------------------------------------------ #
-    #  Pyramid                                                             #
-    # ------------------------------------------------------------------ #
 
     async def try_pyramid(
         self,
@@ -434,6 +341,16 @@ class PositionManager:
         stop_loss: float,
         take_profit: float,
     ) -> None:
+        """Adauga la pozitia curenta (pyramid) cu verificare margin.
+
+        Improvement #2: inainte de place_order(), verifica ca balance disponibil
+        este suficient pentru costul ordinului de pyramid (cu safety buffer 1.5x).
+        La 100x leverage, fiecare ordin de 20 USDT necesita 0.2 USDT margin +
+        fees, dar in practica exchange-ul poate face margin call instant daca
+        contul e aproape de limita. Buffer-ul de 1.5x acoperit si volatilitatea.
+
+        Daca balance insuficient: log WARNING + alert Telegram + pyramid sarit.
+        """
         async with self._snapshot_lock:
             if self._pyramid_adds >= MAX_PYRAMID_ADDS:
                 return
@@ -453,6 +370,29 @@ class PositionManager:
         if add_qty <= 0:
             return
 
+        # --- Improvement #2: margin check ---
+        required_margin = config.order_size_usdt * PYRAMID_MARGIN_BUFFER
+        available_balance = await trader.get_balance()
+
+        if available_balance < required_margin:
+            msg = (
+                f"\u26a0\ufe0f *Pyramid sarit — margin insuficient*\n"
+                f"Disponibil: `{available_balance:.2f} USDT`\n"
+                f"Necesar (cu buffer 1.5x): `{required_margin:.2f} USDT`\n"
+                f"Order size: `{config.order_size_usdt} USDT` @ {config.leverage}x"
+            )
+            logger.warning(
+                f"[PM] Pyramid skipped — insufficient margin: "
+                f"balance={available_balance:.2f} USDT < required={required_margin:.2f} USDT"
+            )
+            try:
+                from .telegram_ui import send_message
+                await send_message(msg)
+            except Exception:
+                pass
+            return
+        # --- end margin check ---
+
         bybit_side = self._bybit_side(side, closing=False)
         resp = await trader.place_order(
             side=bybit_side,
@@ -469,7 +409,8 @@ class PositionManager:
                 state.open_qty += add_qty
             logger.info(
                 f"[PM] Pyramid add #{self._pyramid_adds}: "
-                f"qty={add_qty} pnl={pnl_pct:.4%} score={score:.3f}"
+                f"qty={add_qty} pnl={pnl_pct:.4%} score={score:.3f} "
+                f"balance_before={available_balance:.2f} USDT"
             )
 
 
