@@ -1,15 +1,12 @@
-"""Strategy v1.1.2 — leverage din profil consistent, ROUND_TRIP_FEE unificat.
+"""Strategy v1.1.3 — calc_qty primeste qty_step din trader (fix DOGE Qty invalid).
 
 Changelog:
-  v1.1.2 — BUG FIX INCONSISTENTA:
-    leverage pentru net_profit_check folosea prof.get('leverage') dar
-    risk.calc_qty() folosea config.leverage (global din .env).
-    Daca LEVERAGE din .env != profil leverage -> net profit calculat gresit
-    si qty gresit -> trade-uri cu notional diferit de cel planificat.
-    Fix: _enter() suprascrie config.leverage cu prof['leverage'] inainte
-    de calc_qty() si il restaureaza dupa. Alternativ: calc_qty primeste
-    leverage explicit din profil.
-    ROUND_TRIP_FEE importat din position_manager pentru consistenta.
+  v1.1.3 — BUG FIX: _enter() trecea tick_size la calc_qty care acum
+    asteapta qty_step. Fara qty_step corect, DOGE qty=563.761 in loc
+    de 563.0 -> Bybit ErrCode 10001 'Qty invalid'.
+    Fix: _enter() paseaza qty_step=trader._qty_step la risk.calc_qty().
+    Totodata ORDER_SIZE_USDT resetat la 5 in .env (5.5 era workaround).
+  v1.1.2 — leverage din profil consistent, ROUND_TRIP_FEE unificat.
   v1.1.1 — _enter() SL/TP din profil + comision inclus in TP.
   v1.1.0 — 5 features noi: GATE0/9/10, divergence, breakout.
 """
@@ -321,7 +318,6 @@ async def evaluate(price: float) -> None:
     if not state.running or state.paused:
         return
 
-    # Profil activ
     prof       = config.profile(config.symbol)
     tp1_pct    = prof.get("tp1_pct",        0.0030)
     order_usdt = prof.get("order_size_usdt", 5.0)
@@ -337,33 +333,30 @@ async def evaluate(price: float) -> None:
         )
         return
 
-    # GATE 1: Risk
     if not risk.can_open():
         logger.debug("[evaluate] GATE1 RISK blocat")
         return
 
-    # GATE 2: Regime
+    from .regime_filter import regime
     if not regime.allow_entry():
         logger.debug(f"[evaluate] GATE2 REGIME blocat: {regime.label}")
         return
 
-    # GATE 9: Session
     if not _session_allowed():
         import datetime
         logger.debug(f"[evaluate] GATE9 SESSION blocat: ora UTC={datetime.datetime.utcnow().hour}")
         return
 
-    # GATE 10: News
     if not _news_window_clear():
         import datetime
         logger.debug(f"[evaluate] GATE10 NEWS blocat: min={datetime.datetime.utcnow().minute}")
         return
 
-    ob = compute_ob()
+    from .mtf_filter import mtf
+    ob = __import__('apex_scalper.orderbook_analytics', fromlist=['compute']).compute()
     score_l, score_s = await score_snapshot(price, ob)
     best_score = max(score_l, score_s)
 
-    # GATE 3: Spread
     spread_bps = state.orderbook.spread / price * 10_000 if price > 0 else 999
     atr_ratio  = ind.atr_value / (ATR_BASELINE * price) if price > 0 else 1.0
     max_spread = BASE_SPREAD_BPS * (1 + ATR_SPREAD_MULT * atr_ratio)
@@ -371,23 +364,22 @@ async def evaluate(price: float) -> None:
         logger.debug(f"[evaluate] GATE3 SPREAD: {spread_bps:.2f} > {max_spread:.2f}bps")
         return
 
-    # GATE 4: ATR
     if ind.atr_ready:
         atr_pct = ind.atr_value / price if price > 0 else 0
         if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
             logger.debug(f"[evaluate] GATE4 ATR: {atr_pct:.6f}")
             return
 
-    # GATE 5: Anti-manipulation
+    from .anti_manipulation import anti_manipulation
     if anti_manipulation.is_suspicious():
         logger.debug("[evaluate] GATE5 ANTI-MANIP blocat")
         return
 
-    # GATE 6: MTF
     if not mtf.ready:
         logger.debug("[evaluate] GATE6 MTF not ready")
         return
 
+    from .funding_rate import funding
     await funding.maybe_refresh(config.symbol)
 
     if score_l >= ENTRY_THRESHOLD:
@@ -427,6 +419,7 @@ async def _enter(
     from .position_manager import position_manager as pm
     from .limit_order_manager import place_entry_order
     from .telegram_ui import notify_open
+    from .trader import trader
 
     is_long  = side == "long"
     sl_pct   = prof.get("sl_pct",          0.0020)
@@ -435,8 +428,6 @@ async def _enter(
     lev      = prof.get("leverage",         10)
     order_sz = prof.get("order_size_usdt",  5.0)
 
-    # FIX BUG v1.1.2: usa leverage si order_size DIN PROFIL, nu din config global
-    # config.leverage vine din .env si poate sa nu fie sincronizat cu profilul
     notional = order_sz * lev
     net_tp1  = notional * (tp1_pct - ROUND_TRIP_FEE)
     if net_tp1 <= 0:
@@ -449,11 +440,13 @@ async def _enter(
     sl = price * (1.0 - sl_pct  if is_long else 1.0 + sl_pct)
     tp = price * (1.0 + tp3_pct if is_long else 1.0 - tp3_pct)
 
-    # calc_qty cu leverage si order_size din profil
+    # FIX v1.1.3: paseaza qty_step din trader (ex: 1.0 pe DOGE, 0.001 pe BTC)
+    # Inainte: calc_qty primea tick_size=0.001 implicit -> qty cu zecimale
     qty = risk.calc_qty(
         price,
         order_size_usdt=order_sz,
         leverage=lev,
+        qty_step=trader._qty_step,
         regime_factor=regime.size_factor(),
     )
     if qty <= 0:
@@ -463,7 +456,8 @@ async def _enter(
     logger.info(
         f"[{side.upper()}] ENTRY score={score:.4f} price={price} qty={qty} "
         f"sl={sl:.5f} ({sl_pct:.3%}) tp={tp:.5f} ({tp3_pct:.3%}) "
-        f"net_tp1={net_tp1:.4f} USDT notional={notional:.1f}"
+        f"net_tp1={net_tp1:.4f} USDT notional={notional:.1f} "
+        f"qty_step={trader._qty_step}"
     )
 
     trade_id = await place_entry_order(

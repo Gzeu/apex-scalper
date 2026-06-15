@@ -1,18 +1,21 @@
-"""Risk manager v0.8.6 — Bug 29 fix.
+"""Risk manager v0.8.7 — qty_step fix.
 
 Changelog:
+  v0.8.7 — BUG FIX: calc_qty() folosea tick_size=0.001 default pentru
+    rotunjirea qty, dar tick_size e parametrul de pret, NU de cantitate.
+    qty_step-ul real (ex: 1.0 pe DOGE, 0.001 pe BTC) e diferit.
+    Daca qty_step > 1 (DOGE), rotunjirea cu tick_size=0.001 lasa
+    zecimale -> Bybit returna ErrCode: 10001 'Qty invalid'.
+    Fix: param redenumit qty_step si se ia din trader._qty_step.
+    Apelantii din strategy.py trec acum qty_step=trader._qty_step.
   v0.8.6 — BUG 29 FIX: reset_daily() reseteaza acum si _consecutive_losses=0.
-    Inainte: la UTC midnight _daily_loss si _open_count se resetau dar
-    _consecutive_losses ramanea acumulat din ziua precedenta.
-    Daca botul avea 4 pierderi consecutive seara, a doua zi dupa prima
-    pierdere ajungea la 5 si se bloca automat — desi e o noua sesiune.
-    Fix: self._consecutive_losses = 0 adaugat in reset_daily().
   v0.8.1 — kelly_f property adaugat (Bug 10 fix).
   v0.8.0 — Kelly formula corecta (Bug 6).
   v0.7.1 — reset_daily fix, MAX_CONSECUTIVE_LOSSES, partial close tracking.
 """
 from __future__ import annotations
 
+import math
 import os
 import threading
 from collections import deque
@@ -108,12 +111,7 @@ class RiskManager:
 
     @property
     def kelly_f(self) -> float:
-        """BUG 10 FIX: property pentru acces extern la kelly factor.
-
-        pulse.py folosea getattr(risk, '_kelly_factor', 0.5) care returna
-        obiectul metoda, nu un float -> TypeError la f-string.
-        Acum: risk.kelly_f returneaza float corect, thread-safe sub lock.
-        """
+        """BUG 10 FIX: property pentru acces extern la kelly factor."""
         with self._lock:
             return self._kelly_factor()
 
@@ -122,9 +120,19 @@ class RiskManager:
         price: float,
         order_size_usdt: float = 0.0,
         leverage: float = 1.0,
-        tick_size: float = 0.001,
+        qty_step: float = 0.001,
         regime_factor: float = 1.0,
     ) -> float:
+        """Calculeaza qty rotunjit la qty_step al instrumentului.
+
+        BUG v0.8.7 FIX: parametrul era 'tick_size' (pentru pret!) dar
+        era folosit pentru rotunjirea cantitatii — valori diferite.
+        Bybit DOGE: qty_step=1.0, tick_size=0.00001.
+        Rezultat vechi: qty=563.761 (zecimale) -> ErrCode 10001.
+        Rezultat nou:   qty=563.0 (rotunjit la floor pe qty_step=1.0).
+
+        Folosim floor (nu round) pentru a nu depasi notional-ul planificat.
+        """
         if price <= 0 or order_size_usdt <= 0:
             return 0.0
 
@@ -133,29 +141,32 @@ class RiskManager:
 
         effective_usdt = order_size_usdt * kelly_f * regime_factor
         notional       = effective_usdt * leverage
-        qty            = notional / price
+        raw_qty        = notional / price
 
-        if tick_size > 0:
-            qty = round(qty / tick_size) * tick_size
+        # Floor la qty_step (nu round) - nu depasim niciodata notional-ul
+        if qty_step > 0:
+            qty = math.floor(raw_qty / qty_step) * qty_step
+        else:
+            qty = raw_qty
 
-        qty = max(qty, tick_size)
+        # Asigura minim qty_step
+        qty = max(qty, qty_step)
+
         logger.debug(
             f"Kelly sizing: base={order_size_usdt} f={kelly_f:.3f} "
-            f"regime={regime_factor:.2f} qty={qty:.4f}"
+            f"regime={regime_factor:.2f} raw={raw_qty:.4f} "
+            f"qty_step={qty_step} qty={qty}"
         )
-        return round(qty, 6)
+        return qty
 
     def reset_daily(self) -> None:
         """Reset contoare zilnice la UTC midnight.
 
         v0.8.6 BUG 29 FIX: adaugat reset _consecutive_losses=0.
-          Inainte: _daily_loss si _open_count se resetau dar _consecutive_losses
-          ramanea acumulat -> bot blocat fals a doua zi dupa pierderi serale.
         """
         with self._lock:
             self._daily_loss         = 0.0
             self._open_count         = 0
-            # BUG 29 FIX: reseteaza si streak-ul de pierderi consecutive
             self._consecutive_losses = 0
         logger.info("RiskManager: daily reset (loss + open_count + consecutive_losses)")
 
