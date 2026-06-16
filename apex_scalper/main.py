@@ -1,11 +1,11 @@
-"""Main entry point v1.4.4 — semnature corecte watchdog + daily_report.
+"""Main entry point v1.4.5 — feed fix: ws_feed -> feed.start_feed().
 
 Changelog:
-  v1.4.4 — FIX: run_watchdog(trader, state) -> watchdog_loop() (fara argumente,
-    cf. watchdog.py v0.9.1 unde run_watchdog = watchdog_loop alias).
-    FIX: run_daily_report_loop() -> run_daily_report_loop(config.symbol)
-    (cf. daily_report.py v0.8.4 care primeste symbol: str).
-    Sync cu ce ruleaza local (confirmat functional).
+  v1.4.5 — FIX CRITIC: _run_ws_feed importa din ws_feed (modul inexistent)
+    -> feed nu pornea niciodata -> feed_stale permanent -> 0 tranzactii.
+    Fix: importat start_feed din feed.py (modulul real, v1.0.4).
+    _run_ws_feed devine _run_feed() care apeleaza start_feed() direct.
+  v1.4.4 — watchdog_loop() fara argumente, run_daily_report_loop(symbol).
   v1.4.3 — indicator_warmup la startup (fix #4).
   v1.4.2 — inlocuit get_open_position() cu sync_position_from_exchange().
   v1.4.1 — inject_wall_params via config.wall_ratio + trader.setup().
@@ -48,10 +48,12 @@ async def main() -> None:
     from .state import state
     from .telegram_ui import start_telegram_bot
     from .health import run_health_server
-    from .watchdog import watchdog_loop          # fara argumente (run_watchdog alias)
+    from .watchdog import watchdog_loop
     from .pulse import run_pulse_loop
     from .dashboard import run_dashboard
-    from .indicator_warmup import run_warmup
+    from .indicator_warmup import warmup_indicators
+    from .feed import start_feed              # FIX v1.4.5: modul real
+    from .strategy import set_main_loop
 
     _setup_logging()
     config.validate()
@@ -62,18 +64,19 @@ async def main() -> None:
 
     await trader.setup()
 
-    # Warm up indicatori cu date istorice inainte de pornirea loop-ului
+    # Warm up indicatori cu date istorice inainte de pornirea feed-ului
     logger.info("[warmup] Pornire indicator warmup...")
     try:
-        await run_warmup(config.symbol)
-        logger.info("[warmup] Indicatori ready — RSI/ATR/EMA incalziti")
+        ok = await warmup_indicators(config.symbol)
+        if ok:
+            logger.info("[warmup] Indicatori ready — RSI/ATR/EMA incalziti")
+        else:
+            logger.warning("[warmup] Warmup esuat — indicatorii vor fi ready dupa ~50 candle-uri live")
     except Exception as e:
-        logger.warning(f"[warmup] Warmup esuat (continuam fara): {e}")
+        logger.warning(f"[warmup] Warmup exceptie (continuam fara): {e}")
 
     # Sincronizeaza pozitia existenta la restart
     await trader.sync_position_from_exchange()
-
-    logger.info("Watchdog started (timeout=120s, max_restarts=3/h)")
 
     await funding.maybe_refresh(config.symbol)
 
@@ -84,21 +87,24 @@ async def main() -> None:
     run_dashboard(port=8050)
 
     loop = asyncio.get_event_loop()
+    set_main_loop(loop)   # seteaza loop pentru strategy.update_indicators thread-safety
+
     tasks = [
         asyncio.ensure_future(run_health_server()),
         asyncio.ensure_future(run_pulse_loop()),
-        asyncio.ensure_future(watchdog_loop()),                        # fara argumente
+        asyncio.ensure_future(watchdog_loop()),
         asyncio.ensure_future(run_mtf_refresh_loop(config.symbol)),
         asyncio.ensure_future(run_funding_refresh_loop(config.symbol)),
-        asyncio.ensure_future(run_daily_report_loop(config.symbol)),   # cu symbol
+        asyncio.ensure_future(run_daily_report_loop(config.symbol)),
         asyncio.ensure_future(start_telegram_bot()),
-        asyncio.ensure_future(_run_ws_feed(config, trader, state, loop)),
+        asyncio.ensure_future(start_feed()),   # FIX v1.4.5: feed real
     ]
 
     logger.info(
         f"\n{'='*50}\n"
         f"  Health:      http://localhost:8080/health\n"
         f"  Dashboard:   http://localhost:8050\n"
+        f"  Feed:        feed.py v1.0.4 (native async WS)\n"
         f"  Pulse:       fiecare 60s\n"
         f"{'='*50}"
     )
@@ -113,13 +119,6 @@ async def main() -> None:
 
     await asyncio.gather(*tasks, return_exceptions=True)
     logger.info("Apex Scalper oprit.")
-
-
-async def _run_ws_feed(config, trader, state, loop) -> None:
-    from .ws_feed import run_ws_feed
-    from .strategy import set_main_loop
-    set_main_loop(loop)
-    await run_ws_feed(config, trader, state)
 
 
 def run() -> None:
