@@ -1,6 +1,10 @@
-"""Main entry point v1.4.8 — start_telegram_bot wrapper corect.
+"""Main entry point v1.4.9 — position sync periodic la 30s.
 
 Changelog:
+  v1.4.9 —
+    FIX: adaugat run_position_sync_loop() — sincronizeaza state.open_position
+      cu exchange-ul la fiecare 30s. Detecteaza trade-uri deschise manual
+      sau pozitii inchise extern (SL/TP hit fara WS).
   v1.4.8 —
     FIX: telegram_ui nu are start_telegram_bot() -> adaugat run_polling wrapper.
     FIX: run_dashboard() apelat corect (daemon thread deja).
@@ -39,13 +43,46 @@ async def _run_telegram_polling() -> None:
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    # Tine in viata pana la cancel
     try:
         await asyncio.Event().wait()
     finally:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+
+
+async def run_position_sync_loop() -> None:
+    """Sincronizeaza state.open_position cu exchange-ul la fiecare 30s.
+
+    Detecteaza:
+    - Trade-uri deschise manual pe Bybit dupa pornirea botului
+    - Pozitii inchise extern (SL/TP hit fara WS event)
+    """
+    from .trader import trader
+    from .state import state
+
+    INTERVAL = 30  # secunde
+
+    while True:
+        await asyncio.sleep(INTERVAL)
+        try:
+            with state.lock:
+                pos_before = state.open_position
+
+            await trader.sync_position_from_exchange()
+
+            with state.lock:
+                pos_after = state.open_position
+
+            if pos_before != pos_after:
+                logger.info(
+                    f"[position_sync] State actualizat: "
+                    f"{pos_before!r} -> {pos_after!r} (detectat din exchange)"
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"[position_sync] Eroare sync: {e}")
 
 
 async def main() -> None:
@@ -103,6 +140,7 @@ async def main() -> None:
         asyncio.ensure_future(run_daily_report_loop(config.symbol)),
         asyncio.ensure_future(_run_telegram_polling()),
         asyncio.ensure_future(start_feed()),
+        asyncio.ensure_future(run_position_sync_loop()),  # v1.4.9: sync periodic
     ]
 
     logger.info(
@@ -111,6 +149,7 @@ async def main() -> None:
         f"  Dashboard: http://localhost:8050\n"
         f"  Feed:      feed.py (native async WS)\n"
         f"  Pulse:     fiecare {int(__import__('os').getenv('PULSE_INTERVAL_S', 60))}s\n"
+        f"  PosSync:   fiecare 30s\n"
         f"{'='*50}"
     )
 
