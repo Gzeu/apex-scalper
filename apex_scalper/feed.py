@@ -1,16 +1,12 @@
-"""Public WebSocket feed v1.0.4 — websockets nativ async.
+"""Public WebSocket feed v1.0.5 — update_indicators async (await).
 
 Changelog:
-  v1.0.4 — BUG FIX CRITIC:
-    pybit.unified_trading.WebSocket ruleaza pe thread separat.
-    callback-urile veneau pe alt thread decat asyncio loop-ul principal.
-    Daca _loop era None la primul mesaj (race la startup) sau threadul
-    WS murea fara while True: sleep(), mesajele dispareau silentios.
-    Fix: inlocuit complet cu websockets nativ async — tot codul ruleaza
-    pe acelasi event loop, fara thread-switching, fara race conditions.
-    OB (orderbook.50) + kline (1m) pe o singura conexiune WS multiplexata.
-  v1.0.1 — FEED_STALE_S race condition fix.
-  v0.9.7 — record_heartbeat/kline fix.
+  v1.0.5 —
+    FIX: update_indicators() e acum async in strategy v1.1.5.
+      Feed apela versiunea sync care folosea run_coroutine_threadsafe
+      -> deadlock pe acelasi event loop -> timeout 1s/candle -> 0 trade-uri.
+      Fix: 'await update_indicators(...)' direct.
+  v1.0.4 — websockets nativ async, OB + kline multiplexat.
 """
 from __future__ import annotations
 
@@ -75,11 +71,6 @@ def _handle_orderbook(data: dict, msg_type: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _handle_kline(items: list) -> None:
-    """
-    Bybit kline topic trimite o lista de candle objects.
-    confirm=False  → tick live  → evaluate() daca indicatorii sunt ready.
-    confirm=True   → candle closed → update_indicators() + evaluate().
-    """
     from .watchdog import record_heartbeat, record_kline
     record_heartbeat()
 
@@ -102,14 +93,14 @@ async def _handle_kline(items: list) -> None:
                 await evaluate(close)
             return
 
-        # Candle closed
+        # Candle closed — FIX v1.0.5: await update_indicators (e acum async)
         record_kline()
         high   = float(candle["high"])
         low    = float(candle["low"])
         volume = float(candle["volume"])
 
         from .strategy import update_indicators, evaluate
-        update_indicators(close, {"high": high, "low": low, "volume": volume})
+        await update_indicators(close, {"high": high, "low": low, "volume": volume})
         await evaluate(close)
 
     except Exception as e:
@@ -121,15 +112,6 @@ async def _handle_kline(items: list) -> None:
 # ---------------------------------------------------------------------------
 
 async def start_feed() -> None:
-    """Native async WebSocket feed cu reconnect automat.
-
-    O singura conexiune WS multiplexata pentru:
-      - orderbook.50.BTCUSDT
-      - kline.1.BTCUSDT
-
-    Ping/pong Bybit: trimitem ping la fiecare 20s, asteptam pong.
-    Daca conexiunea moare, reconectam dupa 3s.
-    """
     import websockets
 
     url  = _ws_url()
@@ -149,7 +131,6 @@ async def start_feed() -> None:
                 ping_timeout=30,
                 close_timeout=10,
             ) as ws:
-                # Subscrie la ambele topicuri
                 await ws.send(json.dumps({"op": "subscribe", "args": subs}))
                 logger.info(
                     f"WS connected + subscribed: {subs} | "
@@ -157,7 +138,6 @@ async def start_feed() -> None:
                 )
 
                 async for raw in ws:
-                    # Watchdog restart check (non-blocking)
                     from .watchdog import feed_restart_needed
                     if feed_restart_needed():
                         logger.warning("Watchdog: feed restart requested")
@@ -169,7 +149,6 @@ async def start_feed() -> None:
                     except Exception:
                         continue
 
-                    # Raspuns la subscribe
                     if msg.get("op") == "subscribe":
                         if msg.get("success"):
                             logger.info(f"WS subscribe confirmed: {msg.get('ret_msg', '')}")

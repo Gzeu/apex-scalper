@@ -1,18 +1,16 @@
-"""Strategy v1.1.4 — fix #1 #2 #3 #5 (entry fill confirm, SL unic, state dupa fill, circuit_breaker).
+"""Strategy v1.1.5 — update_indicators async (fix lock timeout deadlock).
 
 Changelog:
-  v1.1.4 —
-    FIX #1: place_entry_order() returneaza (trade_id, filled_qty, avg_price).
-      on_open() primeste avg_price real (nu price de la tick) si filled_qty real.
-      Daca filled_qty=0 -> skip, nu se seteaza state.
-    FIX #2: SL calculat O SINGURA DATA in _enter() si pasat la on_open().
-      on_open() nu mai recalculeaza SL — scoatem dubla suprasciere.
-    FIX #3: state.open_position setat DUPA confirmarea fill (filled_qty > 0).
-    FIX #5: circuit_breaker integrat in _enter() — daca e OPEN, skip entry.
-  v1.1.3 — calc_qty primeste qty_step din trader (fix DOGE Qty invalid).
-  v1.1.2 — leverage din profil consistent, ROUND_TRIP_FEE unificat.
-  v1.1.1 — _enter() SL/TP din profil + comision inclus in TP.
-  v1.1.0 — 5 features noi: GATE0/9/10, divergence, breakout.
+  v1.1.5 —
+    FIX CRITIC: update_indicators() era sync si apela run_coroutine_threadsafe
+      pentru a obtine asyncio.Lock.
+      Cand feed.py (full async, acelasi event loop) o apela direct,
+      run_coroutine_threadsafe intra in deadlock -> timeout 1s la fiecare candle
+      -> evaluate() nu se mai executa -> ZERO trade-uri.
+    Fix: update_indicators() devine async, foloseste direct 'await lock'.
+    Feed.py v1.0.5 o apeleaza cu 'await update_indicators(...)'.
+    _main_loop si run_coroutine_threadsafe eliminati complet (neutilizati).
+  v1.1.4 — entry fill confirm, SL unic, state dupa fill, circuit_breaker.
 """
 from __future__ import annotations
 
@@ -40,7 +38,6 @@ ATR_SPREAD_MULT  = 2.0
 ATR_BASELINE     = 0.001
 
 TAKER_FEE_PCT = 0.00055
-# ROUND_TRIP_FEE importat din position_manager (sursa unica de adevar)
 
 _BLOCKED_SESSIONS   = [(0, 2), (12, 13)]
 _NEWS_BLOCK_MINUTES = 4
@@ -48,7 +45,6 @@ _DIV_WINDOW         = 5
 _SR_WINDOW          = 20
 
 _ind_lock: asyncio.Lock | None = None
-_main_loop: asyncio.AbstractEventLoop | None = None
 
 _price_highs: deque = deque(maxlen=_SR_WINDOW)
 _price_lows:  deque = deque(maxlen=_SR_WINDOW)
@@ -56,9 +52,9 @@ _rsi_buf:     deque = deque(maxlen=_DIV_WINDOW)
 _close_buf:   deque = deque(maxlen=_DIV_WINDOW)
 
 
-def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
-    global _main_loop
-    _main_loop = loop
+def set_main_loop(loop) -> None:
+    """Pastrat pentru compatibilitate backwards — nu mai e necesar."""
+    pass
 
 
 def _get_ind_lock() -> asyncio.Lock:
@@ -236,7 +232,8 @@ async def score_snapshot(price: float, ob) -> tuple[float, float]:
     return _score_long(snap, ob, price), _score_short(snap, ob, price)
 
 
-def update_indicators(price: float, kline_data: dict) -> None:
+async def update_indicators(price: float, kline_data: dict) -> None:
+    """FIX v1.1.5: async — await lock direct, fara run_coroutine_threadsafe."""
     from .indicators import update_all
     s = _get_ind_state()
     high   = float(kline_data.get("high",   price))
@@ -250,21 +247,6 @@ def update_indicators(price: float, kline_data: dict) -> None:
     if s.rsi_ready:
         _rsi_buf.append(s.rsi_value)
 
-    loop = _main_loop
-    if loop is not None and loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(
-            _update_ind_locked(s, price), loop
-        )
-        try:
-            future.result(timeout=1.0)
-        except Exception as e:
-            logger.warning(f"[strategy] update_indicators lock timeout: {e}")
-            _apply_ind_from_state(s, price)
-    else:
-        _apply_ind_from_state(s, price)
-
-
-async def _update_ind_locked(s, price: float) -> None:
     async with _get_ind_lock():
         _apply_ind_from_state(s, price)
 
@@ -329,7 +311,6 @@ async def evaluate(price: float) -> None:
     notional   = order_usdt * lev
     net_tp1    = notional * (tp1_pct - ROUND_TRIP_FEE)
 
-    # GATE 0: Net profit
     if net_tp1 <= 0:
         logger.debug(
             f"[evaluate] GATE0 MIN_PROFIT: net_tp1={net_tp1:.5f} USDT "
@@ -341,13 +322,11 @@ async def evaluate(price: float) -> None:
         logger.debug("[evaluate] GATE1 RISK blocat")
         return
 
-    # FIX #5: circuit_breaker gate
     from .circuit_breaker import circuit_breaker, CircuitOpenError
     if circuit_breaker.is_open:
         logger.debug(f"[evaluate] GATE_CB CIRCUIT OPEN — skip entry")
         return
 
-    from .regime_filter import regime
     if not regime.allow_entry():
         logger.debug(f"[evaluate] GATE2 REGIME blocat: {regime.label}")
         return
@@ -362,7 +341,6 @@ async def evaluate(price: float) -> None:
         logger.debug(f"[evaluate] GATE10 NEWS blocat: min={datetime.datetime.utcnow().minute}")
         return
 
-    from .mtf_filter import mtf
     ob = __import__('apex_scalper.orderbook_analytics', fromlist=['compute']).compute()
     score_l, score_s = await score_snapshot(price, ob)
     best_score = max(score_l, score_s)
@@ -389,7 +367,6 @@ async def evaluate(price: float) -> None:
         logger.debug("[evaluate] GATE6 MTF not ready")
         return
 
-    from .funding_rate import funding
     await funding.maybe_refresh(config.symbol)
 
     if score_l >= ENTRY_THRESHOLD:
@@ -449,7 +426,6 @@ async def _enter(
         )
         return
 
-    # FIX #2: SL calculat O SINGURA DATA aici — pasat la place_entry SI la on_open
     sl = price * (1.0 - sl_pct  if is_long else 1.0 + sl_pct)
     tp = price * (1.0 + tp3_pct if is_long else 1.0 - tp3_pct)
 
@@ -467,11 +443,9 @@ async def _enter(
     logger.info(
         f"[{side.upper()}] ENTRY score={score:.4f} price={price} qty={qty} "
         f"sl={sl:.5f} ({sl_pct:.3%}) tp={tp:.5f} ({tp3_pct:.3%}) "
-        f"net_tp1={net_tp1:.4f} USDT notional={notional:.1f} "
-        f"qty_step={trader._qty_step}"
+        f"net_tp1={net_tp1:.4f} USDT notional={notional:.1f}"
     )
 
-    # FIX #5: place_entry prin circuit_breaker
     try:
         success, filled_qty, avg_price, order_id = await circuit_breaker.call(
             lom.place_entry,
@@ -487,12 +461,10 @@ async def _enter(
         logger.error(f"[{side.upper()}] place_entry exceptie: {e}")
         return
 
-    # FIX #1 + #3: verifica fill REAL inainte de a seta orice stare
     if not success or filled_qty <= 0:
         logger.error(f"[{side.upper()}] place_entry_order failed sau qty=0 — nu setam stare")
         return
 
-    # Inregistreaza trade in DB cu avg_price real
     trade_id = db.record_open_trade(
         symbol=config.symbol,
         side=side,
@@ -500,11 +472,9 @@ async def _enter(
         qty=filled_qty,
     )
 
-    # FIX #2: on_open primeste sl_price gata calculat — nu recalculeaza
     await pm.on_open(side, filled_qty, avg_price, trade_id, sl_price=sl)
     risk.on_open()
 
-    # FIX #3: state setat DUPA confirmarea fill
     with state.lock:
         state.open_position = side
         state.open_qty      = filled_qty
@@ -512,7 +482,6 @@ async def _enter(
 
     logger.info(
         f"[{side.upper()}] OPENED trade_id={trade_id} "
-        f"filled_qty={filled_qty} avg_price={avg_price:.6f} "
-        f"(requested qty={qty} @ tick={price:.6f})"
+        f"filled_qty={filled_qty} avg_price={avg_price:.6f}"
     )
     await notify_open(side, filled_qty, avg_price, sl, tp)
