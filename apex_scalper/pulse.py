@@ -1,12 +1,10 @@
 """Pulse reporter v0.8.2 — compatibilitate pm_mod cu position_manager v1.3.3.
 
 Changelog:
-  v0.8.2 — FIX: pm_mod.TP1_PCT / SL_PCT etc. nu mai exista in v1.3.3
-    (redenumite _DEFAULT_TP1_PCT, SL dinamic via _dynamic_sl_pct()).
-    Fix: citim valorile din profil via _p() / _get_profile() la runtime,
-    la fel cum face position_manager intern. Elimina AttributeError la pulse.
-  v0.8.1 — BUG 10+11 fix: risk.kelly_f property, pm_mod referinta modul.
-  v0.7.9 — race conditions Bug1+Bug5 fix.
+  v0.8.2 — FIX: pm_mod.TP1_PCT / SL_PCT etc. nu mai exista in v1.3.3.
+    Fix: _get_pm_profile_vals() citeste din _get_profile() / _DEFAULT_* la runtime.
+  v0.8.1 — BUG 10+11 fix.
+  v0.7.9 — race conditions fix.
 """
 from __future__ import annotations
 
@@ -44,28 +42,30 @@ def _bar(value: float, max_val: float = 1.0, width: int = 10) -> str:
 
 
 def _get_pm_profile_vals() -> dict:
-    """Citeste TP/SL/trail din profil la runtime (v1.3.3 nu mai are constante module-level)."""
+    """Citeste TP/SL/trail din profil la runtime (pm v1.3.3 nu mai are constante module-level)."""
     try:
-        from .position_manager import (
-            _DEFAULT_TP1_PCT, _DEFAULT_TP2_PCT, _DEFAULT_TP3_PCT,
-            _DEFAULT_SL_PCT, _DEFAULT_TRAIL_PCT,
-            _DEFAULT_MAX_HOLD, _get_profile, _dynamic_sl_pct,
-        )
-        prof = _get_profile()
-        return {
-            "TP1_PCT":        prof.get("tp1_pct",         _DEFAULT_TP1_PCT),
-            "TP2_PCT":        prof.get("tp2_pct",         _DEFAULT_TP2_PCT),
-            "TP3_PCT":        prof.get("tp3_pct",         _DEFAULT_TP3_PCT),
-            "SL_PCT":         _dynamic_sl_pct(),
-            "TRAIL_PCT":      prof.get("trail_pct",       _DEFAULT_TRAIL_PCT),
-            "MAX_HOLD":       prof.get("max_hold_candles", _DEFAULT_MAX_HOLD),
-        }
-    except Exception as e:
-        # Fallback la valori default hardcodate daca importul esueaza
-        return {
-            "TP1_PCT": 0.0030, "TP2_PCT": 0.0060, "TP3_PCT": 0.0100,
-            "SL_PCT":  0.0020, "TRAIL_PCT": 0.0030, "MAX_HOLD": 4,
-        }
+        import apex_scalper.position_manager as _pm
+        tp1  = getattr(_pm, "_DEFAULT_TP1_PCT",   0.0030)
+        tp2  = getattr(_pm, "_DEFAULT_TP2_PCT",   0.0060)
+        tp3  = getattr(_pm, "_DEFAULT_TP3_PCT",   0.0100)
+        sl   = getattr(_pm, "_DEFAULT_SL_PCT",    0.0020)
+        tr   = getattr(_pm, "_DEFAULT_TRAIL_PCT", 0.0030)
+        mh   = getattr(_pm, "_DEFAULT_MAX_HOLD",  4)
+        # Incearca profil dinamic daca exista
+        if hasattr(_pm, "_get_profile"):
+            prof = _pm._get_profile()
+            tp1 = prof.get("tp1_pct", tp1)
+            tp2 = prof.get("tp2_pct", tp2)
+            tp3 = prof.get("tp3_pct", tp3)
+            tr  = prof.get("trail_pct", tr)
+            mh  = prof.get("max_hold_candles", mh)
+        if hasattr(_pm, "_dynamic_sl_pct"):
+            sl = _pm._dynamic_sl_pct()
+        return {"TP1_PCT": tp1, "TP2_PCT": tp2, "TP3_PCT": tp3,
+                "SL_PCT": sl, "TRAIL_PCT": tr, "MAX_HOLD": mh}
+    except Exception:
+        return {"TP1_PCT": 0.0030, "TP2_PCT": 0.0060, "TP3_PCT": 0.0100,
+                "SL_PCT": 0.0020, "TRAIL_PCT": 0.0030, "MAX_HOLD": 4}
 
 
 async def build_pulse_message() -> str:
@@ -80,14 +80,9 @@ async def build_pulse_message() -> str:
     from .config import config
     from .position_manager import position_manager as pm
 
-    # v0.8.2: citim din profil la runtime (compatibil cu pm v1.3.3)
     pv = _get_pm_profile_vals()
-    TP1_PCT       = pv["TP1_PCT"]
-    TP2_PCT       = pv["TP2_PCT"]
-    TP3_PCT       = pv["TP3_PCT"]
-    SL_PCT        = pv["SL_PCT"]
-    TRAIL_PCT     = pv["TRAIL_PCT"]
-    MAX_HOLD_CANDLES = pv["MAX_HOLD"]
+    TP1_PCT, TP2_PCT, TP3_PCT = pv["TP1_PCT"], pv["TP2_PCT"], pv["TP3_PCT"]
+    SL_PCT, TRAIL_PCT, MAX_HOLD_CANDLES = pv["SL_PCT"], pv["TRAIL_PCT"], pv["MAX_HOLD"]
 
     with state.lock:
         price        = state.last_price
@@ -131,27 +126,23 @@ async def build_pulse_message() -> str:
         tp2_hit  = "✅" if snap.tp2_hit else "◻️"
         tp3_hit  = "✅" if snap.tp3_hit else "◻️"
         trail    = "🔴 trail ON" if snap.trail_active else ""
-
         lines += [
             f"",
             f"{'\U0001f7e2' if pos == 'long' else '\U0001f534'} *POZITIE {pos.upper()}*",
             f"  entry `{snap.entry_price}` \u2192 acum `{price}` {pnl_icon} `{pnl_pct*100:+.4f}%` (`{pnl_usdt:+.4f}` USDT)",
-            f"  qty `{open_qty}` | hold `{snap.hold_candles}/{MAX_HOLD_CANDLES}` candle {'\u23f0 timeout iminent' if snap.hold_candles >= MAX_HOLD_CANDLES - 1 else ''}",
+            f"  qty `{open_qty}` | hold `{snap.hold_candles}/{MAX_HOLD_CANDLES}` {'\u23f0 timeout iminent' if snap.hold_candles >= MAX_HOLD_CANDLES - 1 else ''}",
             f"  SL `{sl_price}` | TP1 {tp1_hit}`{tp1_p}` TP2 {tp2_hit}`{tp2_p}` TP3 {tp3_hit}`{tp3_p}`",
-            f"  pyramid adds: `{snap.pyramid_adds}` {trail}",
+            f"  pyramid: `{snap.pyramid_adds}` {trail}",
         ]
     else:
-        lines += [
-            f"",
-            f"\u25ab\ufe0f *Fara pozitie deschisa*",
-        ]
+        lines += [f"", f"\u25ab\ufe0f *Fara pozitie deschisa*"]
 
     rsi_str   = f"`{ind.rsi_value:.1f}`"        if ind.rsi_ready  else "`warmup`"
-    atr_str   = f"`{ind.atr_value:.4f}`"        if ind.atr_ready  else "`warmup`"
+    atr_str   = f"`{ind.atr_value:.5f}`"        if ind.atr_ready  else "`warmup`"
     vol_str   = f"`{ind.vol_zscore:.2f}`"        if ind.vol_ready  else "`warmup`"
     macd_str  = f"`{ind.macd_histogram:+.5f}`"  if ind.macd_ready else "`warmup`"
     stoch_str = (f"`{ind.stoch_k:.1f}`/`{ind.stoch_d:.1f}`" if ind.stoch_ready else "`warmup`")
-    bb_str    = (f"`{ind.bb_lower:.4f}`\u2026`{ind.bb_upper:.4f}`" if ind.bb_ready else "`warmup`")
+    bb_str    = (f"`{ind.bb_lower:.5f}`\u2026`{ind.bb_upper:.5f}`" if ind.bb_ready else "`warmup`")
     vwap_str  = f"`{ind.vwap:.5f}`" if ind.vwap > 0 else "`-`"
 
     lines += [
@@ -164,43 +155,35 @@ async def build_pulse_message() -> str:
         f"  OB imbalance: `{ob.imbalance:.4f}` | pressure: `{ob.pressure_score:.4f}`",
     ]
 
-    l_bar    = _bar(score_l)
-    s_bar    = _bar(score_s)
+    l_bar = _bar(score_l)
+    s_bar = _bar(score_s)
     l_vs_thr = "✅ INTRARE" if score_l >= ENTRY_THRESHOLD else f"`{ENTRY_THRESHOLD - score_l:.3f}` lipsa"
     s_vs_thr = "✅ INTRARE" if score_s >= ENTRY_THRESHOLD else f"`{ENTRY_THRESHOLD - score_s:.3f}` lipsa"
-
     lines += [
         f"",
-        f"🎯 *SCORE ACUM*  (prag `{ENTRY_THRESHOLD}`)",
+        f"🎯 *SCORE ACUM* (prag `{ENTRY_THRESHOLD}`)",
         f"  LONG:  `{score_l:.4f}` {l_bar} {l_vs_thr}",
         f"  SHORT: `{score_s:.4f}` {s_bar} {s_vs_thr}",
     ]
 
-    regime_icon = {
-        "TRENDING": "🟢", "RANGING": "🔴",
-        "VOLATILE": "🟡", "NEUTRAL": "🟤",
-    }.get(regime.label, "⚫")
+    regime_icon = {"TRENDING": "🟢", "RANGING": "🔴", "VOLATILE": "🟡", "NEUTRAL": "🟤"}.get(regime.label, "⚫")
     entry_ok = regime.allow_entry()
-
     lines += [
         f"",
         f"{regime_icon} *REGIM*: `{regime.label}` | ADX `{regime.adx:.1f}` | sz\u00d7`{regime.size_factor():.2f}`",
-        f"  Entry: {'\u2705 permis' if entry_ok else '\u274c BLOCAT \u2014 RANGING'} | MTF: `{'BULL' if price > mtf.ema50 else 'BEAR'}` EMA50(15m)=`{mtf.ema50:.5f}`",
+        f"  Entry: {'\u2705 permis' if entry_ok else '\u274c BLOCAT'} | MTF: `{'BULL' if price > mtf.ema50 else 'BEAR'}` EMA50=`{mtf.ema50:.5f}`",
     ]
 
     p_long  = bp.pressure_long()
     p_short = bp.pressure_short()
     bp_dir  = ("🟢 LONG" if p_long else ("🔴 SHORT" if p_short else "⚪ neutru"))
-
     lines += [
         f"",
-        f"📖 *BOOK PRESSURE*: {bp_dir}",
-        f"  cum\u0394 `{bp.cum_delta:+.0f}` | thr `\u00b1{bp._threshold():.0f}`",
+        f"📖 *BOOK PRESSURE*: {bp_dir} | cum\u0394 `{bp.cum_delta:+.0f}`",
     ]
 
     fund_long  = "✅" if funding.can_enter_long()  else "❌ blocat"
     fund_short = "✅" if funding.can_enter_short() else "❌ blocat"
-
     lines += [
         f"",
         f"💸 *FUNDING*: `{funding.rate_pct}` | LONG {fund_long} | SHORT {fund_short}",
@@ -209,47 +192,44 @@ async def build_pulse_message() -> str:
     can_open = risk.can_open()
     consec   = risk.consecutive_losses
     kelly_f  = risk.kelly_f
-
     lines += [
         f"",
         f"🛡 *RISK*: can\_open `{'DA' if can_open else 'NU \u274c'}` | consec losses `{consec}` | Kelly `{kelly_f:.3f}`",
     ]
 
     if not running or paused:
-        next_action = "⏸ Bot oprit / pauza — fara tranzactii"
+        next_action = "⏸ Bot oprit / pauza"
     elif pos and snap.entry_price > 0:
         if not snap.tp1_hit:
-            next_action = f"\u23f3 Astept TP1 @ `{round(snap.entry_price * (1 + TP1_PCT if pos == 'long' else 1 - TP1_PCT), 6)}`"
+            next_action = f"\u23f3 Astept TP1 @ `{round(snap.entry_price*(1+TP1_PCT if pos=='long' else 1-TP1_PCT),6)}`"
         elif not snap.tp2_hit:
-            next_action = f"\u23f3 Astept TP2 @ `{round(snap.entry_price * (1 + TP2_PCT if pos == 'long' else 1 - TP2_PCT), 6)}`"
+            next_action = f"\u23f3 Astept TP2 @ `{round(snap.entry_price*(1+TP2_PCT if pos=='long' else 1-TP2_PCT),6)}`"
         elif not snap.tp3_hit:
-            next_action = f"\u23f3 Astept TP3 sau trail SL"
+            next_action = "\u23f3 Astept TP3 sau trail SL"
         elif snap.hold_candles >= MAX_HOLD_CANDLES - 1:
-            next_action = "⚠️ Timeout iminent — inchide la urmatoarea lumanare"
+            next_action = "\u26a0\ufe0f Timeout iminent"
         else:
-            next_action = "⏳ Pozitie activa — monitorizez"
+            next_action = "\u23f3 Pozitie activa — monitorizez"
     elif not can_open:
-        next_action = "🔴 Risk blocat (daily limit / consecutive losses)"
+        next_action = "🔴 Risk blocat"
     elif not entry_ok:
         next_action = "🔴 Regim RANGING — astept TRENDING/NEUTRAL"
     elif not mtf.ready:
-        next_action = "⏳ Astept MTF ready (EMA50 15m)"
+        next_action = "\u23f3 Astept MTF ready"
     elif score_l >= ENTRY_THRESHOLD:
-        next_action = f"🟢 LONG TRIGGER — score `{score_l:.4f}` >= `{ENTRY_THRESHOLD}` — astept confirmare BP"
+        next_action = f"🟢 LONG TRIGGER — score `{score_l:.4f}` — astept BP"
     elif score_s >= ENTRY_THRESHOLD:
-        next_action = f"🔴 SHORT TRIGGER — score `{score_s:.4f}` >= `{ENTRY_THRESHOLD}` — astept confirmare BP"
+        next_action = f"🔴 SHORT TRIGGER — score `{score_s:.4f}` — astept BP"
     else:
         best = max(score_l, score_s)
-        next_action = f"\u23f3 Scanez — score max `{best:.4f}` (lipsesc `{ENTRY_THRESHOLD - best:.3f}` pana la prag)"
+        next_action = f"\u23f3 Scanez — max score `{best:.4f}` (lipsesc `{ENTRY_THRESHOLD-best:.3f}`)"
 
     lines += [
         f"",
-        f"\u27a1\ufe0f *URMATOAREA ACTIUNE*:",
-        f"  {next_action}",
+        f"\u27a1\ufe0f *URMATOAREA ACTIUNE*: {next_action}",
         f"",
         f"_pulse interval: {PULSE_INTERVAL_S}s | /pulse off dezactiveaza_",
     ]
-
     return "\n".join(lines)
 
 
@@ -257,7 +237,6 @@ async def run_pulse_loop(symbol: str | None = None) -> None:
     global _start_time
     _start_time = time.time()
     logger.info(f"Pulse loop pornit (interval={PULSE_INTERVAL_S}s, enabled={_pulse_active})")
-
     while True:
         await asyncio.sleep(PULSE_INTERVAL_S)
         if not _pulse_active:
