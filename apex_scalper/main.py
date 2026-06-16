@@ -1,15 +1,15 @@
-"""Main entry point v1.4.5 — feed fix: ws_feed -> feed.start_feed().
+"""Main entry point v1.4.6 — health server + pulse constante fix.
 
 Changelog:
-  v1.4.5 — FIX CRITIC: _run_ws_feed importa din ws_feed (modul inexistent)
-    -> feed nu pornea niciodata -> feed_stale permanent -> 0 tranzactii.
-    Fix: importat start_feed din feed.py (modulul real, v1.0.4).
-    _run_ws_feed devine _run_feed() care apeleaza start_feed() direct.
+  v1.4.6 —
+    FIX: run_health_server() -> start_health_server() (health.py non-blocking thread).
+      Inainte: asyncio.ensure_future(run_health_server()) -> AttributeError
+      -> OSError port 8080 ocupat de instanta veche (nu se inchidea curat).
+      Acum: start_health_server() e apelat direct (non-blocking daemon thread),
+      nu ca task asyncio.
+  v1.4.5 — ws_feed -> feed.start_feed() (modul corect).
   v1.4.4 — watchdog_loop() fara argumente, run_daily_report_loop(symbol).
-  v1.4.3 — indicator_warmup la startup (fix #4).
-  v1.4.2 — inlocuit get_open_position() cu sync_position_from_exchange().
-  v1.4.1 — inject_wall_params via config.wall_ratio + trader.setup().
-  v1.4.0 — dashboard GUI integrat.
+  v1.4.3 — indicator_warmup la startup.
 """
 from __future__ import annotations
 
@@ -40,19 +40,18 @@ def _setup_logging() -> None:
 async def main() -> None:
     from .config import config
     from .trader import trader
-    from .persistence import db
     from .mtf_filter import run_mtf_refresh_loop
     from .funding_rate import run_funding_refresh_loop, funding
     from .daily_report import run_daily_report_loop
     from .anti_manipulation import inject_wall_params
     from .state import state
     from .telegram_ui import start_telegram_bot
-    from .health import run_health_server
+    from .health import start_health_server          # non-blocking daemon thread
     from .watchdog import watchdog_loop
     from .pulse import run_pulse_loop
     from .dashboard import run_dashboard
     from .indicator_warmup import warmup_indicators
-    from .feed import start_feed              # FIX v1.4.5: modul real
+    from .feed import start_feed
     from .strategy import set_main_loop
 
     _setup_logging()
@@ -64,7 +63,7 @@ async def main() -> None:
 
     await trader.setup()
 
-    # Warm up indicatori cu date istorice inainte de pornirea feed-ului
+    # Warm up indicatori inainte de feed
     logger.info("[warmup] Pornire indicator warmup...")
     try:
         ok = await warmup_indicators(config.symbol)
@@ -75,29 +74,29 @@ async def main() -> None:
     except Exception as e:
         logger.warning(f"[warmup] Warmup exceptie (continuam fara): {e}")
 
-    # Sincronizeaza pozitia existenta la restart
     await trader.sync_position_from_exchange()
-
     await funding.maybe_refresh(config.symbol)
 
     state.running = True
     state.paused  = False
 
-    # Dashboard GUI (non-blocking, thread separat)
+    # Health server: daemon thread non-blocking (nu task asyncio)
+    start_health_server()
+
+    # Dashboard GUI: thread separat non-blocking
     run_dashboard(port=8050)
 
     loop = asyncio.get_event_loop()
-    set_main_loop(loop)   # seteaza loop pentru strategy.update_indicators thread-safety
+    set_main_loop(loop)
 
     tasks = [
-        asyncio.ensure_future(run_health_server()),
         asyncio.ensure_future(run_pulse_loop()),
         asyncio.ensure_future(watchdog_loop()),
         asyncio.ensure_future(run_mtf_refresh_loop(config.symbol)),
         asyncio.ensure_future(run_funding_refresh_loop(config.symbol)),
         asyncio.ensure_future(run_daily_report_loop(config.symbol)),
         asyncio.ensure_future(start_telegram_bot()),
-        asyncio.ensure_future(start_feed()),   # FIX v1.4.5: feed real
+        asyncio.ensure_future(start_feed()),
     ]
 
     logger.info(

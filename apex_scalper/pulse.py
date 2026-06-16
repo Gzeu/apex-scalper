@@ -1,15 +1,12 @@
-"""Pulse reporter v0.8.1 — Bug 10+11 fix.
+"""Pulse reporter v0.8.2 — compatibilitate pm_mod cu position_manager v1.3.3.
 
 Changelog:
-  v0.8.1 — BUG 10 FIX: getattr(risk, '_kelly_factor', 0.5) returna metoda
-    -> TypeError la f-string '{kelly_f:.3f}'.
-    Fix: risk.kelly_f (property nou pe RiskManager, returneaza float).
-
-    BUG 11 FIX: 'from .position_manager import TP1_PCT' copie locala la
-    import-time -> inject_profile() nu se propaga, pulse afisa valori default.
-    Fix: import apex_scalper.position_manager as pm_mod
-    Toate referintele TP1_PCT, TP2_PCT etc. -> pm_mod.TP1_PCT etc.
-  v0.7.9 — race conditions Bug1 + Bug5 fix (snapshot + score_snapshot).
+  v0.8.2 — FIX: pm_mod.TP1_PCT / SL_PCT etc. nu mai exista in v1.3.3
+    (redenumite _DEFAULT_TP1_PCT, SL dinamic via _dynamic_sl_pct()).
+    Fix: citim valorile din profil via _p() / _get_profile() la runtime,
+    la fel cum face position_manager intern. Elimina AttributeError la pulse.
+  v0.8.1 — BUG 10+11 fix: risk.kelly_f property, pm_mod referinta modul.
+  v0.7.9 — race conditions Bug1+Bug5 fix.
 """
 from __future__ import annotations
 
@@ -17,7 +14,6 @@ import asyncio
 import os
 import time
 from loguru import logger
-import apex_scalper.position_manager as pm_mod  # BUG 11 FIX: referinta modul
 
 PULSE_INTERVAL_S = int(os.getenv("PULSE_INTERVAL_S", "60"))
 PULSE_ENABLED    = os.getenv("PULSE_ENABLED", "true").lower() == "true"
@@ -47,16 +43,32 @@ def _bar(value: float, max_val: float = 1.0, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-async def build_pulse_message() -> str:
-    """Build full pulse message din date live.
+def _get_pm_profile_vals() -> dict:
+    """Citeste TP/SL/trail din profil la runtime (v1.3.3 nu mai are constante module-level)."""
+    try:
+        from .position_manager import (
+            _DEFAULT_TP1_PCT, _DEFAULT_TP2_PCT, _DEFAULT_TP3_PCT,
+            _DEFAULT_SL_PCT, _DEFAULT_TRAIL_PCT,
+            _DEFAULT_MAX_HOLD, _get_profile, _dynamic_sl_pct,
+        )
+        prof = _get_profile()
+        return {
+            "TP1_PCT":        prof.get("tp1_pct",         _DEFAULT_TP1_PCT),
+            "TP2_PCT":        prof.get("tp2_pct",         _DEFAULT_TP2_PCT),
+            "TP3_PCT":        prof.get("tp3_pct",         _DEFAULT_TP3_PCT),
+            "SL_PCT":         _dynamic_sl_pct(),
+            "TRAIL_PCT":      prof.get("trail_pct",       _DEFAULT_TRAIL_PCT),
+            "MAX_HOLD":       prof.get("max_hold_candles", _DEFAULT_MAX_HOLD),
+        }
+    except Exception as e:
+        # Fallback la valori default hardcodate daca importul esueaza
+        return {
+            "TP1_PCT": 0.0030, "TP2_PCT": 0.0060, "TP3_PCT": 0.0100,
+            "SL_PCT":  0.0020, "TRAIL_PCT": 0.0030, "MAX_HOLD": 4,
+        }
 
-    v0.8.1:
-      BUG 10 FIX: risk.kelly_f (property float, nu metoda)
-      BUG 11 FIX: pm_mod.TP1_PCT etc. (referinta modul, nu copie locala)
-    v0.7.9:
-      BUG 1 FIX: pm.snapshot() atomic
-      BUG 5 FIX: score_snapshot() consistent
-    """
+
+async def build_pulse_message() -> str:
     from .state import state
     from .strategy import ind, score_snapshot, ENTRY_THRESHOLD
     from .orderbook_analytics import compute as compute_ob
@@ -68,13 +80,14 @@ async def build_pulse_message() -> str:
     from .config import config
     from .position_manager import position_manager as pm
 
-    # BUG 11 FIX: citim TP/SL din referinta modul (propagate de inject_profile)
-    TP1_PCT       = pm_mod.TP1_PCT
-    TP2_PCT       = pm_mod.TP2_PCT
-    TP3_PCT       = pm_mod.TP3_PCT
-    SL_PCT        = pm_mod.SL_PCT
-    TRAIL_PCT     = pm_mod.TRAIL_PCT
-    MAX_HOLD_CANDLES = pm_mod.MAX_HOLD_CANDLES
+    # v0.8.2: citim din profil la runtime (compatibil cu pm v1.3.3)
+    pv = _get_pm_profile_vals()
+    TP1_PCT       = pv["TP1_PCT"]
+    TP2_PCT       = pv["TP2_PCT"]
+    TP3_PCT       = pv["TP3_PCT"]
+    SL_PCT        = pv["SL_PCT"]
+    TRAIL_PCT     = pv["TRAIL_PCT"]
+    MAX_HOLD_CANDLES = pv["MAX_HOLD"]
 
     with state.lock:
         price        = state.last_price
@@ -110,10 +123,10 @@ async def build_pulse_message() -> str:
         pnl_pct  = snap.unrealised_pnl_pct(price)
         pnl_usdt = round(pnl_pct * snap.entry_price * open_qty, 4)
         pnl_icon = "⬆️" if pnl_pct >= 0 else "⬇️"
-        sl_price = round(snap.entry_price * (1 - SL_PCT  if pos == "long" else 1 + SL_PCT), 2)
-        tp1_p    = round(snap.entry_price * (1 + TP1_PCT if pos == "long" else 1 - TP1_PCT), 2)
-        tp2_p    = round(snap.entry_price * (1 + TP2_PCT if pos == "long" else 1 - TP2_PCT), 2)
-        tp3_p    = round(snap.entry_price * (1 + TP3_PCT if pos == "long" else 1 - TP3_PCT), 2)
+        sl_price = round(snap.entry_price * (1 - SL_PCT  if pos == "long" else 1 + SL_PCT), 6)
+        tp1_p    = round(snap.entry_price * (1 + TP1_PCT if pos == "long" else 1 - TP1_PCT), 6)
+        tp2_p    = round(snap.entry_price * (1 + TP2_PCT if pos == "long" else 1 - TP2_PCT), 6)
+        tp3_p    = round(snap.entry_price * (1 + TP3_PCT if pos == "long" else 1 - TP3_PCT), 6)
         tp1_hit  = "✅" if snap.tp1_hit else "◻️"
         tp2_hit  = "✅" if snap.tp2_hit else "◻️"
         tp3_hit  = "✅" if snap.tp3_hit else "◻️"
@@ -138,13 +151,13 @@ async def build_pulse_message() -> str:
     vol_str   = f"`{ind.vol_zscore:.2f}`"        if ind.vol_ready  else "`warmup`"
     macd_str  = f"`{ind.macd_histogram:+.5f}`"  if ind.macd_ready else "`warmup`"
     stoch_str = (f"`{ind.stoch_k:.1f}`/`{ind.stoch_d:.1f}`" if ind.stoch_ready else "`warmup`")
-    bb_str    = (f"`{ind.bb_lower:.1f}`\u2026`{ind.bb_upper:.1f}`" if ind.bb_ready else "`warmup`")
-    vwap_str  = f"`{ind.vwap:.2f}`" if ind.vwap > 0 else "`-`"
+    bb_str    = (f"`{ind.bb_lower:.4f}`\u2026`{ind.bb_upper:.4f}`" if ind.bb_ready else "`warmup`")
+    vwap_str  = f"`{ind.vwap:.5f}`" if ind.vwap > 0 else "`-`"
 
     lines += [
         f"",
         f"📊 *INDICATORI* @ `{price}`",
-        f"  EMA 9/21/50: `{ind.ema_fast:.2f}` / `{ind.ema_slow:.2f}` / `{ind.ema_trend:.2f}`",
+        f"  EMA 9/21/50: `{ind.ema_fast:.5f}` / `{ind.ema_slow:.5f}` / `{ind.ema_trend:.5f}`",
         f"  RSI(14): {rsi_str} | ATR(14): {atr_str} | Vol Z: {vol_str}",
         f"  MACD hist: {macd_str} | StochRSI %K/%D: {stoch_str}",
         f"  BB(20,2): {bb_str} | VWAP: {vwap_str}",
@@ -172,7 +185,7 @@ async def build_pulse_message() -> str:
     lines += [
         f"",
         f"{regime_icon} *REGIM*: `{regime.label}` | ADX `{regime.adx:.1f}` | sz\u00d7`{regime.size_factor():.2f}`",
-        f"  Entry: {'\u2705 permis' if entry_ok else '\u274c BLOCAT \u2014 RANGING'} | MTF: `{'BULL' if price > mtf.ema50 else 'BEAR'}` EMA50(15m)=`{mtf.ema50:.2f}`",
+        f"  Entry: {'\u2705 permis' if entry_ok else '\u274c BLOCAT \u2014 RANGING'} | MTF: `{'BULL' if price > mtf.ema50 else 'BEAR'}` EMA50(15m)=`{mtf.ema50:.5f}`",
     ]
 
     p_long  = bp.pressure_long()
@@ -194,8 +207,7 @@ async def build_pulse_message() -> str:
     ]
 
     can_open = risk.can_open()
-    consec   = risk.consecutive_losses   # property thread-safe
-    # BUG 10 FIX: risk.kelly_f property (float), nu getattr metoda
+    consec   = risk.consecutive_losses
     kelly_f  = risk.kelly_f
 
     lines += [
@@ -207,9 +219,9 @@ async def build_pulse_message() -> str:
         next_action = "⏸ Bot oprit / pauza — fara tranzactii"
     elif pos and snap.entry_price > 0:
         if not snap.tp1_hit:
-            next_action = f"\u23f3 Astept TP1 @ `{round(snap.entry_price * (1 + TP1_PCT if pos == 'long' else 1 - TP1_PCT), 2)}`"
+            next_action = f"\u23f3 Astept TP1 @ `{round(snap.entry_price * (1 + TP1_PCT if pos == 'long' else 1 - TP1_PCT), 6)}`"
         elif not snap.tp2_hit:
-            next_action = f"\u23f3 Astept TP2 @ `{round(snap.entry_price * (1 + TP2_PCT if pos == 'long' else 1 - TP2_PCT), 2)}`"
+            next_action = f"\u23f3 Astept TP2 @ `{round(snap.entry_price * (1 + TP2_PCT if pos == 'long' else 1 - TP2_PCT), 6)}`"
         elif not snap.tp3_hit:
             next_action = f"\u23f3 Astept TP3 sau trail SL"
         elif snap.hold_candles >= MAX_HOLD_CANDLES - 1:
