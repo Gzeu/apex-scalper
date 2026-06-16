@@ -1,17 +1,14 @@
-"""Indicator warmup v0.9.8 — pre-incarca candle-uri istorice la startup.
+"""Indicator warmup v0.9.9 — regime.update() in warmup loop.
 
-Problema rezolvata:
-  Dupa fiecare restart, toti indicatorii (EMA50, RSI, ATR, BB, MACD, StochRSI)
-  porneau de la zero si necesitau 50+ candle-uri live (~50 minute) inainte
-  de a fi ready. In acest timp botul nu putea intra in nicio tranzactie.
-
-Solutie:
-  La startup, inainte de a porni WS feed-ul, se descarca ultimele
-  WARMUP_CANDLES (60) candle-uri 1m via Bybit REST API (get_kline).
-  Acestea sunt procesate prin update_all() in aceeasi ordine ca feed-ul live,
-  astfel incat toti indicatorii sunt ready in <1 secunda de la pornire.
-
-Fara dependente noi: pybit e deja instalat.
+Changelog:
+  v0.9.9 —
+    FIX: regime.update() nu era apelat in warmup loop.
+      Rezultat: ADX=0.0 / UNKNOWN timp de 28+ minute dupa restart
+      pana se acumulau suficiente candle-uri live.
+    Fix: adaugat regime.update(close, atr_value, high, low) in loop-ul
+      de warmup, dupa update_all(). La startup ADX e seeded instant
+      din cele 60 candle-uri istorice.
+  v0.9.8 — pre-incarca candle-uri istorice la startup.
 """
 from __future__ import annotations
 
@@ -30,8 +27,9 @@ async def warmup_indicators(symbol: str) -> bool:
     """
     try:
         from .trader import trader
-        from .strategy import update_indicators, _get_ind_state, _apply_ind_from_state, ind
+        from .strategy import _get_ind_state, _apply_ind_from_state, ind
         from .indicators import update_all
+        from .regime_filter import regime
 
         logger.info(f"Indicator warmup: descarc {WARMUP_CANDLES} candle-uri 1m [{symbol}]...")
         t0 = time.monotonic()
@@ -49,21 +47,24 @@ async def warmup_indicators(symbol: str) -> bool:
             low    = candle["low"]
             volume = candle["volume"]
             update_all(s, close, high, low, volume)
+            # FIX v0.9.9: alimenteaza regime cu fiecare candle din warmup
+            regime.update(close, s.atr_value, high, low)
 
-        # Copiaza in strategy.ind (acelasi lucru pe care il face update_indicators)
+        # Copiaza in strategy.ind
         _apply_ind_from_state(s, result[-1]["close"])
 
         elapsed = time.monotonic() - t0
         last_close = result[-1]["close"]
         logger.info(
             f"Indicator warmup complet in {elapsed:.2f}s | "
-            f"{len(result)} candle-uri procesate | last_close={last_close:.2f} | "
+            f"{len(result)} candle-uri procesate | last_close={last_close:.6f} | "
             f"RSI={ind.rsi_value:.1f}({'ready' if ind.rsi_ready else 'warmup'}) "
-            f"ATR={ind.atr_value:.2f}({'ready' if ind.atr_ready else 'warmup'}) "
-            f"EMA9={ind.ema_fast:.2f} EMA21={ind.ema_slow:.2f} EMA50={ind.ema_trend:.2f} "
-            f"MACD_hist={ind.macd_histogram:.4f}({'ready' if ind.macd_ready else 'warmup'}) "
+            f"ATR={ind.atr_value:.6f}({'ready' if ind.atr_ready else 'warmup'}) "
+            f"EMA9={ind.ema_fast:.6f} EMA21={ind.ema_slow:.6f} EMA50={ind.ema_trend:.6f} "
+            f"MACD_hist={ind.macd_histogram:.6f}({'ready' if ind.macd_ready else 'warmup'}) "
             f"BB={'ready' if ind.bb_ready else 'warmup'} "
-            f"StochRSI={'ready' if ind.stoch_ready else 'warmup'}"
+            f"StochRSI={'ready' if ind.stoch_ready else 'warmup'} "
+            f"Regime={regime.label} ADX={regime.adx}"
         )
         return True
 
