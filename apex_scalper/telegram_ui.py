@@ -1,16 +1,15 @@
-"""Telegram bot UI v1.0.5 — bugfix + /daily + rate limiter.
+"""Telegram bot UI v1.0.6 — fix pm constante v1.3.3 + funding attrs.
 
 Changelog:
-  v1.0.5 — Fix-uri:
-    1. /history: t.get('close_reason') -> t.get('reason') (camp corect din DB)
-    2. /config: risk._consecutive_losses -> risk.consecutive_losses (property)
-    3. /daily: adaugat ca comanda text (lipsea desi era in README)
-    4. send_message: rate limiter simplu (max 1 msg/s) pentru a evita
-       Telegram 429 FloodWait la burst de semnale.
-    5. _last_kline_ts: accesat prin getter public din watchdog.
-  v1.0.3 — /history [N], /risk, /start verifica feed activ, polish mesaje.
-  v0.9.9 — /menu inline, /config, /warmup, notificari automate.
-  v0.8.7 — BUG 34 FIX: auth check comenzi distructive.
+  v1.0.6 —
+    FIX: _send_tp() si _send_config() accesau pm_mod.SL_PCT / TP1_PCT etc.
+      care NU mai exista in position_manager v1.3.3.
+      Fix: _get_pm_vals() citeste din _DEFAULT_* + profil la runtime.
+    FIX: _send_funding() accesa funding._next_funding_ms si funding._near_funding()
+      care nu exista in FundingRateMonitor v1.1.1.
+      Fix: campurile lipsesc -> afisam doar rate + can_enter_long/short.
+  v1.0.5 — /daily, rate limiter, consecutive_losses property fix.
+  v1.0.3 — /history [N], /risk, /start feed check.
 """
 from __future__ import annotations
 
@@ -27,23 +26,19 @@ from .performance import perf
 
 _bot: Bot | None = None
 _last_send_ts: float = 0.0
-_SEND_MIN_INTERVAL = 1.0  # min secunde intre mesaje (anti-flood Telegram)
+_SEND_MIN_INTERVAL = 1.0
 
 
 async def send_message(text: str) -> None:
-    """Trimite mesaj Telegram cu rate limiting simplu (1 msg/s max)."""
     if not config.telegram_token or not config.telegram_chat_id:
         return
     global _bot, _last_send_ts
     if _bot is None:
         _bot = Bot(token=config.telegram_token)
-
-    # Rate limiter: asteapta daca am trimis prea recent
     now = time.monotonic()
     wait = _SEND_MIN_INTERVAL - (now - _last_send_ts)
     if wait > 0:
         await asyncio.sleep(wait)
-
     try:
         await _bot.send_message(
             chat_id=config.telegram_chat_id,
@@ -62,6 +57,31 @@ def _check_owner(u: Update) -> bool:
     if user is None:
         return False
     return str(user.id) == str(config.telegram_chat_id)
+
+
+def _get_pm_vals() -> dict:
+    """Citeste TP/SL/trail/hold din pm v1.3.3 _DEFAULT_* + profil la runtime."""
+    import apex_scalper.position_manager as pm
+    prof = {}
+    try:
+        from .config import config as cfg
+        prof = cfg.profile(cfg.symbol)
+    except Exception:
+        pass
+    return {
+        "TP1_PCT":        prof.get("tp1_pct",        getattr(pm, "_DEFAULT_TP1_PCT",       0.0030)),
+        "TP2_PCT":        prof.get("tp2_pct",        getattr(pm, "_DEFAULT_TP2_PCT",       0.0060)),
+        "TP3_PCT":        prof.get("tp3_pct",        getattr(pm, "_DEFAULT_TP3_PCT",       0.0100)),
+        "TP1_FRACTION":   prof.get("tp1_fraction",   getattr(pm, "_DEFAULT_TP1_FRACTION",  0.40)),
+        "TP2_FRACTION":   prof.get("tp2_fraction",   getattr(pm, "_DEFAULT_TP2_FRACTION",  0.30)),
+        "TP3_FRACTION":   prof.get("tp3_fraction",   getattr(pm, "_DEFAULT_TP3_FRACTION",  0.30)),
+        "SL_PCT":         prof.get("sl_pct",         getattr(pm, "_DEFAULT_SL_PCT",        0.0020)),
+        "TRAIL_PCT":      prof.get("trail_pct",      getattr(pm, "_DEFAULT_TRAIL_PCT",     0.0030)),
+        "TRAIL_DELTA":    prof.get("trail_delta",    getattr(pm, "_DEFAULT_TRAIL_DELTA",   0.0010)),
+        "MAX_HOLD":       prof.get("max_hold_candles", getattr(pm, "_DEFAULT_MAX_HOLD",    4)),
+        "MAX_PYRAMID":    prof.get("max_pyramid_adds", getattr(pm, "_DEFAULT_MAX_PYRAMID", 0)),
+        "ROUND_TRIP_FEE": getattr(pm, "ROUND_TRIP_FEE", 0.0011),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +162,7 @@ async def cmd_menu(u: Update, c: ContextTypes.DEFAULT_TYPE):
         paused  = state.paused
     bot_status = "\u2705 ACTIV" if (running and not paused) else ("\u23f8 PAUZA" if paused else "\U0001f6d1 OPRIT")
     text = (
-        f"\u26a1 *Apex Scalper v1.0.5*\n"
+        f"\u26a1 *Apex Scalper v1.0.6*\n"
         f"`{config.symbol}` | {bot_status}\n"
         f"Price: `{price}` | Pozitie: `{pos}`"
     )
@@ -211,7 +231,6 @@ async def _handle_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def _get_feed_elapsed() -> float:
-    """Returneaza secundele de la ultimul kline. -1 daca nu a venit niciodata."""
     try:
         from .watchdog import get_last_kline_ts
         last = get_last_kline_ts()
@@ -328,8 +347,9 @@ async def _send_regime(target):
 
 
 async def _send_tp(target):
-    import apex_scalper.position_manager as pm_mod
+    """FIX v1.0.6: citeste TP/SL din _get_pm_vals() nu din pm_mod.SL_PCT etc."""
     from .position_manager import position_manager as pm
+    pv = _get_pm_vals()
     with state.lock:
         pos   = state.open_position
         price = state.last_price
@@ -338,16 +358,17 @@ async def _send_tp(target):
         msg = "\u25ab\ufe0f Nicio pozitie deschisa."
     else:
         entry = pm._entry_price
-        sl_p  = round(entry * (1 - pm_mod.SL_PCT  if pos == "long" else 1 + pm_mod.SL_PCT), 2)
-        tp1_p = round(entry * (1 + pm_mod.TP1_PCT if pos == "long" else 1 - pm_mod.TP1_PCT), 2)
-        tp2_p = round(entry * (1 + pm_mod.TP2_PCT if pos == "long" else 1 - pm_mod.TP2_PCT), 2)
-        tp3_p = round(entry * (1 + pm_mod.TP3_PCT if pos == "long" else 1 - pm_mod.TP3_PCT), 2)
-        pnl_pct = (price - entry) / entry if pos == "long" else (entry - price) / entry
-        pnl_u   = round(pnl_pct * entry * qty, 4)
+        is_long = pos == "long"
+        sl_p  = round(entry * (1 - pv["SL_PCT"]  if is_long else 1 + pv["SL_PCT"]),  6)
+        tp1_p = round(entry * (1 + pv["TP1_PCT"] if is_long else 1 - pv["TP1_PCT"]), 6)
+        tp2_p = round(entry * (1 + pv["TP2_PCT"] if is_long else 1 - pv["TP2_PCT"]), 6)
+        tp3_p = round(entry * (1 + pv["TP3_PCT"] if is_long else 1 - pv["TP3_PCT"]), 6)
+        pnl_pct  = (price - entry) / entry if is_long else (entry - price) / entry
+        pnl_u    = round(pnl_pct * entry * qty, 4)
         pnl_icon = "\u2b06\ufe0f" if pnl_pct >= 0 else "\u2b07\ufe0f"
         msg = (
-            f"{'\U0001f7e2' if pos=='long' else '\U0001f534'} *{pos.upper()}* entry `{entry}` acum `{price}` {pnl_icon}\n"
-            f"PnL: `{pnl_u:+.4f} USDT` (`{pnl_pct*100:+.4f}%`) | hold `{pm._hold_candles}/{pm_mod.MAX_HOLD_CANDLES}`\n"
+            f"{'\U0001f7e2' if is_long else '\U0001f534'} *{pos.upper()}* entry `{entry}` acum `{price}` {pnl_icon}\n"
+            f"PnL: `{pnl_u:+.4f} USDT` (`{pnl_pct*100:+.4f}%`) | hold `{pm._hold_candles}/{pv['MAX_HOLD']}`\n"
             f"SL: `{sl_p}` | TP1: {'\u2705' if pm._tp1_hit else f'`{tp1_p}`'} "
             f"TP2: {'\u2705' if pm._tp2_hit else f'`{tp2_p}`'} "
             f"TP3: {'\u2705' if pm._tp3_hit else f'`{tp3_p}`'}\n"
@@ -360,18 +381,13 @@ async def _send_tp(target):
 
 
 async def _send_funding(target):
+    """FIX v1.0.6: funding v1.1.1 nu are _next_funding_ms / _near_funding()."""
     from .funding_rate import funding
-    ttn = funding._next_funding_ms
-    now_ms = int(time.time() * 1000)
-    ttf = max(0, (ttn - now_ms) // 1000) if ttn else -1
-    ttf_str = f"`{ttf // 3600}h {(ttf % 3600) // 60}m`" if ttf >= 0 else "`necunoscut`"
     msg = (
         f"\U0001f4b8 *Funding* `{config.symbol}`\n"
         f"Rata: `{funding.rate_pct}` (`{funding.rate:.8f}`)\n"
-        f"LONG: {'\u2705 permis' if funding.can_enter_long() else '\u274c blocat'}\n"
-        f"SHORT: {'\u2705 permis' if funding.can_enter_short() else '\u274c blocat'}\n"
-        f"Aproape de plata: `{'DA \u26a0\ufe0f' if funding._near_funding() else 'NU'}`\n"
-        f"Urmatoarea plata in: {ttf_str}"
+        f"LONG:  {'\u2705 permis' if funding.can_enter_long()  else '\u274c blocat'}\n"
+        f"SHORT: {'\u2705 permis' if funding.can_enter_short() else '\u274c blocat'}"
     )
     if hasattr(target, "edit_message_text"):
         await target.edit_message_text(msg, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
@@ -380,10 +396,11 @@ async def _send_funding(target):
 
 
 async def _send_config(target):
+    """FIX v1.0.6: citeste TP/SL din _get_pm_vals() nu din pm_mod.TP1_PCT etc."""
     import apex_scalper.strategy as sm
-    import apex_scalper.position_manager as pm
     from .mtf_filter import mtf
     from .risk import risk
+    pv = _get_pm_vals()
     msg = (
         f"\u2699\ufe0f *Config live* `{config.symbol}`\n\n"
         f"*Exchange*\n"
@@ -395,13 +412,12 @@ async def _send_config(target):
         f"  ATR: `{sm.ATR_MIN_PCT}` \u2014 `{sm.ATR_MAX_PCT}` | Vol Z min: `{sm.VOL_ZSCORE_MIN}`\n"
         f"  Spread max: `{sm.BASE_SPREAD_BPS}` bps\n\n"
         f"*Scale-out*\n"
-        f"  TP1: `{pm.TP1_PCT:.4f}` ({pm.TP1_FRACTION:.0%}) | TP2: `{pm.TP2_PCT:.4f}` ({pm.TP2_FRACTION:.0%})\n"
-        f"  TP3: `{pm.TP3_PCT:.4f}` ({pm.TP3_FRACTION:.0%}) | SL: `{pm.SL_PCT:.4f}`\n"
-        f"  Trail: `{pm.TRAIL_PCT:.4f}` \u0394`{pm.TRAIL_DELTA:.4f}` | Max hold: `{pm.MAX_HOLD_CANDLES}` candle\n"
-        f"  Max pyramid: `{pm.MAX_PYRAMID_ADDS}`\n\n"
+        f"  TP1: `{pv['TP1_PCT']:.4f}` ({pv['TP1_FRACTION']:.0%}) | TP2: `{pv['TP2_PCT']:.4f}` ({pv['TP2_FRACTION']:.0%})\n"
+        f"  TP3: `{pv['TP3_PCT']:.4f}` ({pv['TP3_FRACTION']:.0%}) | SL: `{pv['SL_PCT']:.4f}`\n"
+        f"  Trail: `{pv['TRAIL_PCT']:.4f}` \u0394`{pv['TRAIL_DELTA']:.4f}` | Max hold: `{pv['MAX_HOLD']}` candle\n"
+        f"  Max pyramid: `{pv['MAX_PYRAMID']}`\n\n"
         f"*Risk*\n"
         f"  Daily loss limit: `{risk._daily_limit:.2f} USDT`\n"
-        # FIX v1.0.5: folosim property public in loc de camp privat
         f"  Consecutive losses: `{risk.consecutive_losses}` / `5`\n\n"
         f"*MTF*\n"
         f"  EMA50(15m): `{mtf.ema50:.2f}` ({'\u2705 ready' if mtf.ready else '\u274c not ready'})"
@@ -476,7 +492,6 @@ async def _send_history(target, n: int = 10):
             side   = t.get("side",     "?")
             entry  = t.get("entry",    0)
             pnl    = t.get("pnl_usdt", 0)
-            # FIX v1.0.5: campul corect din schema DB este 'reason', nu 'close_reason'
             reason = t.get("reason",   "?")
             ts     = t.get("closed_at", "")[:16]
             icon   = "\u2705" if pnl >= 0 else "\u274c"
@@ -516,20 +531,17 @@ async def cmd_menu_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await cmd_menu(u, c)
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Porneste bot-ul. Verifica daca feed-ul e activ."""
     elapsed  = _get_feed_elapsed()
     feed_ok  = 0 <= elapsed < 90
     state.running = True
     state.paused  = False
     feed_warn = (
-        "\n\u26a0\ufe0f Feed WS inactiv \u2014 nu au venit candle-uri in ultimele 90s. "
-        "Restarteaza daca nu pornesc ordinele."
+        "\n\u26a0\ufe0f Feed WS inactiv \u2014 nu au venit candle-uri in ultimele 90s."
     ) if not feed_ok else ""
     await u.message.reply_text(
         f"\u2705 *Apex Scalper STARTED*{feed_warn}",
         parse_mode="Markdown"
     )
-
 
 async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not _check_owner(u):
@@ -539,7 +551,6 @@ async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await trader.close_position()
     await u.message.reply_text("\U0001f6d1 *Bot STOPPED* \u2014 position closed", parse_mode="Markdown")
 
-
 async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not _check_owner(u):
         await u.message.reply_text("\u26d4 Unauthorized.")
@@ -547,13 +558,11 @@ async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
     state.paused = True
     await u.message.reply_text("\u23f8 *PAUSED* \u2014 no new entries", parse_mode="Markdown")
 
-
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
     from .risk import risk
     state.paused = False
     risk.reset_consecutive_losses()
     await u.message.reply_text("\u25b6\ufe0f *RESUMED*", parse_mode="Markdown")
-
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await _send_status(u)
@@ -609,7 +618,6 @@ async def cmd_history(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await _send_history(u, n=n)
 
 async def cmd_daily(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Trimite raportul zilnic la cerere."""
     await u.message.reply_text("\U0001f4c5 *Generez raportul zilnic...*", parse_mode="Markdown")
     try:
         from .daily_report import send_daily_report
@@ -649,16 +657,12 @@ async def cmd_setparam(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("Usage: `/setparam <PARAM> <value>`", parse_mode="Markdown")
         return
     key, val = args[0].upper(), args[1]
+    # Mapeaza parametrii la module si tipuri
     targets = {
-        "RSI_LONG_MIN": (sm, float), "RSI_SHORT_MAX":  (sm, float),
-        "IMBALANCE_LONG": (sm, float), "IMBALANCE_SHORT": (sm, float),
-        "VOL_ZSCORE_MIN": (sm, float), "ATR_MIN_PCT":    (sm, float),
-        "ATR_MAX_PCT":  (sm, float),   "ENTRY_THRESHOLD": (sm, float),
-        "MAX_SPREAD_BPS": (rm, float), "KELLY_FRACTION": (rm, float),
-        "TP1_PCT":  (pm, float), "TP2_PCT":  (pm, float), "TP3_PCT":  (pm, float),
-        "TP1_FRACTION": (pm, float), "TP2_FRACTION": (pm, float), "TP3_FRACTION": (pm, float),
-        "SL_PCT": (pm, float), "TRAIL_PCT": (pm, float), "TRAIL_DELTA": (pm, float),
-        "MAX_HOLD_CANDLES": (pm, int), "MAX_PYRAMID_ADDS": (pm, int),
+        "RSI_LONG_MIN":    (sm, float), "RSI_SHORT_MAX":   (sm, float),
+        "IMBALANCE_LONG":  (sm, float), "IMBALANCE_SHORT": (sm, float),
+        "VOL_ZSCORE_MIN":  (sm, float), "ATR_MIN_PCT":     (sm, float),
+        "ATR_MAX_PCT":     (sm, float), "ENTRY_THRESHOLD": (sm, float),
     }
     if key not in targets:
         await u.message.reply_text(

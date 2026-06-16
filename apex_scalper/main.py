@@ -1,17 +1,10 @@
-"""Main entry point v1.4.7 — toate import-urile verificate.
+"""Main entry point v1.4.8 — start_telegram_bot wrapper corect.
 
 Changelog:
-  v1.4.7 —
-    FIX: run_funding_refresh_loop nu exista in funding_rate.py
-      -> adaugat in funding_rate v1.1.1.
-    FIX: start_health_server() apelat direct (daemon thread),
-      scos din tasks asyncio -> fix OSError port 8080.
-    FIX: pulse.py v0.8.2 -> pm_mod constante compatibile v1.3.3.
-    FIX: from .feed import start_feed (modul real).
-    FIX: set_main_loop(loop) inainte de tasks.
-  v1.4.6 — start_health_server non-blocking.
-  v1.4.5 — ws_feed -> feed.start_feed().
-  v1.4.4 — watchdog_loop() fara argumente.
+  v1.4.8 —
+    FIX: telegram_ui nu are start_telegram_bot() -> adaugat run_polling wrapper.
+    FIX: run_dashboard() apelat corect (daemon thread deja).
+  v1.4.7 — run_funding_refresh_loop adaugat, port 8080 fix, set_main_loop fix.
 """
 from __future__ import annotations
 
@@ -39,6 +32,22 @@ def _setup_logging() -> None:
     )
 
 
+async def _run_telegram_polling() -> None:
+    """Wrapper asyncio pentru build_app().run_polling()."""
+    from .telegram_ui import build_app
+    app = build_app()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    # Tine in viata pana la cancel
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
 async def main() -> None:
     from .config import config
     from .trader import trader
@@ -47,7 +56,6 @@ async def main() -> None:
     from .daily_report import run_daily_report_loop
     from .anti_manipulation import inject_wall_params
     from .state import state
-    from .telegram_ui import start_telegram_bot
     from .health import start_health_server
     from .watchdog import watchdog_loop
     from .pulse import run_pulse_loop
@@ -68,9 +76,9 @@ async def main() -> None:
     try:
         ok = await warmup_indicators(config.symbol)
         if ok:
-            logger.info("[warmup] Indicatori ready — RSI/ATR/EMA incalziti")
+            logger.info("[warmup] Indicatori ready \u2014 RSI/ATR/EMA incalziti")
         else:
-            logger.warning("[warmup] Warmup esuat — indicatorii vor fi ready dupa ~50 candle-uri live")
+            logger.warning("[warmup] Warmup esuat \u2014 indicatorii vor fi ready dupa ~50 candle-uri live")
     except Exception as e:
         logger.warning(f"[warmup] Warmup exceptie (continuam fara): {e}")
 
@@ -93,7 +101,7 @@ async def main() -> None:
         asyncio.ensure_future(run_mtf_refresh_loop(config.symbol)),
         asyncio.ensure_future(run_funding_refresh_loop(config.symbol)),
         asyncio.ensure_future(run_daily_report_loop(config.symbol)),
-        asyncio.ensure_future(start_telegram_bot()),
+        asyncio.ensure_future(_run_telegram_polling()),
         asyncio.ensure_future(start_feed()),
     ]
 
@@ -101,13 +109,13 @@ async def main() -> None:
         f"\n{'='*50}\n"
         f"  Health:    http://localhost:8080/health\n"
         f"  Dashboard: http://localhost:8050\n"
-        f"  Feed:      feed.py v1.0.4 (native async WS)\n"
+        f"  Feed:      feed.py (native async WS)\n"
         f"  Pulse:     fiecare {int(__import__('os').getenv('PULSE_INTERVAL_S', 60))}s\n"
         f"{'='*50}"
     )
 
     def _shutdown(sig, frame):
-        logger.info(f"Semnal {sig} primit — oprire...")
+        logger.info(f"Semnal {sig} primit \u2014 oprire...")
         for t in tasks:
             t.cancel()
 
