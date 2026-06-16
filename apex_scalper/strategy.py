@@ -1,15 +1,12 @@
-"""Strategy v1.1.5 — update_indicators async (fix lock timeout deadlock).
+"""Strategy v1.1.6 — regime.update() apelat in update_indicators.
 
 Changelog:
-  v1.1.5 —
-    FIX CRITIC: update_indicators() era sync si apela run_coroutine_threadsafe
-      pentru a obtine asyncio.Lock.
-      Cand feed.py (full async, acelasi event loop) o apela direct,
-      run_coroutine_threadsafe intra in deadlock -> timeout 1s la fiecare candle
-      -> evaluate() nu se mai executa -> ZERO trade-uri.
-    Fix: update_indicators() devine async, foloseste direct 'await lock'.
-    Feed.py v1.0.5 o apeleaza cu 'await update_indicators(...)'.
-    _main_loop si run_coroutine_threadsafe eliminati complet (neutilizati).
+  v1.1.6 —
+    FIX: regime.update() nu era apelat in update_indicators() v1.1.5.
+      Rezultat: ADX=0.0 permanent, label=UNKNOWN, GATE2 blocat mereu.
+    Fix: regime.update(close, atr_value, high, low) adaugat in update_indicators()
+      dupa apply_ind_from_state().
+  v1.1.5 — update_indicators async, elimina run_coroutine_threadsafe deadlock.
   v1.1.4 — entry fill confirm, SL unic, state dupa fill, circuit_breaker.
 """
 from __future__ import annotations
@@ -53,7 +50,7 @@ _close_buf:   deque = deque(maxlen=_DIV_WINDOW)
 
 
 def set_main_loop(loop) -> None:
-    """Pastrat pentru compatibilitate backwards — nu mai e necesar."""
+    """Pastrat pentru compatibilitate backwards — no-op."""
     pass
 
 
@@ -233,8 +230,10 @@ async def score_snapshot(price: float, ob) -> tuple[float, float]:
 
 
 async def update_indicators(price: float, kline_data: dict) -> None:
-    """FIX v1.1.5: async — await lock direct, fara run_coroutine_threadsafe."""
+    """FIX v1.1.6: apeleaza regime.update() dupa actualizarea indicatorilor."""
     from .indicators import update_all
+    from .regime_filter import regime
+
     s = _get_ind_state()
     high   = float(kline_data.get("high",   price))
     low    = float(kline_data.get("low",    price))
@@ -249,6 +248,9 @@ async def update_indicators(price: float, kline_data: dict) -> None:
 
     async with _get_ind_lock():
         _apply_ind_from_state(s, price)
+
+    # FIX v1.1.6: actualizeaza regime dupa ce ind e gata
+    regime.update(price, s.atr_value, high, low)
 
 
 def _apply_ind_from_state(s, price: float) -> None:
